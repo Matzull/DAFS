@@ -1,0 +1,146 @@
+syntax = "proto3";
+
+package dfs;
+
+// -----------------------------------------------------------------------
+// SERVICE 1: METADATA SERVICE (The Brain)
+// Manages file structure, permissions, and block locations.
+// -----------------------------------------------------------------------
+service MetadataService {
+    // Client asks to upload a file. Master decides where blocks go.
+    rpc CreateFile (CreateFileRequest) returns (CreateFileResponse);
+
+    // Client asks to download a file. Master returns the block map.
+    rpc GetFileMetadata (GetFileRequest) returns (GetFileResponse);
+
+    // Deletes a file from the namespace.
+    rpc DeleteFile (DeleteFileRequest) returns (DeleteFileResponse);
+    
+    // Lists files in a directory (like 'ls').
+    rpc ListDirectory (ListDirectoryRequest) returns (ListDirectoryResponse);
+}
+
+// -----------------------------------------------------------------------
+// SERVICE 2: DATA NODE SERVICE (The Muscle)
+// Manages raw bytes. Uses Streaming for efficiency.
+// -----------------------------------------------------------------------
+service DataNodeService {
+    // Upload: Client streams chunks of bytes.
+    rpc WriteBlock (stream WriteBlockRequest) returns (WriteBlockResponse);
+
+    // Download: Client requests a block, Server streams bytes back.
+    rpc ReadBlock (ReadBlockRequest) returns (stream ReadBlockResponse);
+}
+
+// -----------------------------------------------------------------------
+// SERVICE 3: AUDIT SERVICE (The Notary)
+// Receives immutable logs from all other nodes.
+// -----------------------------------------------------------------------
+service AuditService {
+    // Sends a log entry. Must be low-latency.
+    rpc LogOperation (AuditRequest) returns (AuditResponse);
+}
+
+// =======================================================================
+// DATA MESSAGES
+// =======================================================================
+
+// --- Metadata Messages ---
+
+message CreateFileRequest {
+    string path = 1;      // Full path e.g., "/home/user/thesis.pdf"
+    int64 size = 2;       // Total size in bytes
+    string user_id = 3;   // User creating the file
+}
+
+message CreateFileResponse {
+    string file_id = 1;                  // Internal UUID
+    repeated BlockAssignment blocks = 2; // Where the client should write data
+}
+
+message GetFileRequest {
+    string path = 1;
+    string user_id = 2;
+}
+
+message GetFileResponse {
+    string file_id = 1;
+    int64 size = 2;
+    repeated BlockAssignment blocks = 3; // The map: Which node has which block?
+}
+
+message DeleteFileRequest {
+    string path = 1;
+    string user_id = 2;
+}
+
+message DeleteFileResponse {
+    bool success = 1;
+    string error_message = 2;
+}
+
+message ListDirectoryRequest {
+    string path = 1;
+}
+
+message ListDirectoryResponse {
+    repeated FileInfo files = 1;
+}
+
+message FileInfo {
+    string filename = 1;
+    bool is_directory = 2;
+    int64 size = 3;
+}
+
+message BlockAssignment {
+    string block_id = 1;     // UUID of the chunk
+    string node_address = 2; // IP:PORT of the DataNode (e.g., "127.0.0.1:50051")
+    int64 block_size = 3;    
+    int64 order = 4;         // Sequence number (0, 1, 2...)
+}
+
+// --- DataNode Messages ---
+
+message WriteBlockRequest {
+    // In gRPC streaming, the first message sends metadata, subsequent messages send raw bytes.
+    oneof request_data {
+        BlockMetadata metadata = 1;
+        bytes chunk_data = 2; 
+    }
+}
+
+message BlockMetadata {
+    string block_id = 1;
+    int64 total_size = 2;
+}
+
+message WriteBlockResponse {
+    bool success = 1;
+    string message = 2;
+    int64 bytes_written = 3;
+}
+
+message ReadBlockRequest {
+    string block_id = 1;
+}
+
+message ReadBlockResponse {
+    bytes chunk_data = 1; 
+}
+
+// --- Audit Messages ---
+
+message AuditRequest {
+    int64 timestamp = 1;      // Unix timestamp
+    string user_id = 2;       
+    string action = 3;        // "CREATE", "READ_BLOCK", "DELETE"
+    string resource = 4;      // "/home/user/file.txt" or "BlockID"
+    string component = 5;     // Who is reporting? "MASTER", "DATANODE-1"
+    string status = 6;        // "SUCCESS", "DENIED"
+    string details = 7;       // Extra info (e.g., Source IP)
+}
+
+message AuditResponse {
+    bool ack = 1; 
+}

@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+
+# Aquí listamos todas las carpetas que has creado con "cargo new"
+members = [
+    "common",
+    "services/master",
+    "services/datanode",
+    "services/audit",
+    "client/fscore",
+    "client/cli",
+    "client/fuse_daemon",
+    "client/preload_shim",
+]
+
+# --- DEPENDENCIAS GLOBALES ---
+# Definimos las versiones aquí una sola vez.
+# Luego en los hijos solo pondremos: tonic = { workspace = true }
+[workspace.dependencies]
+# Async Runtime
+tokio = { version = "1.36", features = ["full"] }
+tokio-stream = "0.1"
+
+# gRPC & Protobuf
+tonic = "0.11"
+prost = "0.12"
+tonic-build = "0.11"
+
+# Logs y Trazabilidad (Indispensable para auditoría)
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Serialización y Errores
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"      # Para manejar errores fácilmente
+thiserror = "1.0"
+
+# CLI y Sistema
+clap = { version = "4.4", features = ["derive"] }
+libc = "0.2"        # Para hablar con C (LD_PRELOAD)
+fuser = "0.14"      # Para cuando hagas la parte de FUSE
+bytes = "1.5"       # Para manejar los chunks de archivos eficientemente
