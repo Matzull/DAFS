@@ -8,11 +8,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Compilación avanzada
     // .compile( &[archivos], &[includes] )
-    tonic_build::configure()
-        .compile(
-            &[proto_file], // ¿Qué archivo compilar?
-            &[proto_dir],  // ¿Dónde buscar ese archivo y sus dependencias?
-        )?;
+    tonic_build::configure().compile(
+        &[proto_file], // ¿Qué archivo compilar?
+        &[proto_dir],  // ¿Dónde buscar ese archivo y sus dependencias?
+    )?;
 
     Ok(())
 }

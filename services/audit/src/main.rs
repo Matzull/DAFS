@@ -1,7 +1,7 @@
-use tonic::{transport::Server, Request, Response, Status};
 use common::dfs::audit_service_server::{AuditService, AuditServiceServer};
 use common::dfs::{AuditRequest, AuditResponse};
 use serde::Serialize;
+use tonic::{transport::Server, Request, Response, Status};
 
 // 1. Definimos una estructura "Espejo" para Elasticsearch.
 // Necesitamos que derive 'Serialize' para convertirse en JSON.
@@ -30,9 +30,11 @@ impl AuditService for MyAuditService {
         &self,
         request: Request<AuditRequest>, // <-- Lo que llega por gRPC
     ) -> Result<Response<AuditResponse>, Status> {
-        
         let req = request.into_inner();
-        println!("📝 Recibido log: [{}] {} -> {}", req.component, req.user_id, req.action);
+        println!(
+            "📝 Recibido log: [{}] {} -> {}",
+            req.component, req.user_id, req.action
+        );
 
         // 3. Mapeo: Protobuf -> Struct Rust -> JSON
         let doc = AuditLogDocument {
@@ -48,23 +50,20 @@ impl AuditService for MyAuditService {
         // 4. Enviamos a Elasticsearch (Asíncrono)
         // URL: localhost:9200 / índice "audit-logs" / tipo "_doc"
         let es_url = "http://localhost:9200/audit-logs/_doc";
-        
+
         // Hacemos la petición HTTP POST
         // Nota: En un sistema real, esto debería ir a una cola (Kafka) para no bloquear.
         // Para el TFM, el HTTP directo demuestra integración.
-        let response = self.http_client.post(es_url)
-            .json(&doc)
-            .send()
-            .await;
+        let response = self.http_client.post(es_url).json(&doc).send().await;
 
         match response {
             Ok(res) => {
                 if res.status().is_success() {
-                   // Todo OK
+                    // Todo OK
                 } else {
                     eprintln!("⚠️ Error Elasticsearch: {:?}", res.status());
                 }
-            },
+            }
             Err(e) => eprintln!("❌ Error conexión Elastic: {}", e),
         }
 
