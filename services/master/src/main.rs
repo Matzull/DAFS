@@ -3,8 +3,9 @@ use crate::models::{BlockMetadata, FileMetadata, FileStatus, MasterState};
 use common::dfs::metadata_service_server::{MetadataService, MetadataServiceServer};
 use common::dfs::{
     BlockAssignment, CreateFileRequest, CreateFileResponse, DeleteFileRequest, DeleteFileResponse,
-    GetFileRequest, GetFileResponse, ListDirectoryRequest, ListDirectoryResponse,
+    FileInfo, GetFileRequest, GetFileResponse, ListDirectoryRequest, ListDirectoryResponse,
 };
+use std::fs::File;
 use std::path::PathBuf;
 use std::{
     cmp::min,
@@ -20,7 +21,7 @@ use tracing::subscriber::SetGlobalDefaultError;
 use tracing::{error, info, instrument};
 use uuid::Uuid;
 
-const BLOCK_SIZE: i64 = 64_000_000;
+const BLOCK_SIZE: i64 = 64 * 1024;
 const REPLICATION: i32 = 2; //Minimum number of nodes that must contain a block
 
 #[derive(Debug)]
@@ -111,10 +112,12 @@ impl Metadatanode {
 
 #[tonic::async_trait]
 impl MetadataService for Metadatanode {
+    #[instrument(skip(self))]
     async fn create_file(
         &self,
         request: Request<CreateFileRequest>,
     ) -> Result<Response<CreateFileResponse>, Status> {
+        info!("Received create_file request");
         let file_request = request.into_inner();
         let file_metadata = self
             ._create_file(&self.state, file_request.path, file_request.size)
@@ -137,11 +140,37 @@ impl MetadataService for Metadatanode {
         }))
     }
 
+    #[instrument(skip(self))]
     async fn get_file_metadata(
         &self,
         request: Request<GetFileRequest>,
     ) -> Result<Response<GetFileResponse>, Status> {
-        !todo!()
+        info!("Received get_file_metadata request");
+        let file_path = request.into_inner().path;
+        let files_lock = self.state.files.read().await;
+        let file_metadata = match files_lock.get(&file_path) {
+            Some(filemetadata) => filemetadata,
+            None => return Err(Status::not_found("File not found")),
+        };
+        let datanodes = self.state.available_datanodes.read().await;
+        let block_assignments = file_metadata
+            .blocks
+            .iter()
+            .map(|block| BlockAssignment {
+                block_id: block.id.clone(),
+                node_address: datanodes
+                    .get(&block.locations[0])
+                    .cloned()
+                    .unwrap_or_else(|| "unknown:0".to_string()), //TODO: Use real nodes
+                block_size: block.size,
+                order: block.index as i64, //TODO: check var size i64 vs i32
+            })
+            .collect();
+        Ok(Response::new(GetFileResponse {
+            file_id: file_metadata.id.clone(),
+            size: file_metadata.size,
+            blocks: block_assignments,
+        }))
     }
 
     async fn delete_file(
@@ -155,18 +184,39 @@ impl MetadataService for Metadatanode {
         &self,
         request: Request<ListDirectoryRequest>,
     ) -> Result<Response<ListDirectoryResponse>, Status> {
-        !todo!()
+        info!("Received list_directory request");
+        let dir_path = request.into_inner().path;
+        let files_lock = self.state.files.read().await;
+        let files = files_lock
+            .iter()
+            .filter(|(&ref path, _)| path.starts_with(&dir_path))
+            .map(|(_, v)| FileInfo {
+                filename: v.name.clone(),
+                is_directory: false,
+                size: v.size,
+            })
+            .collect();
+        Ok(Response::new(ListDirectoryResponse { files: files }))
     }
 }
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_target(false)
+        .init();
 
     let files = HashMap::<String, FileMetadata>::new();
     let mut available_data_nodes = HashMap::<i32, String>::new();
 
-    available_data_nodes.insert(1, "localhost:8080".to_string());
-    available_data_nodes.insert(2, "localhost:5051".to_string());
+    available_data_nodes.insert(1, "http://[::1]:8080".to_string());
+    // available_data_nodes.insert(2, "localhost:5051".to_string());
 
     let metadatanode = Metadatanode {
         state: Arc::new(MasterState {

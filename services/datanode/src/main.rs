@@ -12,7 +12,7 @@ use tracing::{debug, error, info, instrument, warn};
 use tracing_subscriber;
 // use tokio::fs::{}
 
-const DATA_FOLDER: &'static str = "./data/";
+const DATA_FOLDER: &'static str = "/home/matzul/Documents/DAFS/testing/datanode";
 
 #[derive(Default)]
 pub struct Datanode {}
@@ -131,7 +131,16 @@ impl DataNodeService for Datanode {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_target(false)
+        .init();
     debug!("Creating directory to store files");
     create_dir_all(DATA_FOLDER).await?;
     let address = "[::1]:8080".parse()?;
