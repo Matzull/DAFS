@@ -41,3 +41,10 @@ clap = { version = "4.4", features = ["derive"] }
 libc = "0.2"        # Para hablar con C (LD_PRELOAD)
 fuser = "0.14"      # Para cuando hagas la parte de FUSE
 bytes = "1.5"       # Para manejar los chunks de archivos eficientemente
+
+# Testing
+tempfile = "3.10"
+tokio-test = "0.4"
+rand = "0.8"
+uuid = { version = "1.6", features = ["v4"] }
+async-trait = "0.1"

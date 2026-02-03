@@ -43,3 +43,70 @@ pub struct MasterState {
     pub files: RwLock<HashMap<String, FileMetadata>>,
     pub available_datanodes: RwLock<HashMap<i32, String>>,
 }
+
+impl MasterState {
+    /// Create a new empty MasterState
+    pub fn new() -> Self {
+        MasterState {
+            files: RwLock::new(HashMap::new()),
+            available_datanodes: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Create a MasterState with the given datanodes
+    pub fn with_datanodes(datanodes: HashMap<i32, String>) -> Self {
+        MasterState {
+            files: RwLock::new(HashMap::new()),
+            available_datanodes: RwLock::new(datanodes),
+        }
+    }
+}
+
+impl Default for MasterState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BlockMetadata {
+    /// Create a new block metadata
+    pub fn new(id: String, index: i32, size: i64, locations: Vec<i32>) -> Self {
+        BlockMetadata {
+            id,
+            index,
+            size,
+            locations,
+        }
+    }
+}
+
+impl FileMetadata {
+    /// Check if the file is ready for reading
+    pub fn is_ready(&self) -> bool {
+        matches!(self.file_status, FileStatus::Ready)
+    }
+
+    /// Check if the file is being uploaded
+    pub fn is_uploading(&self) -> bool {
+        matches!(self.file_status, FileStatus::Uploading)
+    }
+
+    /// Check if the file is marked for deletion
+    pub fn is_deleted(&self) -> bool {
+        matches!(self.file_status, FileStatus::Deleted)
+    }
+
+    /// Get the total number of blocks
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Calculate total size from blocks
+    pub fn calculated_size(&self) -> i64 {
+        self.blocks.iter().map(|b| b.size).sum()
+    }
+}
+
+#[cfg(test)]
+#[path = "models_tests.rs"]
+mod tests;

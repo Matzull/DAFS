@@ -247,3 +247,6 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     Err(e) => error!("Error creating file: {}", e),
     // }
 }
+
+#[cfg(test)]
+mod tests;
