@@ -5,7 +5,6 @@ use common::dfs::{
     BlockAssignment, CreateFileRequest, CreateFileResponse, DeleteFileRequest, DeleteFileResponse,
     FileInfo, GetFileRequest, GetFileResponse, ListDirectoryRequest, ListDirectoryResponse,
 };
-use std::fs::File;
 use std::path::PathBuf;
 use std::{
     cmp::min,
@@ -16,8 +15,7 @@ use std::{
 
 use tokio::sync::RwLock;
 use tonic::transport::Server;
-use tonic::{Request, Response, Status, Streaming};
-use tracing::subscriber::SetGlobalDefaultError;
+use tonic::{Request, Response, Status};
 use tracing::{error, info, instrument};
 use uuid::Uuid;
 
@@ -94,7 +92,7 @@ impl Metadatanode {
             last_modified_at: now_miliseconds,
             checksum: "TO_IMPLEMENT".to_string(),
             file_status: FileStatus::Uploading,
-            blocks: blocks,
+            blocks,
         };
         let file_path_pathbuf = PathBuf::from(file_path);
         let full_path = file_path_pathbuf.to_string_lossy().to_string();
@@ -122,7 +120,7 @@ impl MetadataService for Metadatanode {
         let file_metadata = self
             ._create_file(&self.state, file_request.path, file_request.size)
             .await
-            .map_err(|err| Status::internal(err))?;
+            .map_err(Status::internal)?;
         let datanodes = self.state.available_datanodes.read().await;
         let block_assignments = file_metadata
             .blocks
@@ -189,14 +187,14 @@ impl MetadataService for Metadatanode {
         let files_lock = self.state.files.read().await;
         let files = files_lock
             .iter()
-            .filter(|(&ref path, _)| path.starts_with(&dir_path))
+            .filter(|(path, _)| path.starts_with(&dir_path))
             .map(|(_, v)| FileInfo {
                 filename: v.name.clone(),
                 is_directory: false,
                 size: v.size,
             })
             .collect();
-        Ok(Response::new(ListDirectoryResponse { files: files }))
+        Ok(Response::new(ListDirectoryResponse { files }))
     }
 }
 #[tokio::main]

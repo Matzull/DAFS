@@ -9,10 +9,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, instrument, warn};
-use tracing_subscriber;
 // use tokio::fs::{}
 
-const DATA_FOLDER: &'static str = "/home/matzul/Documents/DAFS/testing/datanode";
+const DATA_FOLDER: &str = "/home/matzul/Documents/DAFS/testing/datanode";
 
 #[derive(Default)]
 pub struct Datanode {}
@@ -72,7 +71,7 @@ impl DataNodeService for Datanode {
         Ok(Response::new(WriteBlockResponse {
             success: true,
             message: "Everything went well".to_string(),
-            bytes_written: bytes_written,
+            bytes_written,
         }))
     }
 

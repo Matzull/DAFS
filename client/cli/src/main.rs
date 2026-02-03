@@ -3,27 +3,19 @@ use common::dfs::data_node_service_client::DataNodeServiceClient;
 use common::dfs::metadata_service_client::MetadataServiceClient;
 use common::dfs::write_block_request::RequestData;
 use common::dfs::{
-    CreateFileRequest, CreateFileResponse, GetFileRequest, ListDirectoryRequest,
-    ListDirectoryResponse, ReadBlockRequest, ReadBlockResponse, WriteBlockRequest,
+    CreateFileRequest, CreateFileResponse, GetFileRequest, ListDirectoryRequest, ReadBlockRequest, WriteBlockRequest,
     WriteBlockResponse,
 };
 use std::error::Error;
 use std::fs::OpenOptions;
-use std::io::SeekFrom;
-use std::mem::offset_of;
 use std::os::unix::fs::{FileExt, MetadataExt};
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread::current;
-use tokio::fs::{create_dir_all, File};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
-use tonic::transport::Server;
-use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error, info, instrument};
 
 /// DAFS CLI - Distributed Asynchronous File System client
 #[derive(Parser, Debug)]
