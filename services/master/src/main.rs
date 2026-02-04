@@ -2,9 +2,12 @@ mod models;
 use crate::models::{BlockMetadata, FileMetadata, FileStatus, MasterState};
 use common::dfs::metadata_service_server::{MetadataService, MetadataServiceServer};
 use common::dfs::{
-    BlockAssignment, CreateFileRequest, CreateFileResponse, DeleteFileRequest, DeleteFileResponse,
-    FileInfo, GetFileRequest, GetFileResponse, ListDirectoryRequest, ListDirectoryResponse,
+    data_node_service_client, BlockAssignment, CreateFileRequest, CreateFileResponse,
+    DeleteBlockRequest, DeleteFileRequest, DeleteFileResponse, FileInfo, GetFileRequest,
+    GetFileResponse, ListDirectoryRequest, ListDirectoryResponse, RenameFileRequest,
+    RenameFileResponse,
 };
+use serde::de::Error;
 use std::path::PathBuf;
 use std::{
     cmp::min,
@@ -12,26 +15,84 @@ use std::{
     sync::Arc,
     time::{self},
 };
+use tracing_subscriber::fmt::format;
 
-use tokio::sync::RwLock;
+use clap::Parser;
+use figment::{
+    providers::{Format, Serialized, Toml},
+    Figment,
+};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, RwLock};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 const BLOCK_SIZE: i64 = 64 * 1024;
 const REPLICATION: i32 = 2; //Minimum number of nodes that must contain a block
 
-#[derive(Debug)]
+#[derive(Parser, Debug, Serialize, Deserialize)]
+pub struct InternalSettings {
+    pub listen_address: String,
+    pub block_size: i64,
+    pub replication_factor: i32,
+    pub log_level: String,
+}
+
+pub fn load_config() -> InternalSettings {
+    let cli = Cli::parse();
+
+    let figment = Figment::new()
+        .merge(Serialized::defaults(InternalSettings {
+            listen_address: "[::1]:9090".to_string(),
+            block_size: BLOCK_SIZE,
+            replication_factor: REPLICATION,
+            log_level: "info".to_string(),
+        }))
+        .merge(Toml::file(&cli.config_path));
+
+    figment.extract().expect("Error loading configuration")
+}
+
+/// DAFS MetadataNode Service
+#[derive(Parser, Debug)]
+#[command(name = "dafs-master")]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// Server listen address
+    #[arg(short, long, default_value = "[::1]:9090")]
+    listen_address: Option<String>,
+
+    /// Block size (in bytes)
+    #[arg(short, long, default_value = "65536")]
+    block_size: Option<i64>,
+
+    /// Replication factor
+    #[arg(short, long, default_value = "2")]
+    replication_factor: Option<i32>,
+
+    /// Log level (trace, debug, info, warn, error)
+    #[arg(long, default_value = "info")]
+    log_level: Option<String>,
+
+    #[arg(short, long, default_value = "config.toml")]
+    pub config_path: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct Metadatanode {
     pub state: Arc<MasterState>,
+    pub garbage_collector_tx: mpsc::Sender<Vec<BlockMetadata>>,
+    pub settings: Arc<InternalSettings>,
 }
 
 impl Metadatanode {
-    #[instrument(skip(state))]
+    #[instrument(skip(state, settings))]
     async fn _create_file(
         &self,
         state: &Arc<MasterState>,
+        settings: &Arc<InternalSettings>,
         file_path: String,
         file_size: i64,
     ) -> Result<FileMetadata, String> {
@@ -40,7 +101,7 @@ impl Metadatanode {
             return Err("File size cannot be negative".to_string());
         }
 
-        let num_blocks = ((file_size + BLOCK_SIZE - 1) / BLOCK_SIZE)
+        let num_blocks = ((file_size + settings.block_size - 1) / settings.block_size)
             .try_into()
             .unwrap();
         let file_id = Uuid::new_v4().to_string();
@@ -61,18 +122,18 @@ impl Metadatanode {
         for block_idx in 0..num_blocks {
             let block_id = Uuid::new_v4().to_string();
             let mut block_datanodes = vec![];
-            for datanode_id in 0..min(REPLICATION, datanodes.len() as i32) {
+            for datanode_id in 0..min(settings.replication_factor, datanodes.len() as i32) {
                 block_datanodes
-                    .push(datanodes[(block_idx + datanode_id) as usize % datanodes.len()]);
+                    .push(datanodes[(block_idx + datanode_id as usize) % datanodes.len()]);
             }
-            let current_block_size = if (block_idx as i64 + 1) * BLOCK_SIZE < file_size {
-                BLOCK_SIZE
+            let current_block_size = if (block_idx as i64 + 1) * settings.block_size < file_size {
+                settings.block_size
             } else {
-                file_size - (block_idx as i64) * BLOCK_SIZE
+                file_size - (block_idx as i64) * settings.block_size
             };
             blocks.push(BlockMetadata {
                 id: block_id,
-                index: block_idx,
+                index: block_idx as i32,
                 size: current_block_size,
                 locations: block_datanodes.clone(),
             });
@@ -118,7 +179,12 @@ impl MetadataService for Metadatanode {
         info!("Received create_file request");
         let file_request = request.into_inner();
         let file_metadata = self
-            ._create_file(&self.state, file_request.path, file_request.size)
+            ._create_file(
+                &self.state,
+                &self.settings,
+                file_request.path,
+                file_request.size,
+            )
             .await
             .map_err(Status::internal)?;
         let datanodes = self.state.available_datanodes.read().await;
@@ -175,7 +241,18 @@ impl MetadataService for Metadatanode {
         &self,
         request: Request<DeleteFileRequest>,
     ) -> Result<Response<DeleteFileResponse>, Status> {
-        !todo!()
+        let file_path = request.into_inner().path;
+        let mut files = self.state.files.write().await;
+        if let Some(filemetadata) = files.remove(&file_path) {
+            let to_delete = filemetadata.blocks;
+            self.garbage_collector_tx.send(to_delete).await.ok();
+            Ok(Response::new(DeleteFileResponse {
+                success: true,
+                error_message: "".to_string(),
+            }))
+        } else {
+            return Err(Status::not_found("File not found"));
+        }
     }
 
     async fn list_directory(
@@ -196,13 +273,56 @@ impl MetadataService for Metadatanode {
             .collect();
         Ok(Response::new(ListDirectoryResponse { files }))
     }
+
+    async fn rename_file(
+        &self,
+        request: Request<RenameFileRequest>,
+    ) -> Result<Response<RenameFileResponse>, Status> {
+        info!("Received rename file request");
+        let rename_req =request.into_inner();
+        let mut files_lock = self.state.files.write().await;
+        if files_lock.contains_key(&rename_req.new_path){
+            return Err(Status::already_exists(format!("File {} already exists", rename_req.new_path)));
+        }
+        if let Some(mut file_metadata) = files_lock.remove(&rename_req.old_path){
+            file_metadata.name = rename_req.new_path.clone();
+            files_lock.insert(rename_req.new_path, file_metadata);
+        }
+        else {
+            return Err(Status::not_found("Couldnt rename file"));
+        }
+        Ok(Response::new(RenameFileResponse {success:true, error_message:"".to_string()}))
+    }
+}
+
+impl Metadatanode {
+    async fn notify_datanode_to_delete(
+        &self,
+        block_id: &str,
+        datanode: String,
+    ) -> Result<bool, String> {
+        let mut client = data_node_service_client::DataNodeServiceClient::connect(datanode)
+            .await
+            .map_err(|err| format!("Could not connect to datanode {}", err.to_string()))?;
+        client
+            .delete_block(DeleteBlockRequest {
+                block_id: block_id.to_string(),
+            })
+            .await
+            .map_err(|err| format!("Could not connect to datanode {}", err.to_string()))?;
+        Ok(true)
+    }
 }
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let settings = Arc::new(load_config());
+
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            std::env::var("RUST_LOG")
+                .ok()
+                .and_then(|v| tracing_subscriber::EnvFilter::try_new(v).ok())
+                .unwrap_or_else(|| tracing_subscriber::EnvFilter::new(settings.log_level.clone())),
         )
         .with_file(true)
         .with_line_number(true)
@@ -214,38 +334,56 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut available_data_nodes = HashMap::<i32, String>::new();
 
     available_data_nodes.insert(1, "http://[::1]:8080".to_string());
-    // available_data_nodes.insert(2, "localhost:5051".to_string());
+    // available_data_nodes.insert(2, "http://[::1]:8081".to_string());
+    let (tx, mut rx) = mpsc::channel::<Vec<BlockMetadata>>(1000);
 
-    let metadatanode = Metadatanode {
+    let metadatanode = Arc::new(Metadatanode {
         state: Arc::new(MasterState {
             files: RwLock::new(files),
             available_datanodes: RwLock::new(available_data_nodes),
         }),
-    };
+        settings: Arc::clone(&settings),
+        garbage_collector_tx: tx,
+    });
 
-    let address = "[::1]:9090".parse()?;
-    let service = MetadataServiceServer::new(metadatanode);
+    let address = settings.listen_address.parse()?;
+    let service = MetadataServiceServer::new((*metadatanode).clone());
 
     info!("Starting MetadataNode server on {}", address);
+    let master_ref = Arc::clone(&metadatanode);
+    tokio::spawn(async move {
+        info!("Garbage Collector started");
+        while let Some(blocks) = rx.recv().await {
+            for block in blocks {
+                for location in block.locations {
+                    let datanode_addr = {
+                        let nodes = master_ref.state.available_datanodes.read().await;
+                        nodes.get(&location).cloned()
+                    };
 
+                    // 2. Manejamos el caso de que el DataNode ya no exista
+                    let addr = match datanode_addr {
+                        Some(a) => a,
+                        None => {
+                            warn!(
+                                "DataNode {} not available to delete block {}",
+                                location, block.id
+                            );
+                            continue;
+                        }
+                    };
+                    if let Err(e) = master_ref.notify_datanode_to_delete(&block.id, addr).await {
+                        error!("Error deleting block {} in {}: {}", block.id, location, e);
+                    }
+                }
+            }
+        }
+    });
     Server::builder()
         .add_service(service)
         .serve(address)
         .await?;
     Ok(())
-
-    // let file = metadatanode
-    //     ._create_file(
-    //         &metadatanode.state,
-    //         "/home/user/test.txt".to_string(),
-    //         100_000_000,
-    //     )
-    //     .await;
-
-    // match file {
-    //     Ok(f) => info!("File created: {:?}", f),
-    //     Err(e) => error!("Error creating file: {}", e),
-    // }
 }
 
 #[cfg(test)]

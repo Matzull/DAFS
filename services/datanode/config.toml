@@ -1,0 +1,16 @@
+# DAFS DataNode Configuration File
+
+# Server listen address
+listen_address = "[::1]:8080"
+
+# Data folder location for storing blocks
+data_folder = "/home/matzul/Documents/DAFS/testing/datanode"
+
+# Logging level (trace, debug, info, warn, error)
+log_level = "info"
+
+# MPSC channel size for read/write operations
+mpsc_channel_size = 4
+
+# Buffer size for reading blocks (in bytes)
+read_buffer_size = 65536

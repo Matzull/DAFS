@@ -3,19 +3,52 @@ use common::dfs::data_node_service_client::DataNodeServiceClient;
 use common::dfs::metadata_service_client::MetadataServiceClient;
 use common::dfs::write_block_request::RequestData;
 use common::dfs::{
-    CreateFileRequest, CreateFileResponse, GetFileRequest, ListDirectoryRequest, ReadBlockRequest, WriteBlockRequest,
-    WriteBlockResponse,
+    CreateFileRequest, CreateFileResponse, GetFileRequest, ListDirectoryRequest, ReadBlockRequest,
+    WriteBlockRequest, WriteBlockResponse, RenameFileRequest
 };
+use figment::{Figment, providers::{Format, Toml, Serialized}};
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs::OpenOptions;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tracing::{error, info, instrument};
+
+#[derive(Parser, Debug, Serialize, Deserialize)]
+pub struct InternalSettings {
+    pub mpsc_upload_channel_size: u8,
+    pub mpsc_download_channel_size: u8,
+    pub master_endpoints: Vec<String>,
+    pub upload_concurrency: usize,
+    pub download_concurrency: usize,
+    pub log_level: String,
+}
+
+pub fn load_config() -> InternalSettings {
+    let cli = Cli::parse();
+
+    let mut figment = Figment::new()
+        .merge(Serialized::defaults(InternalSettings {
+            mpsc_upload_channel_size: 5,
+            mpsc_download_channel_size: 5,
+            master_endpoints: vec!["http://[::1]:9090".to_string()],
+            upload_concurrency: 10,
+            download_concurrency: 10,
+            log_level: "info".to_string(),
+        }))
+        .merge(Toml::file(&cli.config_path));
+
+    if !cli.master_endpoints.is_empty() {
+        figment = figment.merge(("master_endpoints", cli.master_endpoints));
+    }
+
+    figment.extract().expect("Error loading configuration")
+}
 
 /// DAFS CLI - Distributed Asynchronous File System client
 #[derive(Parser, Debug)]
@@ -24,7 +57,7 @@ use tracing::{error, info, instrument};
 struct Cli {
     /// Master node endpoint
     #[arg(short, long, default_value = "http://[::1]:9090")]
-    master: String,
+    master_endpoints: Vec<String>,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(short, long, default_value = "info")]
@@ -32,6 +65,9 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
+
+    #[arg(short, long, default_value = "config.toml")]
+    pub config_path: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -62,21 +98,30 @@ enum Commands {
         #[arg(short, long, default_value = "/")]
         path: String,
     },
+    /// Rename a file or move it from old_path to new_path
+    Rename {
+        #[arg(short, long, default_value = "/")]
+        old_path: String,
+
+        #[arg(short, long, default_value = "/")]
+        new_path: String
+    }
 }
 
-#[instrument(skip(file_handle, data_node_endpoint))]
+#[instrument(skip(file_handle, data_node_endpoint, settings))]
 async fn upload_block(
     block_id: String,
     data_node_endpoint: String,
     offset: u64,
     block_size: i64,
     file_handle: Arc<std::fs::File>,
+    settings: Arc<InternalSettings>,
 ) -> Result<WriteBlockResponse, String> {
     info!(block_id, "Starting block upload");
-    let (tx, rx) = mpsc::channel(5);
+    let (tx, rx) = mpsc::channel(settings.mpsc_upload_channel_size as usize);
     let mut client = DataNodeServiceClient::connect(data_node_endpoint)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("Cannot connect to datanode for upload: {}", e))?;
     let response_fut = client.write_block(ReceiverStream::new(rx));
     tx.send(WriteBlockRequest {
         request_data: Some(RequestData::Metadata(common::dfs::BlockMetadata {
@@ -85,11 +130,11 @@ async fn upload_block(
         })),
     })
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| format!("Failed to send block metadata: {}", e))?;
     let mut bytes_remaining = block_size as usize;
     let mut internal_block_offset = offset;
     while bytes_remaining > 0 {
-        let bytes_to_read = std::cmp::min(bytes_remaining, 64 * 1024);
+        let bytes_to_read = std::cmp::min(bytes_remaining, 64 * 1024); //TODO check block size with master
         let mut sending_buffer = vec![0u8; bytes_to_read];
         let file = Arc::clone(&file_handle);
         let reading = tokio::task::spawn_blocking(move || {
@@ -97,8 +142,13 @@ async fn upload_block(
                 .map(|n| (n, sending_buffer))
         })
         .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("Block read task failed: {}", e))?
+        .map_err(|e| {
+            format!(
+                "Failed to read file at offset {}: {}",
+                internal_block_offset, e
+            )
+        })?;
         let (bytes_read, sending_buffer) = reading;
         if bytes_read == 0 {
             break;
@@ -108,27 +158,30 @@ async fn upload_block(
             request_data: Some(RequestData::ChunkData(sending_buffer)),
         })
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("Failed to send chunk data: {}", e))?;
 
         bytes_remaining -= bytes_read;
         internal_block_offset += bytes_read as u64;
     }
     drop(tx);
-    let response = response_fut.await.map_err(|e| e.to_string())?;
+    let response = response_fut
+        .await
+        .map_err(|e| format!("Failed to get write block response: {}", e))?;
     Ok(response.into_inner())
 }
 
-#[instrument(skip(file_handle, data_node_endpoint))]
+#[instrument(skip(file_handle, data_node_endpoint, settings))]
 async fn download_block(
     block_id: String,
     data_node_endpoint: String,
     offset: u64,
     file_handle: Arc<std::fs::File>,
+    settings: Arc<InternalSettings>,
 ) -> Result<bool, String> {
     info!(block_id, "Starting block download");
     let mut client = DataNodeServiceClient::connect(data_node_endpoint)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("Cannot connect to datanode {}", e.to_string()))?;
 
     let mut current_offset = offset;
     let mut stream = client
@@ -136,37 +189,39 @@ async fn download_block(
             block_id: block_id.clone(),
         })
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("Couldnt read block {}", e.to_string()))?
         .into_inner();
     let mut writing_tasks = JoinSet::new();
     while let Some(msg) = stream.next().await {
-        let data = msg.map_err(|e| e.to_string())?.chunk_data;
+        let data = msg
+            .map_err(|e| format!("Failed to receive block chunk: {}", e))?
+            .chunk_data;
         let data_len = data.len() as u64;
         let write_offset = current_offset;
         let file = Arc::clone(&file_handle);
         writing_tasks.spawn_blocking(move || file.write_at(&data, write_offset));
         current_offset += data_len;
 
-        if writing_tasks.len() > 10 {
+        if writing_tasks.len() > settings.download_concurrency {
             writing_tasks.join_next().await;
         }
     }
 
     while let Some(res) = writing_tasks.join_next().await {
-        res.map_err(|err| err.to_string())?
-            .map_err(|err| err.to_string())?;
+        res.map_err(|err| format!("Block write task failed: {}", err))?
+            .map_err(|err| format!("Failed to write block data to file: {}", err))?;
     }
     info!("Block was downloaded correctly");
     Ok(true)
 }
 
-#[instrument]
+#[instrument(skip(settings))]
 async fn upload_file(
-    master_node_endpoint: String,
+    settings: Arc<InternalSettings>,
     file_path: String,
 ) -> Result<CreateFileResponse, Box<dyn Error>> {
     info!(file_path, "Starting file upload");
-    let mut client = MetadataServiceClient::connect(master_node_endpoint).await?;
+    let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
 
     let file_handle = std::fs::File::open(&file_path)?;
     let create_file_response = client
@@ -177,40 +232,49 @@ async fn upload_file(
         })
         .await?
         .into_inner();
-    let block_assignments = &create_file_response.blocks;
 
     let shared_file_handle = Arc::new(file_handle);
+    let semaphore = Arc::new(Semaphore::new(settings.upload_concurrency));
     let mut set = JoinSet::new();
     let mut block_size = -1;
-    for block_assignment in block_assignments.iter() {
+    for block_assignment in create_file_response.blocks.clone() {
         if block_size == -1 {
             block_size = block_assignment.block_size;
         }
+        let permit = semaphore.clone().acquire_owned().await?;
         let block_offset = block_assignment.order * block_size;
         let block_id = block_assignment.block_id.clone();
-        set.spawn(upload_block(
-            block_id,
-            block_assignment.node_address.clone(),
-            block_offset as u64,
-            block_assignment.block_size,
-            Arc::clone(&shared_file_handle),
-        ));
+        let f_handle = Arc::clone(&shared_file_handle);
+        let settings_clone = Arc::clone(&settings);
+        set.spawn(async move {
+            let result = upload_block(
+                block_id,
+                block_assignment.node_address.clone(),
+                block_offset as u64,
+                block_assignment.block_size,
+                f_handle,
+                settings_clone,
+            )
+            .await;
+            let _ptr = permit;
+            result
+        });
     }
 
     while let Some(res) = set.join_next().await {
-        res.map_err(|e| e.to_string())??;
+        res.map_err(|e| format!("Block upload task panicked: {}", e))??;
     }
     Ok(create_file_response)
 }
 
-#[instrument]
+#[instrument(skip(settings))]
 async fn download_file(
-    master_node_endpoint: String,
+    settings: Arc<InternalSettings>,
     file_path: String,
     out_file_path: String,
 ) -> Result<bool, Box<dyn Error>> {
     info!(file_path, "Starting file download");
-    let mut client = MetadataServiceClient::connect(master_node_endpoint).await?;
+    let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
 
     let get_file_response = client
         .get_file_metadata(GetFileRequest {
@@ -219,43 +283,53 @@ async fn download_file(
         })
         .await?
         .into_inner();
-    let block_assignments = &get_file_response.blocks;
     let file_handle = OpenOptions::new()
         .write(true)
         .create(true)
         .open(&out_file_path)?;
     file_handle.set_len(get_file_response.size as u64)?;
     let shared_file_handle = Arc::new(file_handle);
+    let semaphore = Arc::new(Semaphore::new(settings.download_concurrency));
     let mut set = JoinSet::new();
 
     let mut block_size = -1;
-    for block_assignment in block_assignments.iter() {
+    for block_assignment in get_file_response.blocks.clone() {
         if block_size == -1 {
             block_size = block_assignment.block_size;
         }
+        let permit = semaphore.clone().acquire_owned().await?;
         let block_offset = block_assignment.order * block_size;
         let block_id = block_assignment.block_id.clone();
-        set.spawn(download_block(
-            block_id,
-            block_assignment.node_address.clone(),
-            block_offset as u64,
-            Arc::clone(&shared_file_handle),
-        ));
+        let f_handle = Arc::clone(&shared_file_handle);
+        let settings_clone = Arc::clone(&settings);
+
+        set.spawn(async move {
+            let result = download_block(
+                block_id,
+                block_assignment.node_address.clone(),
+                block_offset as u64,
+                f_handle,
+                settings_clone,
+            )
+            .await;
+            let _ptr = permit;
+            result
+        });
     }
 
     while let Some(res) = set.join_next().await {
-        res.map_err(|e| e.to_string())??;
+        res.map_err(|e| format!("Block download task panicked: {}", e))??;
     }
     Ok(true)
 }
 
-#[instrument]
+#[instrument(skip(settings))]
 async fn list_directory(
-    master_node_endpoint: String,
+    settings: Arc<InternalSettings>,
     directory: String,
 ) -> Result<bool, Box<dyn Error>> {
     info!(directory, "Starting listing directory");
-    let mut client = MetadataServiceClient::connect(master_node_endpoint).await?;
+    let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
 
     let get_file_response = client
         .list_directory(ListDirectoryRequest {
@@ -272,12 +346,25 @@ async fn list_directory(
     Ok(true)
 }
 
+#[instrument(skip(settings))]
+async fn rename_file(
+    settings: Arc<InternalSettings>,
+    old_path: String,
+    new_path: String
+) -> Result<bool, Box<dyn Error>> {
+    info!(old_path, new_path, "Starting renaming file");
+    let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
+
+    client.rename_file(RenameFileRequest{old_path:old_path, new_path:new_path,user_id:"1".to_string()}).await?;
+    Ok(true)
+}
+
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let settings = Arc::new(load_config());
 
     // Initialize tracing with the specified log level
-    let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| cli.log_level.clone());
+    let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| settings.log_level.clone());
 
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(log_level))
@@ -288,8 +375,9 @@ async fn main() {
         .init();
 
     info!("DAFS CLI starting");
-    info!("Master node: {}", cli.master);
+    info!("Master node: {}", settings.master_endpoints.join(", "));
 
+    let cli = Cli::parse();
     let result = match cli.command {
         Commands::Upload { file, remote_path } => {
             let remote = remote_path.unwrap_or_else(|| {
@@ -300,7 +388,7 @@ async fn main() {
                     .to_string()
             });
             info!("Uploading {} to {}", file, remote);
-            upload_file(cli.master, file).await.map(|resp| {
+            upload_file(Arc::clone(&settings), file).await.map(|resp| {
                 info!("File uploaded successfully");
                 info!("Blocks created: {}", resp.blocks.len());
             })
@@ -310,11 +398,20 @@ async fn main() {
             output,
         } => {
             info!("Downloading {} to {}", remote_path, output);
-            download_file(cli.master, remote_path, output)
+            download_file(Arc::clone(&settings), remote_path, output)
                 .await
                 .map(|_| info!("File downloaded successfully"))
         }
-        Commands::List { path } => list_directory(cli.master, path).await.map(|_| ()),
+        Commands::List { path } => list_directory(Arc::clone(&settings), path)
+            .await
+            .map(|_| ()),
+        
+        Commands::Rename { old_path, new_path } => {
+            info!("Renaming/Moving from {} to {}", old_path, new_path);
+            rename_file(Arc::clone(&settings), old_path, new_path)
+                .await
+                .map(|_| info!("File renamed/moved successfully"))
+        }
     };
 
     if let Err(e) = result {

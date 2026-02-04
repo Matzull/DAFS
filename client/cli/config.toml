@@ -1,0 +1,15 @@
+# DAFS CLI Configuration File
+
+# MPSC channel sizes for upload and download operations
+mpsc_upload_channel_size = 5
+mpsc_download_channel_size = 5
+
+# Master node endpoints (can be overridden via CLI flags)
+master_endpoints = ["http://[::1]:9090"]
+
+# Concurrency settings for parallel block operations
+upload_concurrency = 10
+download_concurrency = 10
+
+# Logging level (trace, debug, info, warn, error)
+log_level = "info"

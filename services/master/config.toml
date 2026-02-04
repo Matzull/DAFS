@@ -1,0 +1,13 @@
+# DAFS Master (MetadataNode) Configuration File
+
+# Server listen address
+listen_address = "[::1]:9090"
+
+# Block size (in bytes) - should match datanode settings
+block_size = 65536
+
+# Replication factor - minimum number of nodes that must contain a block
+replication_factor = 2
+
+# Logging level (trace, debug, info, warn, error)
+log_level = "info"
