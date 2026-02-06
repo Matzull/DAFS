@@ -19,7 +19,11 @@ service MetadataService {
     // Lists files in a directory (like 'ls').
   rpc ListDirectory (ListDirectoryRequest) returns (ListDirectoryResponse);
 
+    // Renames a file from old path to new path.
   rpc RenameFile (RenameFileRequest) returns (RenameFileResponse);
+    
+    // Heartbeat sent by the datanodes to the master server.
+  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
 }
 
 // -----------------------------------------------------------------------
@@ -53,13 +57,13 @@ service AuditService {
 // --- Metadata Messages ---
 
 message CreateFileRequest {
-  string path    = 1;      // Full path e.g., "/home/user/thesis.pdf"
-  int64  size    = 2;       // Total size in bytes
-  string user_id = 3;   // User creating the file
+  string path    = 1; // Full path e.g., "/home/user/thesis.pdf"
+  int64  size    = 2; // Total size in bytes
+  string user_id = 3; // User creating the file
 }
 
 message CreateFileResponse {
-  string                   file_id = 1;                  // Internal UUID
+  string                   file_id = 1; // Internal UUID
   repeated BlockAssignment blocks  = 2; // Where the client should write data
 }
 
@@ -110,10 +114,21 @@ message FileInfo {
 }
 
 message BlockAssignment {
-  string block_id     = 1;     // UUID of the chunk
+  string block_id     = 1; // UUID of the chunk
   string node_address = 2; // IP:PORT of the DataNode (e.g., "127.0.0.1:50051")
   int64  block_size   = 3;
-  int64  order        = 4;         // Sequence number (0, 1, 2...)
+  int64  order        = 4; // Sequence number (0, 1, 2...)
+}
+
+message HeartbeatRequest {
+  string node_id    = 1; // Unique ID of the DataNode
+  float  cpu_usage   = 2; // In percentage
+  int64  free_space = 3; // In bytes
+  int64  used_space = 4; // In bytes
+}
+
+message HeartbeatResponse {
+  bool   acknowledgement = 1;
 }
 
 // --- DataNode Messages ---
@@ -159,13 +174,13 @@ message DeleteBlockResponse {
 // --- Audit Messages ---
 
 message AuditRequest {
-  int64  timestamp = 1;      // Unix timestamp
+  int64  timestamp = 1; // Unix timestamp
   string user_id   = 2;
-  string action    = 3;        // "CREATE", "READ_BLOCK", "DELETE"
-  string resource  = 4;      // "/home/user/file.txt" or "BlockID"
-  string component = 5;     // Who is reporting? "MASTER", "DATANODE-1"
-  string status    = 6;        // "SUCCESS", "DENIED"
-  string details   = 7;       // Extra info (e.g., Source IP)
+  string action    = 3; // "CREATE", "READ_BLOCK", "DELETE"
+  string resource  = 4; // "/home/user/file.txt" or "BlockID"
+  string component = 5; // Who is reporting? "MASTER", "DATANODE-1"
+  string status    = 6; // "SUCCESS", "DENIED"
+  string details   = 7; // Extra info (e.g., Source IP)
 }
 
 message AuditResponse {

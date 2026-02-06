@@ -1,8 +1,9 @@
 use clap::Parser;
 use common::dfs::data_node_service_server::{DataNodeService, DataNodeServiceServer};
+use common::dfs::metadata_service_client::MetadataServiceClient;
 use common::dfs::write_block_request::RequestData;
 use common::dfs::{
-    DeleteBlockRequest, DeleteBlockResponse, ReadBlockRequest, ReadBlockResponse,
+    DeleteBlockRequest, DeleteBlockResponse, HeartbeatRequest, ReadBlockRequest, ReadBlockResponse,
     WriteBlockRequest, WriteBlockResponse,
 };
 use figment::{
@@ -11,6 +12,7 @@ use figment::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::process::exit;
 use std::sync::Arc;
 use tokio::fs::{self, create_dir_all, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -243,6 +245,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = DataNodeServiceServer::new(datanode);
 
     info!("Starting DataNode server on {}", address);
+
+    tokio::spawn(async move {
+        info!("HeartBeat sender started");
+        let mut client = MetadataServiceClient::connect("http://[::1]:9090")
+            .await
+            .unwrap(); //TODO, addr of master has to be auto
+        loop {
+            let result = client
+                .heartbeat(HeartbeatRequest {
+                    cpu_usage: 1.0,
+                    node_id: "1".to_string(),
+                    free_space: 4,
+                    used_space: 4,
+                })
+                .await;
+            if result.unwrap().into_inner().acknowledgement {
+                info!("Heartbeat correct");
+                tokio::time::sleep(tokio::time::Duration::from_millis(3000)).await; //TODO remove time hardcoded
+                continue;
+            }
+            error!("Heartbeat response from master was not correct");
+            //TODO: manage better
+            exit(1);
+        }
+    });
 
     Server::builder()
         .add_service(service)

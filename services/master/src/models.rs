@@ -11,6 +11,7 @@ pub enum FileStatus {
 #[derive(Clone, Debug)]
 pub struct DatanodeInfo {
     pub id: String,
+    pub last_heartbeat: i64,
 }
 
 #[derive(Clone, Debug)]

@@ -4,8 +4,8 @@ use common::dfs::metadata_service_server::{MetadataService, MetadataServiceServe
 use common::dfs::{
     data_node_service_client, BlockAssignment, CreateFileRequest, CreateFileResponse,
     DeleteBlockRequest, DeleteFileRequest, DeleteFileResponse, FileInfo, GetFileRequest,
-    GetFileResponse, ListDirectoryRequest, ListDirectoryResponse, RenameFileRequest,
-    RenameFileResponse,
+    GetFileResponse, HeartbeatRequest, HeartbeatResponse, ListDirectoryRequest,
+    ListDirectoryResponse, RenameFileRequest, RenameFileResponse,
 };
 use serde::de::Error;
 use std::path::PathBuf;
@@ -279,19 +279,41 @@ impl MetadataService for Metadatanode {
         request: Request<RenameFileRequest>,
     ) -> Result<Response<RenameFileResponse>, Status> {
         info!("Received rename file request");
-        let rename_req =request.into_inner();
+        let rename_req = request.into_inner();
         let mut files_lock = self.state.files.write().await;
-        if files_lock.contains_key(&rename_req.new_path){
-            return Err(Status::already_exists(format!("File {} already exists", rename_req.new_path)));
+        if files_lock.contains_key(&rename_req.new_path) {
+            return Err(Status::already_exists(format!(
+                "File {} already exists",
+                rename_req.new_path
+            )));
         }
-        if let Some(mut file_metadata) = files_lock.remove(&rename_req.old_path){
+        if let Some(mut file_metadata) = files_lock.remove(&rename_req.old_path) {
             file_metadata.name = rename_req.new_path.clone();
             files_lock.insert(rename_req.new_path, file_metadata);
-        }
-        else {
+        } else {
             return Err(Status::not_found("Couldnt rename file"));
         }
-        Ok(Response::new(RenameFileResponse {success:true, error_message:"".to_string()}))
+        Ok(Response::new(RenameFileResponse {
+            success: true,
+            error_message: "".to_string(),
+        }))
+    }
+
+    async fn heartbeat(
+        &self,
+        request: Request<HeartbeatRequest>,
+    ) -> Result<Response<HeartbeatResponse>, Status> {
+        info!("Received heartbeat from node");
+        let node_request = request.into_inner();
+        // let mut state_lock = self.state.available_datanodes.write().await;
+        info!("{} {}", node_request.node_id, node_request.cpu_usage);
+        // if let Some(datanode) = state_lock.get(&5){ //&node_request.node_id
+        //     info!("")
+        // }
+        //TODO: send audit
+        Ok(Response::new(HeartbeatResponse {
+            acknowledgement: true,
+        }))
     }
 }
 

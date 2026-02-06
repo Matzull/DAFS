@@ -4,9 +4,12 @@ use common::dfs::metadata_service_client::MetadataServiceClient;
 use common::dfs::write_block_request::RequestData;
 use common::dfs::{
     CreateFileRequest, CreateFileResponse, GetFileRequest, ListDirectoryRequest, ReadBlockRequest,
-    WriteBlockRequest, WriteBlockResponse, RenameFileRequest
+    RenameFileRequest, WriteBlockRequest, WriteBlockResponse,
 };
-use figment::{Figment, providers::{Format, Toml, Serialized}};
+use figment::{
+    providers::{Format, Serialized, Toml},
+    Figment,
+};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs::OpenOptions;
@@ -104,8 +107,8 @@ enum Commands {
         old_path: String,
 
         #[arg(short, long, default_value = "/")]
-        new_path: String
-    }
+        new_path: String,
+    },
 }
 
 #[instrument(skip(file_handle, data_node_endpoint, settings))]
@@ -350,12 +353,18 @@ async fn list_directory(
 async fn rename_file(
     settings: Arc<InternalSettings>,
     old_path: String,
-    new_path: String
+    new_path: String,
 ) -> Result<bool, Box<dyn Error>> {
     info!(old_path, new_path, "Starting renaming file");
     let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
 
-    client.rename_file(RenameFileRequest{old_path:old_path, new_path:new_path,user_id:"1".to_string()}).await?;
+    client
+        .rename_file(RenameFileRequest {
+            old_path: old_path,
+            new_path: new_path,
+            user_id: "1".to_string(),
+        })
+        .await?;
     Ok(true)
 }
 
@@ -405,7 +414,7 @@ async fn main() {
         Commands::List { path } => list_directory(Arc::clone(&settings), path)
             .await
             .map(|_| ()),
-        
+
         Commands::Rename { old_path, new_path } => {
             info!("Renaming/Moving from {} to {}", old_path, new_path);
             rename_file(Arc::clone(&settings), old_path, new_path)
