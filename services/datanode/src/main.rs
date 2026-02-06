@@ -258,7 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     debug!("Creating directory to store files");
     create_dir_all(&settings.data_folder).await?;
-    let address = settings.listen_address.parse()?;
+    let address: std::net::SocketAddr = settings.listen_address.parse()?;
     let datanode = Datanode {
         node_id: Arc::new(Mutex::new(0)),
         settings: Arc::clone(&settings),
@@ -302,6 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     node_id: current_node_id,
                     free_space: 4,
                     used_space: 4,
+                    addr: address.to_string(),
                 })
                 .await;
 
@@ -313,11 +314,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if current_node_id == 0 && resp.assigned_node_id > 0 {
                             let new_id = resp.assigned_node_id as u16;
                             *node_id_arc.lock().await = new_id;
-                            info!(
-                                node_id = new_id,
-                                address = resp.node_address,
-                                "Registered with master, assigned node_id"
-                            );
+                            info!(node_id = new_id, "Registered with master, assigned node_id");
                         } else {
                             debug!(node_id = current_node_id, "Heartbeat acknowledged");
                         }

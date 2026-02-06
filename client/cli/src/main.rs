@@ -41,7 +41,7 @@ pub fn load_config() -> InternalSettings {
             mpsc_upload_channel_size: 5,
             mpsc_download_channel_size: 5,
             master_endpoints: vec!["http://[::1]:9090".to_string()],
-            upload_concurrency: 10,
+            upload_concurrency: 2,
             download_concurrency: 10,
             log_level: "info".to_string(),
         }))
@@ -129,7 +129,7 @@ async fn upload_block(
     let response_fut = client.write_block(ReceiverStream::new(rx));
     tx.send(WriteBlockRequest {
         request_data: Some(RequestData::Metadata(common::dfs::BlockMetadata {
-            block_id,
+            block_id: block_id.clone(),
             total_size: block_size,
         })),
     })
@@ -169,12 +169,12 @@ async fn upload_block(
     }
     drop(tx);
     let response = response_fut.await.map_err(|e| {
-        error!(block_id, "Failed to get write block response: {}", e);
+        error!("Failed to get write block response: {}", e);
         format!("Failed to get write block response: {}", e)
     })?;
     let inner = response.into_inner();
     info!(
-        block_id,
+        block_id = &block_id,
         bytes_written = inner.bytes_written,
         "Block upload completed successfully"
     );
@@ -258,12 +258,15 @@ async fn upload_file(
         if block_size == -1 {
             block_size = block_assignment.block_size;
         }
-        let permit = semaphore.clone().acquire_owned().await?;
         let block_offset = block_assignment.order * block_size;
         let block_id = block_assignment.block_id.clone();
         let f_handle = Arc::clone(&shared_file_handle);
         let settings_clone = Arc::clone(&settings);
+        let sem = Arc::clone(&semaphore); // Clonamos el Arc fuera
+
         set.spawn(async move {
+            let _permit = sem.acquire_owned().await.map_err(|e| e.to_string())?;
+
             let result = upload_block(
                 block_id,
                 block_assignment.node_address.clone(),
@@ -273,7 +276,7 @@ async fn upload_file(
                 settings_clone,
             )
             .await;
-            let _ptr = permit;
+
             result
         });
     }

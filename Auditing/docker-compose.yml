@@ -1,4 +1,3 @@
-version: '3'
 services:
   # Base de datos de Logs
   elasticsearch:
@@ -18,5 +17,15 @@ services:
       - "5601:5601"
     environment:
       - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    depends_on:
+      - elasticsearch
+  
+  init-es:
+    image: alpine:latest
+    command: >
+      sh -c "apk add curl && 
+      curl -X PUT 'elasticsearch:9200/_index_template/dfs_audit_template' -H 'Content-Type: application/json' -d '@template.json'"
+    volumes:
+      - ./template.json:/template.json
     depends_on:
       - elasticsearch

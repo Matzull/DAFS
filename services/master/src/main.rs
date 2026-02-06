@@ -79,10 +79,20 @@ struct Cli {
     pub config_path: String,
 }
 
+#[derive(Serialize, Clone)]
+pub struct AuditLog {
+    pub timestamp: i64,
+    pub action: String,
+    pub file_path: String,
+    pub status: String,
+    pub user: String,
+}
+
 #[derive(Debug)]
 pub struct Metadatanode {
     pub state: Arc<MasterState>,
     pub garbage_collector_tx: mpsc::Sender<Vec<BlockMetadata>>,
+    pub audit_tx: mpsc::Sender<AuditLog>,
     pub settings: Arc<InternalSettings>,
     pub next_node_id: AtomicU16,
 }
@@ -92,6 +102,7 @@ impl Clone for Metadatanode {
         Metadatanode {
             state: Arc::clone(&self.state),
             garbage_collector_tx: self.garbage_collector_tx.clone(),
+            audit_tx: self.audit_tx.clone(),
             settings: Arc::clone(&self.settings),
             next_node_id: AtomicU16::new(self.next_node_id.load(Ordering::SeqCst)),
         }
@@ -193,7 +204,7 @@ impl MetadataService for Metadatanode {
             ._create_file(
                 &self.state,
                 &self.settings,
-                file_request.path,
+                file_request.path.clone(),
                 file_request.size,
             )
             .await
@@ -209,6 +220,8 @@ impl MetadataService for Metadatanode {
                 order: block.index as i64, //TODO: check var size i64 vs i32
             })
             .collect();
+        self.audit("Creating file".to_string(), file_request.path.clone())
+            .await;
         Ok(Response::new(CreateFileResponse {
             file_id: file_metadata.id,
             blocks: block_assignments,
@@ -238,6 +251,8 @@ impl MetadataService for Metadatanode {
                 order: block.index as i64, //TODO: check var size i64 vs i32
             })
             .collect();
+        self.audit("Getting file".to_string(), file_path.to_string())
+            .await;
         Ok(Response::new(GetFileResponse {
             file_id: file_metadata.id.clone(),
             size: file_metadata.size,
@@ -261,6 +276,8 @@ impl MetadataService for Metadatanode {
                 file_path,
                 block_count, "File deleted, blocks queued for garbage collection"
             );
+            self.audit("Deleting file".to_string(), file_path.to_string())
+                .await;
             Ok(Response::new(DeleteFileResponse {
                 success: true,
                 error_message: "".to_string(),
@@ -293,6 +310,8 @@ impl MetadataService for Metadatanode {
             file_count = files.len(),
             "Directory listing completed"
         );
+        self.audit("Listing dir".to_string(), dir_path.to_string())
+            .await;
         Ok(Response::new(ListDirectoryResponse { files }))
     }
 
@@ -326,6 +345,9 @@ impl MetadataService for Metadatanode {
             warn!(old_path = rename_req.old_path, "File not found for rename");
             return Err(Status::not_found("Couldnt rename file"));
         }
+        self.audit("Renamed file".to_string(), rename_req.old_path.to_string())
+            .await;
+
         Ok(Response::new(RenameFileResponse {
             success: true,
             error_message: "".to_string(),
@@ -337,22 +359,14 @@ impl MetadataService for Metadatanode {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
-        let remote_addr = request
-            .remote_addr()
-            .map(|addr| addr.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
         let node_request = request.into_inner();
-
+        let remote_addr = node_request.addr;
         let mut datanodes_lock = self.state.available_datanodes.write().await;
 
         // If node_id is 0, this is a new datanode registering
         if node_request.node_id == 0 {
             let new_id = self.next_node_id.fetch_add(1, Ordering::SeqCst);
-            info!(
-                assigned_node_id = new_id,
-                address = %remote_addr,
-                "New datanode registered"
-            );
+            info!(assigned_node_id = new_id, "New datanode registered");
 
             // Extract IP from remote_addr and use standard datanode port
             let datanode_addr = format!("http://{}", remote_addr);
@@ -372,7 +386,6 @@ impl MetadataService for Metadatanode {
             return Ok(Response::new(HeartbeatResponse {
                 acknowledgement: true,
                 assigned_node_id: new_id as u32,
-                node_address: datanode_addr,
             }));
         }
 
@@ -400,7 +413,6 @@ impl MetadataService for Metadatanode {
         Ok(Response::new(HeartbeatResponse {
             acknowledgement: true,
             assigned_node_id: node_request.node_id,
-            node_address: "".to_string(),
         }))
     }
 }
@@ -432,7 +444,26 @@ impl Metadatanode {
                 format!("Could not delete block on datanode {}", err)
             })?;
         info!(block_id, datanode, "Block deletion confirmed by datanode");
+        self.audit("Notified to delete".to_string(), block_id.to_string())
+            .await;
         Ok(true)
+    }
+
+    async fn audit(&self, action: String, file_path: String) {
+        let millis_now = time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis() as i64;
+        self.audit_tx
+            .send(AuditLog {
+                timestamp: millis_now,
+                action: action.to_string(),
+                file_path: file_path,
+                status: "SUCCESS".to_string(),
+                user: "1".to_string(),
+            })
+            .await
+            .ok();
     }
 }
 
@@ -458,6 +489,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (garbage_collector_tx, mut garbage_collector_rx) =
         mpsc::channel::<Vec<BlockMetadata>>(1000);
+    let (audit_tx, mut audit_rx) = mpsc::channel::<AuditLog>(10000); // Buffer grande
 
     let metadatanode = Arc::new(Metadatanode {
         state: Arc::new(MasterState {
@@ -466,6 +498,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         settings: Arc::clone(&settings),
         garbage_collector_tx: garbage_collector_tx,
+        audit_tx: audit_tx,
         next_node_id: AtomicU16::new(1), // Start assigning IDs from 1
     });
 
@@ -497,6 +530,23 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         error!("Error deleting block {} in {}: {}", block.id, location, e);
                     }
                 }
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let es_url = "http://localhost:9200/dfs-audit/_doc";
+
+        while let Some(log) = audit_rx.recv().await {
+            // Enviar a Elastic de forma asíncrona
+            // Aquí podrías añadir reintentos si falla la petición
+            info!("Sending log");
+            let res = client.post(es_url).json(&log).send().await;
+
+            match res {
+                Ok(response) => info!("Respuesta Elastic: {:?}", response.status()), // <--- DEBUG
+                Err(e) => error!("Error enviando log: {:?}", e),                     // <--- DEBUG
             }
         }
     });

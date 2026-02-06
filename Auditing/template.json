@@ -1,0 +1,14 @@
+{
+  "index_patterns": ["dfs-audit-*"],
+  "template": {
+    "mappings": {
+      "properties": {
+        "timestamp": { "type": "date" },
+        "action":    { "type": "keyword" },
+        "file_path": { "type": "keyword" },
+        "status":    { "type": "keyword" },
+        "user":      { "type": "keyword" }
+      }
+    }
+  }
+}
