@@ -20,7 +20,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
-use tracing::{error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 #[derive(Parser, Debug, Serialize, Deserialize)]
 pub struct InternalSettings {
@@ -34,6 +34,7 @@ pub struct InternalSettings {
 
 pub fn load_config() -> InternalSettings {
     let cli = Cli::parse();
+    info!("Loading CLI configuration from '{}'", cli.config_path);
 
     let mut figment = Figment::new()
         .merge(Serialized::defaults(InternalSettings {
@@ -167,10 +168,17 @@ async fn upload_block(
         internal_block_offset += bytes_read as u64;
     }
     drop(tx);
-    let response = response_fut
-        .await
-        .map_err(|e| format!("Failed to get write block response: {}", e))?;
-    Ok(response.into_inner())
+    let response = response_fut.await.map_err(|e| {
+        error!(block_id, "Failed to get write block response: {}", e);
+        format!("Failed to get write block response: {}", e)
+    })?;
+    let inner = response.into_inner();
+    info!(
+        block_id,
+        bytes_written = inner.bytes_written,
+        "Block upload completed successfully"
+    );
+    Ok(inner)
 }
 
 #[instrument(skip(file_handle, data_node_endpoint, settings))]
@@ -211,10 +219,16 @@ async fn download_block(
     }
 
     while let Some(res) = writing_tasks.join_next().await {
-        res.map_err(|err| format!("Block write task failed: {}", err))?
-            .map_err(|err| format!("Failed to write block data to file: {}", err))?;
+        res.map_err(|err| {
+            error!(block_id, "Block write task failed: {}", err);
+            format!("Block write task failed: {}", err)
+        })?
+        .map_err(|err| {
+            error!(block_id, "Failed to write block data to file: {}", err);
+            format!("Failed to write block data to file: {}", err)
+        })?;
     }
-    info!("Block was downloaded correctly");
+    info!(block_id, "Block downloaded successfully");
     Ok(true)
 }
 
@@ -265,8 +279,16 @@ async fn upload_file(
     }
 
     while let Some(res) = set.join_next().await {
-        res.map_err(|e| format!("Block upload task panicked: {}", e))??;
+        res.map_err(|e| {
+            error!(file_path, "Block upload task panicked: {}", e);
+            format!("Block upload task panicked: {}", e)
+        })??;
     }
+    info!(
+        file_path,
+        blocks = create_file_response.blocks.len(),
+        "File upload completed successfully"
+    );
     Ok(create_file_response)
 }
 
@@ -321,8 +343,15 @@ async fn download_file(
     }
 
     while let Some(res) = set.join_next().await {
-        res.map_err(|e| format!("Block download task panicked: {}", e))??;
+        res.map_err(|e| {
+            error!(file_path, "Block download task panicked: {}", e);
+            format!("Block download task panicked: {}", e)
+        })??;
     }
+    info!(
+        file_path,
+        out_file_path, "File download completed successfully"
+    );
     Ok(true)
 }
 
@@ -340,12 +369,14 @@ async fn list_directory(
         })
         .await?
         .into_inner();
+    let file_count = get_file_response.files.len();
     for file in get_file_response.files {
         println!(
             "Dir: {} ---- Size: {} bytes ---- {}",
             file.is_directory, file.size, file.filename
         );
     }
+    info!(directory, file_count, "Directory listing completed");
     Ok(true)
 }
 
@@ -360,11 +391,12 @@ async fn rename_file(
 
     client
         .rename_file(RenameFileRequest {
-            old_path: old_path,
-            new_path: new_path,
+            old_path: old_path.clone(),
+            new_path: new_path.clone(),
             user_id: "1".to_string(),
         })
         .await?;
+    info!(old_path, new_path, "File rename completed successfully");
     Ok(true)
 }
 

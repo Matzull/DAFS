@@ -10,7 +10,8 @@ pub enum FileStatus {
 
 #[derive(Clone, Debug)]
 pub struct DatanodeInfo {
-    pub id: String,
+    pub id: u16,
+    pub addr: String,
     pub last_heartbeat: i64,
 }
 
@@ -20,7 +21,7 @@ pub struct BlockMetadata {
     pub index: i32,
     pub size: i64,
 
-    pub locations: Vec<i32>, //The ids of the datanodes containing that block
+    pub locations: Vec<u16>, //The ids of the datanodes containing that block
 }
 #[derive(Clone, Debug)]
 pub struct FileMetadata {
@@ -42,44 +43,20 @@ pub struct FileMetadata {
 #[derive(Debug)]
 pub struct MasterState {
     pub files: RwLock<HashMap<String, FileMetadata>>,
-    pub available_datanodes: RwLock<HashMap<i32, String>>,
+    pub available_datanodes: RwLock<HashMap<u16, DatanodeInfo>>,
 }
 
-impl MasterState {
-    /// Create a new empty MasterState
-    pub fn new() -> Self {
-        MasterState {
-            files: RwLock::new(HashMap::new()),
-            available_datanodes: RwLock::new(HashMap::new()),
-        }
-    }
-
-    /// Create a MasterState with the given datanodes
-    pub fn with_datanodes(datanodes: HashMap<i32, String>) -> Self {
-        MasterState {
-            files: RwLock::new(HashMap::new()),
-            available_datanodes: RwLock::new(datanodes),
-        }
-    }
-}
-
-impl Default for MasterState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl BlockMetadata {
-    /// Create a new block metadata
-    pub fn new(id: String, index: i32, size: i64, locations: Vec<i32>) -> Self {
-        BlockMetadata {
-            id,
-            index,
-            size,
-            locations,
-        }
-    }
-}
+// impl BlockMetadata {
+//     /// Create a new block metadata
+//     pub fn new(id: String, index: i32, size: i64, locations: Vec<i32>) -> Self {
+//         BlockMetadata {
+//             id,
+//             index,
+//             size,
+//             locations,
+//         }
+//     }
+// }
 
 impl FileMetadata {
     /// Check if the file is ready for reading

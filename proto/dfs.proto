@@ -39,6 +39,9 @@ service DataNodeService {
     
     // Deletes a block from the DataNode.
   rpc DeleteBlock (DeleteBlockRequest) returns (DeleteBlockResponse);
+
+    // Configuration command from Master to DataNode.
+  rpc ConfigureNode (ConfigureNodeRequest) returns (ConfigureNodeResponse);
 }
 
 // -----------------------------------------------------------------------
@@ -121,14 +124,16 @@ message BlockAssignment {
 }
 
 message HeartbeatRequest {
-  string node_id    = 1; // Unique ID of the DataNode
+  uint32 node_id    = 1; // Unique ID of the DataNode
   float  cpu_usage   = 2; // In percentage
   int64  free_space = 3; // In bytes
   int64  used_space = 4; // In bytes
 }
 
 message HeartbeatResponse {
-  bool   acknowledgement = 1;
+  bool   acknowledgement   = 1;
+  uint32 assigned_node_id  = 2; // If node_id was 0 in request, master assigns a new ID here
+  string node_address      = 3; // The address the datanode should use for itself
 }
 
 // --- DataNode Messages ---
@@ -169,6 +174,16 @@ message DeleteBlockResponse {
     bool   success       = 1;
     string error_message = 2;
   }
+}
+
+message ConfigureNodeRequest {
+  uint32 node_id = 1;
+  string config  = 2;
+}
+
+message ConfigureNodeResponse {
+  bool   success       = 1;
+  string error_message = 2;
 }
 
 // --- Audit Messages ---

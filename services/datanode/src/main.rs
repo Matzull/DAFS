@@ -3,8 +3,8 @@ use common::dfs::data_node_service_server::{DataNodeService, DataNodeServiceServ
 use common::dfs::metadata_service_client::MetadataServiceClient;
 use common::dfs::write_block_request::RequestData;
 use common::dfs::{
-    DeleteBlockRequest, DeleteBlockResponse, HeartbeatRequest, ReadBlockRequest, ReadBlockResponse,
-    WriteBlockRequest, WriteBlockResponse,
+    ConfigureNodeRequest, ConfigureNodeResponse, DeleteBlockRequest, DeleteBlockResponse,
+    HeartbeatRequest, ReadBlockRequest, ReadBlockResponse, WriteBlockRequest, WriteBlockResponse,
 };
 use figment::{
     providers::{Format, Serialized, Toml},
@@ -12,11 +12,10 @@ use figment::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::process::exit;
 use std::sync::Arc;
 use tokio::fs::{self, create_dir_all, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
@@ -76,6 +75,7 @@ struct Cli {
 
 #[derive(Default)]
 pub struct Datanode {
+    pub node_id: Arc<Mutex<u16>>,
     pub settings: Arc<InternalSettings>,
 }
 
@@ -209,13 +209,33 @@ impl DataNodeService for Datanode {
         let mut file_path_pathbuf = PathBuf::from(&self.settings.data_folder);
         file_path_pathbuf.push(&block_id[..2]);
         file_path_pathbuf.push(&block_id[2..4]);
-        let _ = fs::remove_file(file_path_pathbuf)
+        let _ = fs::remove_file(&file_path_pathbuf)
             .await
-            .map_err(|err| Status::not_found(format!("Could not delete file {}", err)));
+            .map_err(|err| {
+                warn!(block_id = %block_id, path = ?file_path_pathbuf, "Could not delete block file: {}", err);
+                Status::not_found(format!("Could not delete file {}", err))
+            });
+        info!(block_id = %block_id, "Block deleted successfully");
         Ok(Response::new(DeleteBlockResponse {
             delete_result: Some(common::dfs::delete_block_response::DeleteResult::Success(
                 true,
             )),
+        }))
+    }
+
+    #[instrument(skip(self, request))]
+    async fn configure_node(
+        &self,
+        request: Request<ConfigureNodeRequest>,
+    ) -> Result<Response<ConfigureNodeResponse>, Status> {
+        let req = request.into_inner();
+        let new_node_id = req.node_id;
+        info!(node_id = new_node_id, "Received configure_node request");
+        *self.node_id.lock().await = new_node_id as u16;
+        info!(node_id = new_node_id, "Node configured successfully");
+        Ok(Response::new(ConfigureNodeResponse {
+            success: true,
+            error_message: "".to_string(),
         }))
     }
 }
@@ -240,34 +260,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     create_dir_all(&settings.data_folder).await?;
     let address = settings.listen_address.parse()?;
     let datanode = Datanode {
+        node_id: Arc::new(Mutex::new(0)),
         settings: Arc::clone(&settings),
     };
+    let node_id_arc = Arc::clone(&datanode.node_id);
     let service = DataNodeServiceServer::new(datanode);
 
     info!("Starting DataNode server on {}", address);
 
     tokio::spawn(async move {
-        info!("HeartBeat sender started");
-        let mut client = MetadataServiceClient::connect("http://[::1]:9090")
-            .await
-            .unwrap(); //TODO, addr of master has to be auto
+        info!("HeartBeat sender starting - will register with master");
+
+        // Retry connection with exponential backoff
+        let mut retry_delay = tokio::time::Duration::from_millis(500);
+        let max_retry_delay = tokio::time::Duration::from_secs(30);
+
+        let mut client = loop {
+            match MetadataServiceClient::connect("http://[::1]:9090").await {
+                Ok(c) => {
+                    info!("Connected to master server");
+                    break c;
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to connect to master: {}. Retrying in {:?}...",
+                        e, retry_delay
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
+                }
+            }
+        };
+
         loop {
+            let current_node_id = *node_id_arc.lock().await as u32;
+
+            info!("Sending heartbeat");
             let result = client
                 .heartbeat(HeartbeatRequest {
                     cpu_usage: 1.0,
-                    node_id: "1".to_string(),
+                    node_id: current_node_id,
                     free_space: 4,
                     used_space: 4,
                 })
                 .await;
-            if result.unwrap().into_inner().acknowledgement {
-                info!("Heartbeat correct");
-                tokio::time::sleep(tokio::time::Duration::from_millis(3000)).await; //TODO remove time hardcoded
-                continue;
+
+            match result {
+                Ok(response) => {
+                    let resp = response.into_inner();
+                    if resp.acknowledgement {
+                        // If we sent node_id=0 (not registered), update with assigned ID
+                        if current_node_id == 0 && resp.assigned_node_id > 0 {
+                            let new_id = resp.assigned_node_id as u16;
+                            *node_id_arc.lock().await = new_id;
+                            info!(
+                                node_id = new_id,
+                                address = resp.node_address,
+                                "Registered with master, assigned node_id"
+                            );
+                        } else {
+                            debug!(node_id = current_node_id, "Heartbeat acknowledged");
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(3000)).await;
+                    } else {
+                        error!("Heartbeat not acknowledged by master");
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                    }
+                }
+                Err(e) => {
+                    error!("Heartbeat failed: {}. Attempting to reconnect...", e);
+                    // Try to reconnect
+                    retry_delay = tokio::time::Duration::from_millis(500);
+                    loop {
+                        match MetadataServiceClient::connect("http://[::1]:9090").await {
+                            Ok(c) => {
+                                info!("Reconnected to master server");
+                                client = c;
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to reconnect to master: {}. Retrying in {:?}...",
+                                    e, retry_delay
+                                );
+                                tokio::time::sleep(retry_delay).await;
+                                retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
+                            }
+                        }
+                    }
+                }
             }
-            error!("Heartbeat response from master was not correct");
-            //TODO: manage better
-            exit(1);
         }
     });
 
