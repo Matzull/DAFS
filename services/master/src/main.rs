@@ -22,6 +22,7 @@ use figment::{
     Figment,
 };
 use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, RwLock};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -81,7 +82,7 @@ struct Cli {
 
 #[derive(Serialize, Clone)]
 pub struct AuditLog {
-    pub timestamp: i64,
+    pub timestamp: DateTime<Utc>, //In epoch_millis but serialized
     pub action: String,
     pub file_path: String,
     pub status: String,
@@ -450,13 +451,10 @@ impl Metadatanode {
     }
 
     async fn audit(&self, action: String, file_path: String) {
-        let millis_now = time::SystemTime::now()
-            .duration_since(time::UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_millis() as i64;
+        let now = Utc::now();
         self.audit_tx
             .send(AuditLog {
-                timestamp: millis_now,
+                timestamp: now,
                 action: action.to_string(),
                 file_path: file_path,
                 status: "SUCCESS".to_string(),
