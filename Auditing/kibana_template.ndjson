@@ -1,0 +1,89 @@
+{
+    "attributes": {
+        "fieldAttrs": "{}",
+        "fieldFormatMap": "{}",
+        "fields": "[]",
+        "name": "DAFS",
+        "runtimeFieldMap": "{}",
+        "sourceFilters": "[]",
+        "timeFieldName": "timestamp",
+        "title": "dfs-audit*",
+        "typeMeta": "{}"
+    },
+    "coreMigrationVersion": "8.7.1",
+    "created_at": "2026-02-09T18:19:51.727Z",
+    "id": "fa40b26f-2f7c-4da3-9a4f-cf683ef00db5",
+    "migrationVersion": {
+        "index-pattern": "8.0.0"
+    },
+    "references": [],
+    "type": "index-pattern",
+    "updated_at": "2026-02-09T18:19:51.727Z",
+    "version": "WzIwNywxXQ=="
+}
+{
+    "attributes": {
+        "description": "",
+        "kibanaSavedObjectMeta": {
+            "searchSourceJSON": "{\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
+        },
+        "optionsJSON": "{\"useMargins\":true,\"syncColors\":false,\"syncCursor\":true,\"syncTooltips\":false,\"hidePanelTitles\":false}",
+        "panelsJSON": "[{\"version\":\"8.7.1\",\"type\":\"lens\",\"gridData\":{\"x\":0,\"y\":0,\"w\":24,\"h\":15,\"i\":\"b51b5882-da24-4ea7-bd00-c8bd61ec86db\"},\"panelIndex\":\"b51b5882-da24-4ea7-bd00-c8bd61ec86db\",\"embeddableConfig\":{\"attributes\":{\"title\":\"\",\"visualizationType\":\"lnsXY\",\"type\":\"lens\",\"references\":[{\"type\":\"index-pattern\",\"id\":\"fa40b26f-2f7c-4da3-9a4f-cf683ef00db5\",\"name\":\"indexpattern-datasource-layer-c75eeba5-bbd2-4fe2-8b34-76d5248dfe77\"}],\"state\":{\"visualization\":{\"title\":\"Empty XY chart\",\"legend\":{\"isVisible\":true,\"position\":\"right\"},\"valueLabels\":\"hide\",\"preferredSeriesType\":\"line\",\"layers\":[{\"layerId\":\"c75eeba5-bbd2-4fe2-8b34-76d5248dfe77\",\"accessors\":[\"9ada2ba5-e3cb-4a08-9509-fc9ae691dcaf\"],\"position\":\"top\",\"seriesType\":\"line\",\"showGridlines\":false,\"layerType\":\"data\",\"xAccessor\":\"3c4edc5a-3d51-4971-a03e-dc3ae166686c\"}],\"curveType\":\"CURVE_MONOTONE_X\",\"yTitle\":\"Operations\",\"axisTitlesVisibilitySettings\":{\"x\":true,\"yLeft\":true,\"yRight\":true},\"xTitle\":\"Timestamp\",\"gridlinesVisibilitySettings\":{\"x\":true,\"yLeft\":true,\"yRight\":true},\"tickLabelsVisibilitySettings\":{\"x\":true,\"yLeft\":true,\"yRight\":true},\"hideEndzones\":false,\"showCurrentTimeMarker\":true},\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filters\":[],\"datasourceStates\":{\"formBased\":{\"layers\":{\"c75eeba5-bbd2-4fe2-8b34-76d5248dfe77\":{\"columns\":{\"3c4edc5a-3d51-4971-a03e-dc3ae166686c\":{\"label\":\"timestamp\",\"dataType\":\"date\",\"operationType\":\"date_histogram\",\"sourceField\":\"timestamp\",\"isBucketed\":true,\"scale\":\"interval\",\"params\":{\"interval\":\"auto\",\"includeEmptyRows\":true,\"dropPartials\":false}},\"9ada2ba5-e3cb-4a08-9509-fc9ae691dcaf\":{\"label\":\"Count of records\",\"dataType\":\"number\",\"operationType\":\"count\",\"isBucketed\":false,\"scale\":\"ratio\",\"sourceField\":\"___records___\",\"params\":{\"emptyAsNull\":true}}},\"columnOrder\":[\"3c4edc5a-3d51-4971-a03e-dc3ae166686c\",\"9ada2ba5-e3cb-4a08-9509-fc9ae691dcaf\"],\"sampling\":1,\"incompleteColumns\":{}}}},\"textBased\":{\"layers\":{}}},\"internalReferences\":[],\"adHocDataViews\":{}}},\"enhancements\":{}}}]",
+        "timeRestore": false,
+        "title": "Test1",
+        "version": 1
+    },
+    "coreMigrationVersion": "8.7.1",
+    "created_at": "2026-02-09T18:25:33.181Z",
+    "id": "b8882ad0-05e4-11f1-adff-abc66a9c55db",
+    "migrationVersion": {
+        "dashboard": "8.7.0"
+    },
+    "references": [
+        {
+            "id": "fa40b26f-2f7c-4da3-9a4f-cf683ef00db5",
+            "name": "b51b5882-da24-4ea7-bd00-c8bd61ec86db:indexpattern-datasource-layer-c75eeba5-bbd2-4fe2-8b34-76d5248dfe77",
+            "type": "index-pattern"
+        }
+    ],
+    "type": "dashboard",
+    "updated_at": "2026-02-09T18:25:33.181Z",
+    "version": "WzMxNiwxXQ=="
+}
+{
+    "attributes": {
+        "buildNum": 61224,
+        "defaultIndex": "fa40b26f-2f7c-4da3-9a4f-cf683ef00db5",
+        "isDefaultIndexMigrated": true
+    },
+    "coreMigrationVersion": "8.7.1",
+    "created_at": "2026-02-09T17:51:31.377Z",
+    "id": "8.7.1",
+    "migrationVersion": {
+        "config": "8.7.0"
+    },
+    "references": [],
+    "type": "config",
+    "updated_at": "2026-02-09T18:19:52.730Z",
+    "version": "WzIwOCwxXQ=="
+}
+{
+    "attributes": {
+        "buildNum": 61224,
+        "isDefaultIndexMigrated": true
+    },
+    "coreMigrationVersion": "8.7.1",
+    "created_at": "2026-02-09T17:59:08.894Z",
+    "id": "8.7.1",
+    "references": [],
+    "type": "config-global",
+    "updated_at": "2026-02-09T17:59:08.894Z",
+    "version": "WzE0OCwxXQ=="
+}
+{
+    "excludedObjects": [],
+    "excludedObjectsCount": 0,
+    "exportedCount": 4,
+    "missingRefCount": 0,
+    "missingReferences": []
+}

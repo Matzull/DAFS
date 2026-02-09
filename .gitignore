@@ -17,3 +17,9 @@ target/
 testing/datanode
 
 *.dat
+
+*.env
+
+Auditing/kibanadata
+Auditing/certs
+Auditing/esdata01
