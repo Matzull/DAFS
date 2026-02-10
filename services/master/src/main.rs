@@ -16,21 +16,20 @@ use std::{
     time::{self},
 };
 
+use chrono::{DateTime, Utc};
 use clap::Parser;
+use dotenvy::dotenv;
 use figment::{
     providers::{Format, Serialized, Toml},
     Figment,
 };
 use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Utc};
+use std::env;
 use tokio::sync::{mpsc, RwLock};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
-use std::env;
-use dotenvy::dotenv;
-
 
 const BLOCK_SIZE: i64 = 64 * 1024;
 const REPLICATION: i32 = 2; //Minimum number of nodes that must contain a block
@@ -535,24 +534,31 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     dotenv().ok();
-    env::vars()
-        .for_each(|(key, value)| {
-            debug!("Env var: {}={}", key, value);
-        });
+    env::vars().for_each(|(key, value)| {
+        debug!("Env var: {}={}", key, value);
+    });
     let es_url = env::var("ELASTIC_URL").expect("URL not defined");
     let es_user = env::var("ELASTIC_USER").expect("User not defined");
     let es_pass = env::var("ELASTIC_PASSWORD").expect("Pass not defined");
 
     tokio::spawn(async move {
         let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true) 
-        .build()
-        .expect("Failed to build client");
-        info!("Audit Logger started, sending logs to ElasticSearch at {}", es_url);
+            .danger_accept_invalid_certs(true)
+            .build()
+            .expect("Failed to build client");
+        info!(
+            "Audit Logger started, sending logs to ElasticSearch at {}",
+            es_url
+        );
 
         while let Some(log) = audit_rx.recv().await {
             info!("Sending log");
-            let res = client.post(&es_url).basic_auth(&es_user, Some(&es_pass)).json(&log).send().await;
+            let res = client
+                .post(&es_url)
+                .basic_auth(&es_user, Some(&es_pass))
+                .json(&log)
+                .send()
+                .await;
 
             match res {
                 Ok(response) => info!("Respuesta Elastic: {:?}", response.status()), // <--- DEBUG
