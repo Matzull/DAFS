@@ -1,11 +1,13 @@
 use clap::Parser;
 use common::dfs::data_node_service_server::{DataNodeService, DataNodeServiceServer};
 use common::dfs::metadata_service_client::MetadataServiceClient;
+use common::dfs::read_block_response::ResponseData;
 use common::dfs::write_block_request::RequestData;
 use common::dfs::{
     ConfigureNodeRequest, ConfigureNodeResponse, DeleteBlockRequest, DeleteBlockResponse,
     HeartbeatRequest, ReadBlockRequest, ReadBlockResponse, WriteBlockRequest, WriteBlockResponse,
 };
+use crc32fast::Hasher;
 use figment::{
     providers::{Format, Serialized, Toml},
     Figment,
@@ -20,6 +22,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Server, Uri};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, instrument, warn};
+use tracing_subscriber::field::debug;
 
 const DEFAULT_DATA_FOLDER: &str = "./testing/datanode";
 const DEFAULT_LOG_LEVEL: &str = "info";
@@ -70,7 +73,7 @@ struct Cli {
     data_folder: Option<String>,
 
     /// Log level (trace, debug, info, warn, error)
-    #[arg(long)]
+    #[arg(long, global = true)]
     #[serde(skip_serializing_if = "Option::is_none")]
     log_level: Option<String>,
 
@@ -95,6 +98,7 @@ impl DataNodeService for Datanode {
         request: Request<Streaming<WriteBlockRequest>>,
     ) -> Result<Response<WriteBlockResponse>, Status> {
         debug!("Received write_block request");
+        let mut hasher = Hasher::new();
         let mut stream = request.into_inner();
         // let mut file: Option<File> = None;
         let mut writer: Option<BufWriter<File>> = None;
@@ -137,11 +141,25 @@ impl DataNodeService for Datanode {
                             error!(%err, "Failed to write chunk data");
                             Status::internal(err.to_string())
                         })?;
+                        hasher.update(&chunkdata);
                         bytes_written += chunkdata.len() as i64;
                     } else {
                         error!("Received chunk data before metadata");
                         return Err(Status::failed_precondition("Metadata missing"));
                     }
+                }
+                Some(RequestData::Checksum(expected_checksum)) => {
+                    let calculated_checksum = hasher.finalize().to_string();
+                    if calculated_checksum != expected_checksum {
+                        error!(
+                            calculated = calculated_checksum,
+                            expected = expected_checksum,
+                            "Checksum mismatch"
+                        );
+                        return Err(Status::invalid_argument("Checksum mismatch"));
+                    }
+                    debug!(block_id = %block_id_str, "Checksum verified successfully");
+                    break;
                 }
                 None => {
                     warn!("Received empty message in stream");
@@ -173,6 +191,7 @@ impl DataNodeService for Datanode {
         request: Request<ReadBlockRequest>,
     ) -> Result<Response<Self::ReadBlockStream>, Status> {
         let block_id = request.into_inner().block_id;
+        let mut hasher = Hasher::new();
         debug!(block_id = %block_id, "Received read_block request");
         if block_id.contains('/') || block_id.contains('.') {
             return Err(Status::invalid_argument("Invalid block_id"));
@@ -199,11 +218,21 @@ impl DataNodeService for Datanode {
                 match file.read(&mut buffer).await {
                     Ok(0) => {
                         debug!(block_id = %block_id, "Finished reading file");
+                        let block_checksum = hasher.finalize().to_string();
+                        let response = ReadBlockResponse {
+                            response_data: Some(ResponseData::Checksum(block_checksum.clone())),
+                        };
+                        if tx.send(Ok(response)).await.is_err() {
+                            warn!(block_id = %block_id, "Receiver dropped, stopping read");
+                            return;
+                        }
+                        debug!(block_id = %block_id, checksum = %block_checksum, "Calculated checksum");
                         break;
                     }
                     Ok(n) => {
+                        hasher.update(&buffer[..n]);
                         let response = ReadBlockResponse {
-                            chunk_data: buffer[..n].to_vec(),
+                            response_data: Some(ResponseData::ChunkData(buffer[..n].to_vec())),
                         };
                         if tx.send(Ok(response)).await.is_err() {
                             warn!(block_id = %block_id, "Receiver dropped, stopping read");

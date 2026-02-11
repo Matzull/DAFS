@@ -347,6 +347,7 @@ dependencies = [
  "clap",
  "common",
  "config-rs",
+ "crc32fast",
  "figment",
  "serde",
  "tokio",
@@ -427,12 +428,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "crc32fast"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "datanode"
 version = "0.1.0"
 dependencies = [
  "clap",
  "common",
  "config-rs",
+ "crc32fast",
  "figment",
  "rand 0.8.5",
  "serde",

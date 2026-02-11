@@ -170,6 +170,7 @@ impl Metadatanode {
                 index: block_idx as i32,
                 size: current_block_size,
                 locations: block_datanodes.clone(),
+                checksum: "TO_IMPLEMENT".to_string(),
             });
         }
         let now_miliseconds = time::SystemTime::now()
@@ -185,7 +186,6 @@ impl Metadatanode {
             owner: "SYSTEM".to_string(),
             created_at: now_miliseconds,
             last_modified_at: now_miliseconds,
-            checksum: "TO_IMPLEMENT".to_string(),
             file_status: FileStatus::Uploading,
             blocks,
         };
@@ -272,7 +272,7 @@ impl MetadataService for Metadatanode {
             owner: file_metadata.owner.clone(),
             created_at: file_metadata.created_at,
             last_modified_at: file_metadata.last_modified_at,
-            checksum: file_metadata.checksum.clone(),
+            // checksum: file_metadata.checksum.clone(),
             file_status: file_metadata.file_status.to_string(),
             blocks: block_assignments,
         }))
@@ -324,7 +324,7 @@ impl MetadataService for Metadatanode {
                 owner: v.owner.clone(),
                 created_at: v.created_at,
                 last_modified_at: v.last_modified_at,
-                checksum: v.checksum.clone(),
+                // checksum: v.checksum.clone(),
                 file_status: v.file_status.to_string(),
             })
             .collect();

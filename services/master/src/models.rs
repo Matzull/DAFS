@@ -31,7 +31,7 @@ pub struct BlockMetadata {
     pub id: String,
     pub index: i32,
     pub size: i64,
-
+    pub checksum: String,
     pub locations: Vec<u16>, //The ids of the datanodes containing that block
 }
 #[derive(Clone, Debug)]
@@ -44,7 +44,6 @@ pub struct FileMetadata {
     pub owner: String,
     pub created_at: i64,       //In millis since epoch
     pub last_modified_at: i64, //In millis since epoch
-    pub checksum: String,
 
     pub file_status: FileStatus,
 

@@ -2,11 +2,13 @@ use bytes::{Bytes, BytesMut};
 use clap::{Parser, Subcommand};
 use common::dfs::data_node_service_client::DataNodeServiceClient;
 use common::dfs::metadata_service_client::MetadataServiceClient;
+use common::dfs::read_block_response::ResponseData;
 use common::dfs::write_block_request::RequestData;
 use common::dfs::{
     CreateFileRequest, CreateFileResponse, GetFileRequest, ListDirectoryRequest, ReadBlockRequest,
     RenameFileRequest, WriteBlockRequest, WriteBlockResponse,
 };
+use crc32fast::Hasher;
 use figment::{
     providers::{Format, Serialized, Toml},
     Figment,
@@ -156,6 +158,7 @@ async fn upload_block(
     settings: Arc<InternalSettings>,
 ) -> Result<WriteBlockResponse, String> {
     debug!(block_id, "Starting block upload");
+    let mut hasher = Hasher::new();
     let (tx, rx) = mpsc::channel(settings.mpsc_upload_channel_size as usize);
     let mut client = data_node_client;
     debug!(block_id, "Connected to datanode for upload");
@@ -189,6 +192,7 @@ async fn upload_block(
         if bytes_read < bytes_to_read {
             final_data = final_data.slice(0..bytes_read);
         }
+        hasher.update(&final_data);
         tx.send(WriteBlockRequest {
             request_data: Some(RequestData::ChunkData(final_data.to_vec())),
         })
@@ -198,6 +202,12 @@ async fn upload_block(
         bytes_remaining -= bytes_read;
         internal_block_offset += bytes_read as u64;
     }
+    let checksum = hasher.finalize();
+    tx.send(WriteBlockRequest {
+        request_data: Some(RequestData::Checksum(checksum.to_string())),
+    })
+    .await
+    .map_err(|e| format!("Failed to send checksum: {e}"))?;
     drop(tx);
     let response = response_fut.await.map_err(|e| {
         error!("Failed to get write block response: {}", e);
@@ -295,6 +305,7 @@ async fn download_block(
     settings: Arc<InternalSettings>,
 ) -> Result<bool, String> {
     debug!(block_id, "Starting block download");
+    let mut hasher = Hasher::new();
     let mut client = data_node_client;
 
     let mut current_offset = offset;
@@ -307,13 +318,39 @@ async fn download_block(
         .into_inner();
     let mut writing_tasks = JoinSet::new();
     while let Some(msg) = stream.next().await {
-        let data = msg
-            .map_err(|e| format!("Failed to receive block chunk: {e}"))?
-            .chunk_data;
-        let data_len = data.len() as u64;
+        let data = msg.map_err(|e| format!("Failed to receive block chunk: {e}"))?;
+        if let Some(ResponseData::Checksum(checksum)) = data.response_data {
+            let calculated_checksum = hasher.finalize();
+            if checksum != calculated_checksum.to_string() {
+                error!(
+                    block_id,
+                    "Checksum mismatch: expected {}, got {}", checksum, calculated_checksum
+                );
+                return Err(format!(
+                    "Checksum mismatch for block {}: expected {}, got {}",
+                    block_id, checksum, calculated_checksum
+                ));
+            }
+            debug!(
+                block_id,
+                "Block download completed successfully with valid checksum"
+            );
+            break;
+        }
+        let chunk_data = match data.response_data {
+            Some(ResponseData::ChunkData(data)) => data,
+            _ => {
+                error!(block_id, "Received unexpected response data type");
+                return Err(format!(
+                    "Received unexpected response data type for block {}",
+                    block_id
+                ));
+            }
+        };
+        let data_len = chunk_data.len() as u64;
         let write_offset = current_offset;
         let file = Arc::clone(&file_handle);
-        writing_tasks.spawn_blocking(move || file.write_at(&data, write_offset));
+        writing_tasks.spawn_blocking(move || file.write_at(&chunk_data, write_offset));
         current_offset += data_len;
 
         if writing_tasks.len() > settings.download_concurrency {

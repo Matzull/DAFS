@@ -17,10 +17,10 @@ config-rs = { workspace = true }
 serde.workspace = true
 figment = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
+crc32fast = { workspace = true }
 
 
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio-test = { workspace = true }
 rand = { workspace = true }
-

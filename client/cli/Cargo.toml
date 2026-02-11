@@ -21,3 +21,4 @@ serde.workspace = true
 figment = { workspace = true }
 bytes ={ workspace = true}
 chrono = { workspace = true }
+crc32fast = { workspace = true }

@@ -82,9 +82,8 @@ message GetFileResponse {
   string                   owner            = 4;
   int64                    created_at       = 5;
   int64                    last_modified_at = 6;
-  string                   checksum         = 7;
-  string                   file_status      = 8;
-  repeated BlockAssignment blocks           = 9; // The map: Which node has which block?
+  string                   file_status      = 7;
+  repeated BlockAssignment blocks           = 8; // The map: Which node has which block?
 }
 
 message DeleteFileRequest {
@@ -123,8 +122,7 @@ message FileInfo {
   string                   owner            = 4;
   int64                    created_at       = 5;
   int64                    last_modified_at = 6;
-  string                   checksum         = 7;
-  string                   file_status      = 8;
+  string                   file_status      = 7;
 }
 
 message BlockAssignment {
@@ -154,6 +152,7 @@ message WriteBlockRequest {
   oneof request_data {
     BlockMetadata metadata   = 1;
     bytes         chunk_data = 2;
+    string        checksum   = 3;
   }
 }
 
@@ -173,7 +172,10 @@ message ReadBlockRequest {
 }
 
 message ReadBlockResponse {
-  bytes chunk_data = 1;
+  oneof response_data {
+    bytes chunk_data = 1;
+    string checksum = 2;
+  }
 }
 
 message DeleteBlockRequest {
