@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Display;
 use tokio::sync::RwLock;
 
 #[derive(Clone, Debug)]
@@ -6,6 +7,16 @@ pub enum FileStatus {
     Uploading, // File is being written to, reading is bloqued
     Ready,     // File can be read and written to
     Deleted,   // Marked to be deleted
+}
+
+impl Display for FileStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FileStatus::Uploading => write!(f, "Uploading"),
+            FileStatus::Ready => write!(f, "Ready"),
+            FileStatus::Deleted => write!(f, "Deleted"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

@@ -13,8 +13,8 @@ use figment::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::fs::{self, create_dir_all, File};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::fs::{self, create_dir_all, File, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Server, Uri};
@@ -96,7 +96,8 @@ impl DataNodeService for Datanode {
     ) -> Result<Response<WriteBlockResponse>, Status> {
         debug!("Received write_block request");
         let mut stream = request.into_inner();
-        let mut file: Option<File> = None;
+        // let mut file: Option<File> = None;
+        let mut writer: Option<BufWriter<File>> = None;
         let mut bytes_written: i64 = 0;
         let mut block_id_str = String::new();
 
@@ -104,6 +105,9 @@ impl DataNodeService for Datanode {
             match msg.request_data {
                 Some(RequestData::Metadata(metadata)) => {
                     block_id_str = metadata.block_id.clone();
+                    if block_id_str.contains('/') || block_id_str.contains('.') {
+                        return Err(Status::invalid_argument("Invalid block_id"));
+                    }
                     debug!(block_id = %block_id_str, "Received metadata for block");
                     let mut file_path_pathbuf = PathBuf::from(&self.settings.data_folder);
                     file_path_pathbuf.push(&block_id_str[..2]);
@@ -113,14 +117,23 @@ impl DataNodeService for Datanode {
                         Status::internal(err.to_string())
                     })?;
                     file_path_pathbuf.push(&block_id_str);
-                    file = Some(File::create_new(file_path_pathbuf).await.map_err(|err| {
-                        error!(%err, "Failed to create file");
-                        Status::internal(err.to_string())
-                    })?);
+                    let f = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(file_path_pathbuf)
+                        .await
+                        .map_err(|err| {
+                            error!(%err, "Failed to create file");
+                            Status::internal(err.to_string())
+                        })?;
+
+                    writer = Some(BufWriter::with_capacity(128 * 1024, f));
+                    // file = Some(f);
                 }
                 Some(RequestData::ChunkData(chunkdata)) => {
-                    if let Some(ref mut f) = file {
-                        f.write_all(&chunkdata).await.map_err(|err| {
+                    if let Some(ref mut w) = writer {
+                        w.write_all(&chunkdata).await.map_err(|err| {
                             error!(%err, "Failed to write chunk data");
                             Status::internal(err.to_string())
                         })?;
@@ -136,8 +149,12 @@ impl DataNodeService for Datanode {
                 }
             }
         }
-        if let Some(f) = file {
-            f.sync_all().await.map_err(|err| {
+        if let Some(mut w) = writer {
+            w.flush().await.map_err(|err| {
+                error!(%err, "Failed to flush buffer");
+                Status::internal(err.to_string())
+            })?;
+            w.get_mut().sync_all().await.map_err(|err| {
                 error!(%err, "Failed to sync file");
                 Status::internal(err.to_string())
             })?;
@@ -157,7 +174,9 @@ impl DataNodeService for Datanode {
     ) -> Result<Response<Self::ReadBlockStream>, Status> {
         let block_id = request.into_inner().block_id;
         debug!(block_id = %block_id, "Received read_block request");
-
+        if block_id.contains('/') || block_id.contains('.') {
+            return Err(Status::invalid_argument("Invalid block_id"));
+        }
         let mut file_path_pathbuf = PathBuf::from(&self.settings.data_folder);
         file_path_pathbuf.push(&block_id[..2]);
         file_path_pathbuf.push(&block_id[2..4]);

@@ -267,7 +267,13 @@ impl MetadataService for Metadatanode {
             .await;
         Ok(Response::new(GetFileResponse {
             file_id: file_metadata.id.clone(),
+            path: file_metadata.path.clone(),
             size: file_metadata.size,
+            owner: file_metadata.owner.clone(),
+            created_at: file_metadata.created_at,
+            last_modified_at: file_metadata.last_modified_at,
+            checksum: file_metadata.checksum.clone(),
+            file_status: file_metadata.file_status.to_string(),
             blocks: block_assignments,
         }))
     }
@@ -315,6 +321,11 @@ impl MetadataService for Metadatanode {
                 filename: v.name.clone(),
                 is_directory: false,
                 size: v.size,
+                owner: v.owner.clone(),
+                created_at: v.created_at,
+                last_modified_at: v.last_modified_at,
+                checksum: v.checksum.clone(),
+                file_status: v.file_status.to_string(),
             })
             .collect();
         info!(

@@ -19,3 +19,5 @@ tokio-util = "0.7.18"
 config-rs = { workspace = true }
 serde.workspace = true
 figment = { workspace = true }
+bytes ={ workspace = true}
+chrono = { workspace = true }

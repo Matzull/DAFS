@@ -76,9 +76,15 @@ message GetFileRequest {
 }
 
 message GetFileResponse {
-  string                   file_id = 1;
-  int64                    size    = 2;
-  repeated BlockAssignment blocks  = 3; // The map: Which node has which block?
+  string                   file_id          = 1;
+  string                   path             = 2;
+  int64                    size             = 3;
+  string                   owner            = 4;
+  int64                    created_at       = 5;
+  int64                    last_modified_at = 6;
+  string                   checksum         = 7;
+  string                   file_status      = 8;
+  repeated BlockAssignment blocks           = 9; // The map: Which node has which block?
 }
 
 message DeleteFileRequest {
@@ -111,9 +117,14 @@ message RenameFileResponse {
 }
 
 message FileInfo {
-  string filename     = 1;
-  bool   is_directory = 2;
-  int64  size         = 3;
+  string                   filename         = 1;
+  bool                     is_directory     = 2;
+  int64                    size             = 3;
+  string                   owner            = 4;
+  int64                    created_at       = 5;
+  int64                    last_modified_at = 6;
+  string                   checksum         = 7;
+  string                   file_status      = 8;
 }
 
 message BlockAssignment {

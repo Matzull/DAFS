@@ -1,3 +1,4 @@
+use bytes::{Bytes, BytesMut};
 use clap::{Parser, Subcommand};
 use common::dfs::data_node_service_client::DataNodeServiceClient;
 use common::dfs::metadata_service_client::MetadataServiceClient;
@@ -11,6 +12,7 @@ use figment::{
     Figment,
 };
 use serde::{de, Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::OpenOptions;
 use std::os::unix::fs::{FileExt, MetadataExt};
@@ -21,6 +23,29 @@ use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, instrument};
+
+fn format_file_size(bytes: i64) -> String {
+    const KB: i64 = 1024;
+    const MB: i64 = 1024 * KB;
+    const GB: i64 = 1024 * MB;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn format_timestamp(millis: i64) -> String {
+    let secs = millis / 1000;
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
 
 #[derive(Parser, Debug, Serialize, Deserialize)]
 pub struct InternalSettings {
@@ -120,10 +145,11 @@ enum Commands {
     },
 }
 
-#[instrument(skip(file_handle, data_node_endpoint, settings))]
+#[instrument(skip(file_handle, data_node_client, settings))]
 async fn upload_block(
     block_id: String,
-    data_node_endpoint: String,
+    // data_node_endpoint: String,
+    data_node_client: DataNodeServiceClient<tonic::transport::Channel>,
     offset: u64,
     block_size: i64,
     file_handle: Arc<std::fs::File>,
@@ -131,9 +157,7 @@ async fn upload_block(
 ) -> Result<WriteBlockResponse, String> {
     debug!(block_id, "Starting block upload");
     let (tx, rx) = mpsc::channel(settings.mpsc_upload_channel_size as usize);
-    let mut client = DataNodeServiceClient::connect(data_node_endpoint)
-        .await
-        .map_err(|e| format!("Cannot connect to datanode for upload: {e}"))?;
+    let mut client = data_node_client;
     debug!(block_id, "Connected to datanode for upload");
     let response_fut = client.write_block(ReceiverStream::new(rx));
     tx.send(WriteBlockRequest {
@@ -147,23 +171,26 @@ async fn upload_block(
     let mut bytes_remaining = block_size as usize;
     let mut internal_block_offset = offset;
     while bytes_remaining > 0 {
-        let bytes_to_read = std::cmp::min(bytes_remaining, block_size as usize); //TODO check block size with master
-        let mut sending_buffer = vec![0u8; bytes_to_read];
+        let bytes_to_read = std::cmp::min(bytes_remaining, 64 * 1024 as usize); //TODO set in config
+        let mut buffer = BytesMut::with_capacity(bytes_to_read);
+        buffer.resize(bytes_to_read, 0);
         let file = Arc::clone(&file_handle);
-        let reading = tokio::task::spawn_blocking(move || {
-            file.read_at(&mut sending_buffer, internal_block_offset)
-                .map(|n| (n, sending_buffer))
+        let (bytes_read, buffer) = tokio::task::spawn_blocking(move || {
+            file.read_at(&mut buffer[..], internal_block_offset)
+                .map(|n| (n, buffer))
         })
         .await
         .map_err(|e| format!("Block read task failed: {e}"))?
         .map_err(|e| format!("Failed to read file at offset {internal_block_offset}: {e}"))?;
-        let (bytes_read, sending_buffer) = reading;
         if bytes_read == 0 {
             break;
         }
-
+        let mut final_data = buffer.freeze();
+        if bytes_read < bytes_to_read {
+            final_data = final_data.slice(0..bytes_read);
+        }
         tx.send(WriteBlockRequest {
-            request_data: Some(RequestData::ChunkData(sending_buffer)),
+            request_data: Some(RequestData::ChunkData(final_data.to_vec())),
         })
         .await
         .map_err(|e| format!("Failed to send chunk data: {e}"))?;
@@ -185,18 +212,90 @@ async fn upload_block(
     Ok(inner)
 }
 
-#[instrument(skip(file_handle, data_node_endpoint, settings))]
+#[instrument(skip(settings))]
+async fn upload_file(
+    settings: Arc<InternalSettings>,
+    file_path: String,
+) -> Result<CreateFileResponse, Box<dyn Error>> {
+    info!(file_path, "Starting file upload");
+    let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
+
+    let file_handle = std::fs::File::open(&file_path)?;
+    let create_file_response = client
+        .create_file(CreateFileRequest {
+            path: file_path.clone(),
+            size: file_handle.metadata()?.size() as i64, //TODO: file can be larger than 4GB
+            user_id: "1".to_string(),
+        })
+        .await?
+        .into_inner();
+
+    let shared_file_handle = Arc::new(file_handle);
+    let semaphore = Arc::new(Semaphore::new(settings.upload_concurrency));
+    let mut set = JoinSet::new();
+    let mut block_size = -1;
+
+    let nodes_to_connect: HashSet<_> = create_file_response
+        .blocks
+        .iter()
+        .map(|b| b.node_address.clone())
+        .collect();
+    let mut clients = HashMap::new();
+    for addr in nodes_to_connect {
+        let client = DataNodeServiceClient::connect(addr.clone()).await?;
+        clients.insert(addr, client);
+    }
+    for block_assignment in create_file_response.blocks.clone() {
+        if block_size == -1 {
+            block_size = block_assignment.block_size;
+        }
+        let block_offset = block_assignment.order * block_size;
+        let block_id = block_assignment.block_id.clone();
+        let f_handle = Arc::clone(&shared_file_handle);
+        let settings_clone = Arc::clone(&settings);
+        let sem = Arc::clone(&semaphore); // Clonamos el Arc fuera
+        let client = clients.get(&block_assignment.node_address).unwrap().clone();
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.map_err(|e| e.to_string())?;
+
+            let result = upload_block(
+                block_id,
+                client,
+                block_offset as u64,
+                block_assignment.block_size,
+                f_handle,
+                settings_clone,
+            )
+            .await;
+
+            result
+        });
+    }
+
+    while let Some(res) = set.join_next().await {
+        res.map_err(|e| {
+            error!(file_path, "Block upload task panicked: {}", e);
+            format!("Block upload task panicked: {e}")
+        })??;
+    }
+    info!(
+        file_path,
+        blocks = create_file_response.blocks.len(),
+        "File upload completed successfully"
+    );
+    Ok(create_file_response)
+}
+
+#[instrument(skip(file_handle, data_node_client, settings))]
 async fn download_block(
     block_id: String,
-    data_node_endpoint: String,
+    data_node_client: DataNodeServiceClient<tonic::transport::Channel>,
     offset: u64,
     file_handle: Arc<std::fs::File>,
     settings: Arc<InternalSettings>,
 ) -> Result<bool, String> {
     debug!(block_id, "Starting block download");
-    let mut client = DataNodeServiceClient::connect(data_node_endpoint)
-        .await
-        .map_err(|e| format!("Cannot connect to datanode {e}"))?;
+    let mut client = data_node_client;
 
     let mut current_offset = offset;
     let mut stream = client
@@ -237,69 +336,6 @@ async fn download_block(
 }
 
 #[instrument(skip(settings))]
-async fn upload_file(
-    settings: Arc<InternalSettings>,
-    file_path: String,
-) -> Result<CreateFileResponse, Box<dyn Error>> {
-    info!(file_path, "Starting file upload");
-    let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
-
-    let file_handle = std::fs::File::open(&file_path)?;
-    let create_file_response = client
-        .create_file(CreateFileRequest {
-            path: file_path.clone(),
-            size: file_handle.metadata()?.size() as i64, //TODO: file can be larger than 4GB
-            user_id: "1".to_string(),
-        })
-        .await?
-        .into_inner();
-
-    let shared_file_handle = Arc::new(file_handle);
-    let semaphore = Arc::new(Semaphore::new(settings.upload_concurrency));
-    let mut set = JoinSet::new();
-    let mut block_size = -1;
-    for block_assignment in create_file_response.blocks.clone() {
-        if block_size == -1 {
-            block_size = block_assignment.block_size;
-        }
-        let block_offset = block_assignment.order * block_size;
-        let block_id = block_assignment.block_id.clone();
-        let f_handle = Arc::clone(&shared_file_handle);
-        let settings_clone = Arc::clone(&settings);
-        let sem = Arc::clone(&semaphore); // Clonamos el Arc fuera
-
-        set.spawn(async move {
-            let _permit = sem.acquire_owned().await.map_err(|e| e.to_string())?;
-
-            let result = upload_block(
-                block_id,
-                block_assignment.node_address.clone(),
-                block_offset as u64,
-                block_assignment.block_size,
-                f_handle,
-                settings_clone,
-            )
-            .await;
-
-            result
-        });
-    }
-
-    while let Some(res) = set.join_next().await {
-        res.map_err(|e| {
-            error!(file_path, "Block upload task panicked: {}", e);
-            format!("Block upload task panicked: {e}")
-        })??;
-    }
-    info!(
-        file_path,
-        blocks = create_file_response.blocks.len(),
-        "File upload completed successfully"
-    );
-    Ok(create_file_response)
-}
-
-#[instrument(skip(settings))]
 async fn download_file(
     settings: Arc<InternalSettings>,
     file_path: String,
@@ -325,6 +361,16 @@ async fn download_file(
     let mut set = JoinSet::new();
 
     let mut block_size = -1;
+    let nodes_to_connect: HashSet<_> = get_file_response
+        .blocks
+        .iter()
+        .map(|b| b.node_address.clone())
+        .collect();
+    let mut clients = HashMap::new();
+    for addr in nodes_to_connect {
+        let client = DataNodeServiceClient::connect(addr.clone()).await?;
+        clients.insert(addr, client);
+    }
     for block_assignment in get_file_response.blocks.clone() {
         if block_size == -1 {
             block_size = block_assignment.block_size;
@@ -334,11 +380,11 @@ async fn download_file(
         let block_id = block_assignment.block_id.clone();
         let f_handle = Arc::clone(&shared_file_handle);
         let settings_clone = Arc::clone(&settings);
-
+        let client = clients.get(&block_assignment.node_address).unwrap().clone();
         set.spawn(async move {
             let result = download_block(
                 block_id,
-                block_assignment.node_address.clone(),
+                client,
                 block_offset as u64,
                 f_handle,
                 settings_clone,
@@ -377,10 +423,33 @@ async fn list_directory(
         .await?
         .into_inner();
     let file_count = get_file_response.files.len();
+    println!(
+        "{:<30} {:<12} {:<15} {:<15} {:<20} {:<20} {:<12}",
+        "Filename", "Type", "Size", "Owner", "Created", "Modified", "Status"
+    );
+    println!("{}", "-".repeat(124));
     for file in get_file_response.files {
+        let file_type = if file.is_directory {
+            "Directory"
+        } else {
+            "File"
+        };
+        let size_str = if file.is_directory {
+            "-".to_string()
+        } else {
+            format_file_size(file.size)
+        };
+        let created_time = format_timestamp(file.created_at);
+        let modified_time = format_timestamp(file.last_modified_at);
         println!(
-            "Dir: {} ---- Size: {} bytes ---- {}",
-            file.is_directory, file.size, file.filename
+            "{:<30} {:<12} {:<15} {:<15} {:<20} {:<20} {:<12}",
+            file.filename,
+            file_type,
+            size_str,
+            file.owner,
+            created_time,
+            modified_time,
+            file.file_status
         );
     }
     info!(directory, file_count, "Directory listing completed");

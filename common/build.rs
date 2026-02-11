@@ -8,10 +8,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Compilación avanzada
     // .compile( &[archivos], &[includes] )
-    tonic_build::configure().compile(
-        &[proto_file], // ¿Qué archivo compilar?
-        &[proto_dir],  // ¿Dónde buscar ese archivo y sus dependencias?
-    )?;
+    tonic_build::configure()
+        .field_attribute(
+            "common.dfs.WriteBlockRequest.chunk_data",
+            "#[prost(bytes=\"bytes\")]",
+        )
+        // Y por si acaso, para el de lectura también
+        .field_attribute(
+            "common.dfs.ReadBlockResponse.chunk_data",
+            "#[prost(bytes=\"bytes\")]",
+        )
+        .compile(
+            &[proto_file], // ¿Qué archivo compilar?
+            &[proto_dir],  // ¿Dónde buscar ese archivo y sus dependencias?
+        )?;
 
     Ok(())
 }
