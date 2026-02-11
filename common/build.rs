@@ -4,7 +4,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_dir = "../proto"; // El directorio donde buscar los imports
 
     // 2. Avisamos a cargo que si el archivo cambia, recompile
-    println!("cargo:rerun-if-changed={}", proto_file);
+    println!("cargo:rerun-if-changed={proto_file}");
 
     // 3. Compilación avanzada
     // .compile( &[archivos], &[includes] )

@@ -10,7 +10,7 @@ use figment::{
     providers::{Format, Serialized, Toml},
     Figment,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Serialize};
 use std::error::Error;
 use std::fs::OpenOptions;
 use std::os::unix::fs::{FileExt, MetadataExt};
@@ -20,7 +20,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, info, instrument};
 
 #[derive(Parser, Debug, Serialize, Deserialize)]
 pub struct InternalSettings {
@@ -36,6 +36,9 @@ pub fn load_config() -> InternalSettings {
     let cli = Cli::parse();
     info!("Loading CLI configuration from '{}'", cli.config_path);
 
+    let has_master_endpoints = !cli.master_endpoints.is_empty();
+    let master_endpoints = cli.master_endpoints.clone();
+
     let mut figment = Figment::new()
         .merge(Serialized::defaults(InternalSettings {
             mpsc_upload_channel_size: 5,
@@ -45,36 +48,41 @@ pub fn load_config() -> InternalSettings {
             download_concurrency: 10,
             log_level: "info".to_string(),
         }))
-        .merge(Toml::file(&cli.config_path));
+        .merge(Toml::file(&cli.config_path))
+        .merge(Serialized::globals(cli));
 
-    if !cli.master_endpoints.is_empty() {
-        figment = figment.merge(("master_endpoints", cli.master_endpoints));
+    if has_master_endpoints {
+        figment = figment.merge(("master_endpoints", master_endpoints));
     }
 
     figment.extract().expect("Error loading configuration")
 }
 
 /// DAFS CLI - Distributed Asynchronous File System client
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Serialize, Deserialize)]
 #[command(name = "dafs-cli")]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Master node endpoint
-    #[arg(short, long, default_value = "http://[::1]:9090")]
+    #[arg(short, long, global = true)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     master_endpoints: Vec<String>,
 
     /// Log level (trace, debug, info, warn, error)
-    #[arg(short, long, default_value = "info")]
-    log_level: String,
+    #[arg(short, long, global = true)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_level: Option<String>,
 
     #[command(subcommand)]
-    command: Commands,
+    #[serde(skip)]
+    command: Option<Commands>,
 
-    #[arg(short, long, default_value = "config.toml")]
+    #[arg(short, long, default_value = "config.toml", global = true)]
+    #[serde(skip)]
     pub config_path: String,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Serialize, Deserialize)]
 enum Commands {
     /// Upload a file to the distributed file system
     Upload {
@@ -121,11 +129,12 @@ async fn upload_block(
     file_handle: Arc<std::fs::File>,
     settings: Arc<InternalSettings>,
 ) -> Result<WriteBlockResponse, String> {
-    info!(block_id, "Starting block upload");
+    debug!(block_id, "Starting block upload");
     let (tx, rx) = mpsc::channel(settings.mpsc_upload_channel_size as usize);
     let mut client = DataNodeServiceClient::connect(data_node_endpoint)
         .await
-        .map_err(|e| format!("Cannot connect to datanode for upload: {}", e))?;
+        .map_err(|e| format!("Cannot connect to datanode for upload: {e}"))?;
+    debug!(block_id, "Connected to datanode for upload");
     let response_fut = client.write_block(ReceiverStream::new(rx));
     tx.send(WriteBlockRequest {
         request_data: Some(RequestData::Metadata(common::dfs::BlockMetadata {
@@ -134,11 +143,11 @@ async fn upload_block(
         })),
     })
     .await
-    .map_err(|e| format!("Failed to send block metadata: {}", e))?;
+    .map_err(|e| format!("Failed to send block metadata: {e}"))?;
     let mut bytes_remaining = block_size as usize;
     let mut internal_block_offset = offset;
     while bytes_remaining > 0 {
-        let bytes_to_read = std::cmp::min(bytes_remaining, 64 * 1024); //TODO check block size with master
+        let bytes_to_read = std::cmp::min(bytes_remaining, block_size as usize); //TODO check block size with master
         let mut sending_buffer = vec![0u8; bytes_to_read];
         let file = Arc::clone(&file_handle);
         let reading = tokio::task::spawn_blocking(move || {
@@ -146,13 +155,8 @@ async fn upload_block(
                 .map(|n| (n, sending_buffer))
         })
         .await
-        .map_err(|e| format!("Block read task failed: {}", e))?
-        .map_err(|e| {
-            format!(
-                "Failed to read file at offset {}: {}",
-                internal_block_offset, e
-            )
-        })?;
+        .map_err(|e| format!("Block read task failed: {e}"))?
+        .map_err(|e| format!("Failed to read file at offset {internal_block_offset}: {e}"))?;
         let (bytes_read, sending_buffer) = reading;
         if bytes_read == 0 {
             break;
@@ -162,7 +166,7 @@ async fn upload_block(
             request_data: Some(RequestData::ChunkData(sending_buffer)),
         })
         .await
-        .map_err(|e| format!("Failed to send chunk data: {}", e))?;
+        .map_err(|e| format!("Failed to send chunk data: {e}"))?;
 
         bytes_remaining -= bytes_read;
         internal_block_offset += bytes_read as u64;
@@ -170,10 +174,10 @@ async fn upload_block(
     drop(tx);
     let response = response_fut.await.map_err(|e| {
         error!("Failed to get write block response: {}", e);
-        format!("Failed to get write block response: {}", e)
+        format!("Failed to get write block response: {e}")
     })?;
     let inner = response.into_inner();
-    info!(
+    debug!(
         block_id = &block_id,
         bytes_written = inner.bytes_written,
         "Block upload completed successfully"
@@ -189,10 +193,10 @@ async fn download_block(
     file_handle: Arc<std::fs::File>,
     settings: Arc<InternalSettings>,
 ) -> Result<bool, String> {
-    info!(block_id, "Starting block download");
+    debug!(block_id, "Starting block download");
     let mut client = DataNodeServiceClient::connect(data_node_endpoint)
         .await
-        .map_err(|e| format!("Cannot connect to datanode {}", e.to_string()))?;
+        .map_err(|e| format!("Cannot connect to datanode {e}"))?;
 
     let mut current_offset = offset;
     let mut stream = client
@@ -200,12 +204,12 @@ async fn download_block(
             block_id: block_id.clone(),
         })
         .await
-        .map_err(|e| format!("Couldnt read block {}", e.to_string()))?
+        .map_err(|e| format!("Couldnt read block {e}"))?
         .into_inner();
     let mut writing_tasks = JoinSet::new();
     while let Some(msg) = stream.next().await {
         let data = msg
-            .map_err(|e| format!("Failed to receive block chunk: {}", e))?
+            .map_err(|e| format!("Failed to receive block chunk: {e}"))?
             .chunk_data;
         let data_len = data.len() as u64;
         let write_offset = current_offset;
@@ -221,14 +225,14 @@ async fn download_block(
     while let Some(res) = writing_tasks.join_next().await {
         res.map_err(|err| {
             error!(block_id, "Block write task failed: {}", err);
-            format!("Block write task failed: {}", err)
+            format!("Block write task failed: {err}")
         })?
         .map_err(|err| {
             error!(block_id, "Failed to write block data to file: {}", err);
-            format!("Failed to write block data to file: {}", err)
+            format!("Failed to write block data to file: {err}")
         })?;
     }
-    info!(block_id, "Block downloaded successfully");
+    debug!(block_id, "Block downloaded successfully");
     Ok(true)
 }
 
@@ -284,7 +288,7 @@ async fn upload_file(
     while let Some(res) = set.join_next().await {
         res.map_err(|e| {
             error!(file_path, "Block upload task panicked: {}", e);
-            format!("Block upload task panicked: {}", e)
+            format!("Block upload task panicked: {e}")
         })??;
     }
     info!(
@@ -348,7 +352,7 @@ async fn download_file(
     while let Some(res) = set.join_next().await {
         res.map_err(|e| {
             error!(file_path, "Block download task panicked: {}", e);
-            format!("Block download task panicked: {}", e)
+            format!("Block download task panicked: {e}")
         })??;
     }
     info!(
@@ -405,25 +409,27 @@ async fn rename_file(
 
 #[tokio::main]
 async fn main() {
+    let cli = Cli::parse();
     let settings = Arc::new(load_config());
 
     // Initialize tracing with the specified log level
     let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| settings.log_level.clone());
 
+    let filter = tracing_subscriber::EnvFilter::new("info")
+        .add_directive(format!("cli={}", log_level).parse().unwrap());
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(log_level))
+        .with_env_filter(filter)
         .with_file(true)
         .with_line_number(true)
         .with_thread_ids(true)
         .with_target(false)
         .init();
-
+    debug!("CLI configuration loaded: {:?}", settings);
     info!("DAFS CLI starting");
     info!("Master node: {}", settings.master_endpoints.join(", "));
 
-    let cli = Cli::parse();
     let result = match cli.command {
-        Commands::Upload { file, remote_path } => {
+        Some(Commands::Upload { file, remote_path }) => {
             let remote = remote_path.unwrap_or_else(|| {
                 std::path::Path::new(&file)
                     .file_name()
@@ -437,24 +443,27 @@ async fn main() {
                 info!("Blocks created: {}", resp.blocks.len());
             })
         }
-        Commands::Download {
+        Some(Commands::Download {
             remote_path,
             output,
-        } => {
+        }) => {
             info!("Downloading {} to {}", remote_path, output);
             download_file(Arc::clone(&settings), remote_path, output)
                 .await
                 .map(|_| info!("File downloaded successfully"))
         }
-        Commands::List { path } => list_directory(Arc::clone(&settings), path)
+        Some(Commands::List { path }) => list_directory(Arc::clone(&settings), path)
             .await
             .map(|_| ()),
-
-        Commands::Rename { old_path, new_path } => {
+        Some(Commands::Rename { old_path, new_path }) => {
             info!("Renaming/Moving from {} to {}", old_path, new_path);
             rename_file(Arc::clone(&settings), old_path, new_path)
                 .await
                 .map(|_| info!("File renamed/moved successfully"))
+        }
+        None => {
+            error!("No command provided. Use --help for usage information.");
+            std::process::exit(1);
         }
     };
 

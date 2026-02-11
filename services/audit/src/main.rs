@@ -64,7 +64,7 @@ impl AuditService for MyAuditService {
                     eprintln!("⚠️ Error Elasticsearch: {:?}", res.status());
                 }
             }
-            Err(e) => eprintln!("❌ Error conexión Elastic: {}", e),
+            Err(e) => eprintln!("❌ Error conexión Elastic: {e}"),
         }
 
         // 5. Respondemos al cliente gRPC "Todo OK" (ACK)
@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "127.0.0.1:50053".parse()?; // Puerto para Auditoría
     let service = MyAuditService::default();
 
-    println!("🛡️  Audit Service escuchando en {}", addr);
+    println!("🛡️  Audit Service escuchando en {addr}");
     println!("📊 Conectando con Elasticsearch en localhost:9200...");
 
     Server::builder()

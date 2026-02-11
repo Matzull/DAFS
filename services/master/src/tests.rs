@@ -52,7 +52,7 @@ async fn test_create_file_multiple_blocks() {
     let node = create_test_metadatanode();
 
     // Create a file that requires 3 blocks (BLOCK_SIZE = 64KB)
-    let file_size = BLOCK_SIZE * 3 - 100; // Just under 3 full blocks
+    let file_size = DEFAULT_BLOCK_SIZE * 3 - 100; // Just under 3 full blocks
     let result = node
         ._create_file(&node.state, "/test/large.txt".to_string(), file_size)
         .await;
@@ -62,9 +62,9 @@ async fn test_create_file_multiple_blocks() {
     assert_eq!(file.block_count(), 3);
 
     // Check block sizes
-    assert_eq!(file.blocks[0].size, BLOCK_SIZE);
-    assert_eq!(file.blocks[1].size, BLOCK_SIZE);
-    assert_eq!(file.blocks[2].size, file_size - BLOCK_SIZE * 2);
+    assert_eq!(file.blocks[0].size, DEFAULT_BLOCK_SIZE);
+    assert_eq!(file.blocks[1].size, DEFAULT_BLOCK_SIZE);
+    assert_eq!(file.blocks[2].size, file_size - DEFAULT_BLOCK_SIZE * 2);
 }
 
 #[tokio::test]
@@ -72,7 +72,7 @@ async fn test_create_file_exact_block_boundary() {
     let node = create_test_metadatanode();
 
     // Create a file that is exactly 2 blocks
-    let file_size = BLOCK_SIZE * 2;
+    let file_size = DEFAULT_BLOCK_SIZE * 2;
     let result = node
         ._create_file(&node.state, "/test/exact.txt".to_string(), file_size)
         .await;
@@ -80,8 +80,8 @@ async fn test_create_file_exact_block_boundary() {
     assert!(result.is_ok());
     let file = result.unwrap();
     assert_eq!(file.block_count(), 2);
-    assert_eq!(file.blocks[0].size, BLOCK_SIZE);
-    assert_eq!(file.blocks[1].size, BLOCK_SIZE);
+    assert_eq!(file.blocks[0].size, DEFAULT_BLOCK_SIZE);
+    assert_eq!(file.blocks[1].size, DEFAULT_BLOCK_SIZE);
 }
 
 #[tokio::test]
@@ -153,7 +153,7 @@ async fn test_create_file_block_replication() {
 
     // Each block should have REPLICATION number of locations (or less if fewer datanodes)
     for block in &file.blocks {
-        assert!(block.locations.len() <= REPLICATION as usize);
+        assert!(block.locations.len() <= DEFAULT_REPLICATION as usize);
         assert!(!block.locations.is_empty());
     }
 }
@@ -187,7 +187,7 @@ async fn test_grpc_create_file() {
 
     let request = Request::new(CreateFileRequest {
         path: "/grpc/test.txt".to_string(),
-        size: BLOCK_SIZE * 2,
+        size: DEFAULT_BLOCK_SIZE * 2,
         user_id: "user1".to_string(),
     });
 
@@ -320,7 +320,7 @@ async fn test_block_assignment_addresses() {
 
     let request = Request::new(CreateFileRequest {
         path: "/block/test.txt".to_string(),
-        size: BLOCK_SIZE * 2,
+        size: DEFAULT_BLOCK_SIZE * 2,
         user_id: "user1".to_string(),
     });
 
@@ -339,7 +339,7 @@ async fn test_block_assignment_order() {
 
     let request = Request::new(CreateFileRequest {
         path: "/order/test.txt".to_string(),
-        size: BLOCK_SIZE * 5,
+        size: DEFAULT_BLOCK_SIZE * 5,
         user_id: "user1".to_string(),
     });
 

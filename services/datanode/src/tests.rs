@@ -1,7 +1,6 @@
 //! Unit tests for the DataNode service
 
 use super::*;
-use common::dfs::data_node_service_server::DataNodeService;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;

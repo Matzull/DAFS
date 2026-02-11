@@ -345,7 +345,7 @@ fn test_audit_request_display() {
         details: "Permission denied".to_string(),
     };
 
-    let display = format!("{}", request);
+    let display = format!("{request}");
     assert!(display.contains("admin"));
     assert!(display.contains("DELETE"));
     assert!(display.contains("DENIED"));

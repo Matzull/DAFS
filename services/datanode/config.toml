@@ -4,13 +4,15 @@
 listen_address = "[::1]:8080"
 
 # Data folder location for storing blocks
-data_folder = "/home/matzul/Documents/DAFS/testing/datanode"
+data_folder = "./testing/datanode"
 
 # Logging level (trace, debug, info, warn, error)
 log_level = "info"
 
 # MPSC channel size for read/write operations
-mpsc_channel_size = 4
+mpsc_channel_size = 64
 
 # Buffer size for reading blocks (in bytes)
 read_buffer_size = 65536
+
+metadata_node_address = "http://[::1]:9090"

@@ -15,6 +15,7 @@ use std::{
     sync::Arc,
     time::{self},
 };
+use tracing_subscriber::field::debug;
 
 use chrono::{DateTime, Utc};
 use clap::Parser;
@@ -31,8 +32,10 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
-const BLOCK_SIZE: i64 = 64 * 1024;
-const REPLICATION: i32 = 2; //Minimum number of nodes that must contain a block
+const DEFAULT_BLOCK_SIZE: i64 = 64 * 1024;
+const DEFAULT_REPLICATION: i32 = 2; //Minimum number of nodes that must contain a block
+const DEFAULT_LISTEN_ADDRESS: &str = "[::1]:9090";
+const DEFAULT_LOG_LEVEL: &str = "info";
 
 #[derive(Parser, Debug, Serialize, Deserialize)]
 pub struct InternalSettings {
@@ -47,38 +50,44 @@ pub fn load_config() -> InternalSettings {
 
     let figment = Figment::new()
         .merge(Serialized::defaults(InternalSettings {
-            listen_address: "[::1]:9090".to_string(),
-            block_size: BLOCK_SIZE,
-            replication_factor: REPLICATION,
-            log_level: "info".to_string(),
+            listen_address: DEFAULT_LISTEN_ADDRESS.to_string(),
+            block_size: DEFAULT_BLOCK_SIZE,
+            replication_factor: DEFAULT_REPLICATION,
+            log_level: DEFAULT_LOG_LEVEL.to_string(),
         }))
-        .merge(Toml::file(&cli.config_path));
+        .merge(Toml::file(&cli.config_path))
+        .merge(Serialized::globals(cli));
 
     figment.extract().expect("Error loading configuration")
 }
 
 /// DAFS MetadataNode Service
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Serialize, Deserialize)]
 #[command(name = "dafs-master")]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Server listen address
-    #[arg(short, long, default_value = "[::1]:9090")]
+    #[arg(short, long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     listen_address: Option<String>,
 
     /// Block size (in bytes)
-    #[arg(short, long, default_value = "65536")]
+    #[arg(short, long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     block_size: Option<i64>,
 
     /// Replication factor
-    #[arg(short, long, default_value = "2")]
+    #[arg(short, long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     replication_factor: Option<i32>,
 
     /// Log level (trace, debug, info, warn, error)
-    #[arg(long, default_value = "info")]
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     log_level: Option<String>,
 
     #[arg(short, long, default_value = "config.toml")]
+    #[serde(skip)]
     pub config_path: String,
 }
 
@@ -170,7 +179,7 @@ impl Metadatanode {
 
         let file = FileMetadata {
             id: file_id,
-            name: file_path.split('/').last().unwrap_or("").to_string(),
+            name: file_path.split('/').next_back().unwrap_or("").to_string(),
             path: file_path.clone(),
             size: file_size,
             owner: "SYSTEM".to_string(),
@@ -186,7 +195,7 @@ impl Metadatanode {
 
         if files_lock.contains_key(&full_path) {
             error!("File {} already exists", full_path);
-            return Err(format!("File {} already exists", full_path));
+            return Err(format!("File {full_path} already exists"));
         }
         files_lock.insert(full_path, file.clone());
         info!("File metadata created successfully for {}", file.id);
@@ -372,7 +381,7 @@ impl MetadataService for Metadatanode {
             info!(assigned_node_id = new_id, "New datanode registered");
 
             // Extract IP from remote_addr and use standard datanode port
-            let datanode_addr = format!("http://{}", remote_addr);
+            let datanode_addr = format!("http://{remote_addr}");
 
             datanodes_lock.insert(
                 new_id,
@@ -432,7 +441,7 @@ impl Metadatanode {
             .await
             .map_err(|err| {
                 error!(block_id, datanode, "Could not connect to datanode: {}", err);
-                format!("Could not connect to datanode {}", err)
+                format!("Could not connect to datanode {err}")
             })?;
         client
             .delete_block(DeleteBlockRequest {
@@ -444,7 +453,7 @@ impl Metadatanode {
                     block_id,
                     datanode, "Failed to delete block on datanode: {}", err
                 );
-                format!("Could not delete block on datanode {}", err)
+                format!("Could not delete block on datanode {err}")
             })?;
         info!(block_id, datanode, "Block deletion confirmed by datanode");
         self.audit("Notified to delete".to_string(), block_id.to_string())
@@ -458,7 +467,7 @@ impl Metadatanode {
             .send(AuditLog {
                 timestamp: now,
                 action: action.to_string(),
-                file_path: file_path,
+                file_path,
                 status: "SUCCESS".to_string(),
                 user: "1".to_string(),
             })
@@ -471,19 +480,18 @@ impl Metadatanode {
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = Arc::new(load_config());
 
+    let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| settings.log_level.clone());
+    let filter = tracing_subscriber::EnvFilter::new("info")
+        .add_directive(format!("master={}", log_level).parse().unwrap());
     tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG")
-                .ok()
-                .and_then(|v| tracing_subscriber::EnvFilter::try_new(v).ok())
-                .unwrap_or_else(|| tracing_subscriber::EnvFilter::new(settings.log_level.clone())),
-        )
+        .with_env_filter(filter)
         .with_file(true)
         .with_line_number(true)
         .with_thread_ids(true)
         .with_target(false)
         .init();
 
+    info!("Configuration loaded: {:?}", settings);
     let files = HashMap::<String, FileMetadata>::new();
     let available_data_nodes = HashMap::<u16, DatanodeInfo>::new();
 
@@ -497,8 +505,8 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
             available_datanodes: RwLock::new(available_data_nodes),
         }),
         settings: Arc::clone(&settings),
-        garbage_collector_tx: garbage_collector_tx,
-        audit_tx: audit_tx,
+        garbage_collector_tx,
+        audit_tx,
         next_node_id: AtomicU16::new(1), // Start assigning IDs from 1
     });
 
@@ -533,10 +541,8 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
-    dotenv().ok();
-    env::vars().for_each(|(key, value)| {
-        debug!("Env var: {}={}", key, value);
-    });
+    // dotenv().ok();
+    dotenvy::from_path(std::path::Path::new("services/master/.env")).ok();
     let es_url = env::var("ELASTIC_URL").expect("URL not defined");
     let es_user = env::var("ELASTIC_USER").expect("User not defined");
     let es_pass = env::var("ELASTIC_PASSWORD").expect("Pass not defined");
@@ -553,17 +559,17 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         while let Some(log) = audit_rx.recv().await {
             info!("Sending log");
-            let res = client
-                .post(&es_url)
-                .basic_auth(&es_user, Some(&es_pass))
-                .json(&log)
-                .send()
-                .await;
+            // let res = client
+            //     .post(&es_url)
+            //     .basic_auth(&es_user, Some(&es_pass))
+            //     .json(&log)
+            //     .send()
+            //     .await;
 
-            match res {
-                Ok(response) => info!("Respuesta Elastic: {:?}", response.status()), // <--- DEBUG
-                Err(e) => error!("Error enviando log: {:?}", e),                     // <--- DEBUG
-            }
+            // match res {
+            //     Ok(response) => info!("Respuesta Elastic: {:?}", response.status()), // <--- DEBUG
+            //     Err(e) => error!("Error enviando log: {:?}", e),                     // <--- DEBUG
+            // }
         }
     });
 

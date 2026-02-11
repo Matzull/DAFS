@@ -17,11 +17,14 @@ use tokio::fs::{self, create_dir_all, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::Server;
+use tonic::transport::{Server, Uri};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, instrument, warn};
 
-const DATA_FOLDER: &str = "/home/matzul/Documents/DAFS/testing/datanode";
+const DEFAULT_DATA_FOLDER: &str = "./testing/datanode";
+const DEFAULT_LOG_LEVEL: &str = "info";
+const DEFAULT_LISTEN_ADDRESS: &str = "[::1]:8080";
+const DEFAULT_METADATA_NODE_ADDRESS: &str = "http://[::1]:9090";
 
 #[derive(Parser, Debug, Serialize, Deserialize, Default)]
 pub struct InternalSettings {
@@ -30,6 +33,7 @@ pub struct InternalSettings {
     pub log_level: String,
     pub mpsc_channel_size: u8,
     pub read_buffer_size: usize,
+    pub metadata_node_address: String,
 }
 
 pub fn load_config() -> InternalSettings {
@@ -37,39 +41,41 @@ pub fn load_config() -> InternalSettings {
 
     let figment = Figment::new()
         .merge(Serialized::defaults(InternalSettings {
-            listen_address: "[::1]:8080".to_string(),
-            data_folder: DATA_FOLDER.to_string(),
-            log_level: "info".to_string(),
+            listen_address: DEFAULT_LISTEN_ADDRESS.to_string(),
+            data_folder: DEFAULT_DATA_FOLDER.to_string(),
+            log_level: DEFAULT_LOG_LEVEL.to_string(),
             mpsc_channel_size: 4,
             read_buffer_size: 64 * 1024,
+            metadata_node_address: DEFAULT_METADATA_NODE_ADDRESS.to_string(),
         }))
-        .merge(Toml::file(&cli.config_path));
+        .merge(Toml::file(&cli.config_path))
+        .merge(Serialized::globals(cli));
 
     figment.extract().expect("Error loading configuration")
 }
 
 /// DAFS DataNode Service
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Serialize, Deserialize)]
 #[command(name = "dafs-datanode")]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Server listen address
-    #[arg(short, long, default_value = "[::1]:8080")]
+    #[arg(short, long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     listen_address: Option<String>,
 
     /// Data folder location
-    #[arg(
-        short,
-        long,
-        default_value = "/home/matzul/Documents/DAFS/testing/datanode"
-    )]
+    #[arg(short, long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     data_folder: Option<String>,
 
     /// Log level (trace, debug, info, warn, error)
-    #[arg(long, default_value = "info")]
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     log_level: Option<String>,
 
     #[arg(short, long, default_value = "config.toml")]
+    #[serde(skip)]
     pub config_path: String,
 }
 
@@ -88,7 +94,7 @@ impl DataNodeService for Datanode {
         &self,
         request: Request<Streaming<WriteBlockRequest>>,
     ) -> Result<Response<WriteBlockResponse>, Status> {
-        info!("Received write_block request");
+        debug!("Received write_block request");
         let mut stream = request.into_inner();
         let mut file: Option<File> = None;
         let mut bytes_written: i64 = 0;
@@ -136,7 +142,7 @@ impl DataNodeService for Datanode {
                 Status::internal(err.to_string())
             })?;
         }
-        info!(block_id = %block_id_str, bytes_written, "Successfully wrote block");
+        debug!(block_id = %block_id_str, bytes_written, "Successfully wrote block");
         Ok(Response::new(WriteBlockResponse {
             success: true,
             message: "Everything went well".to_string(),
@@ -150,7 +156,7 @@ impl DataNodeService for Datanode {
         request: Request<ReadBlockRequest>,
     ) -> Result<Response<Self::ReadBlockStream>, Status> {
         let block_id = request.into_inner().block_id;
-        info!(block_id = %block_id, "Received read_block request");
+        debug!(block_id = %block_id, "Received read_block request");
 
         let mut file_path_pathbuf = PathBuf::from(&self.settings.data_folder);
         file_path_pathbuf.push(&block_id[..2]);
@@ -204,7 +210,7 @@ impl DataNodeService for Datanode {
         request: Request<DeleteBlockRequest>,
     ) -> Result<Response<DeleteBlockResponse>, Status> {
         let block_id = request.into_inner().block_id;
-        info!(block_id = %block_id, "Received delete_block request");
+        debug!(block_id = %block_id, "Received delete_block request");
 
         let mut file_path_pathbuf = PathBuf::from(&self.settings.data_folder);
         file_path_pathbuf.push(&block_id[..2]);
@@ -213,9 +219,9 @@ impl DataNodeService for Datanode {
             .await
             .map_err(|err| {
                 warn!(block_id = %block_id, path = ?file_path_pathbuf, "Could not delete block file: {}", err);
-                Status::not_found(format!("Could not delete file {}", err))
+                Status::not_found(format!("Could not delete file {err}"))
             });
-        info!(block_id = %block_id, "Block deleted successfully");
+        debug!(block_id = %block_id, "Block deleted successfully");
         Ok(Response::new(DeleteBlockResponse {
             delete_result: Some(common::dfs::delete_block_response::DeleteResult::Success(
                 true,
@@ -244,18 +250,17 @@ impl DataNodeService for Datanode {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = Arc::new(load_config());
 
+    let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| settings.log_level.clone());
+    let filter = tracing_subscriber::EnvFilter::new("info")
+        .add_directive(format!("datanode={}", log_level).parse().unwrap());
     tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG")
-                .ok()
-                .and_then(|v| tracing_subscriber::EnvFilter::try_new(v).ok())
-                .unwrap_or_else(|| tracing_subscriber::EnvFilter::new(settings.log_level.clone())),
-        )
+        .with_env_filter(filter)
         .with_file(true)
         .with_line_number(true)
         .with_thread_ids(true)
         .with_target(false)
         .init();
+    info!("Starting DataNode with settings: {:?}", settings);
     debug!("Creating directory to store files");
     create_dir_all(&settings.data_folder).await?;
     let address: std::net::SocketAddr = settings.listen_address.parse()?;
@@ -276,7 +281,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let max_retry_delay = tokio::time::Duration::from_secs(30);
 
         let mut client = loop {
-            match MetadataServiceClient::connect("http://[::1]:9090").await {
+            match MetadataServiceClient::connect(
+                settings.metadata_node_address.parse::<Uri>().unwrap(),
+            )
+            .await
+            {
                 Ok(c) => {
                     info!("Connected to master server");
                     break c;
@@ -329,7 +338,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Try to reconnect
                     retry_delay = tokio::time::Duration::from_millis(500);
                     loop {
-                        match MetadataServiceClient::connect("http://[::1]:9090").await {
+                        match MetadataServiceClient::connect(
+                            settings.metadata_node_address.parse::<Uri>().unwrap(),
+                        )
+                        .await
+                        {
                             Ok(c) => {
                                 info!("Reconnected to master server");
                                 client = c;
