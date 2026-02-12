@@ -570,17 +570,17 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         while let Some(log) = audit_rx.recv().await {
             info!("Sending log");
-            // let res = client
-            //     .post(&es_url)
-            //     .basic_auth(&es_user, Some(&es_pass))
-            //     .json(&log)
-            //     .send()
-            //     .await;
+            let res = client
+                .post(&es_url)
+                .basic_auth(&es_user, Some(&es_pass))
+                .json(&log)
+                .send()
+                .await;
 
-            // match res {
-            //     Ok(response) => info!("Respuesta Elastic: {:?}", response.status()), // <--- DEBUG
-            //     Err(e) => error!("Error enviando log: {:?}", e),                     // <--- DEBUG
-            // }
+            match res {
+                Ok(response) => info!("Respuesta Elastic: {:?}", response.status()),
+                Err(e) => error!("Error enviando log: {:?}", e),
+            }
         }
     });
 

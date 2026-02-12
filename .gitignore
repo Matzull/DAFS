@@ -20,6 +20,10 @@ testing/datanode
 
 *.env
 
-Auditing/kibanadata
-Auditing/certs
-Auditing/esdata01
+Auditing/certs/*
+Auditing/esdata01/*
+Auditing/grafana/storage/*
+
+!Auditing/esdata01/.gitkeep
+!Auditing/grafana/storage/.gitkeep
+!Auditing/certs/.gitkeep

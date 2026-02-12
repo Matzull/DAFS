@@ -1,0 +1,21 @@
+apiVersion: 1
+datasources:
+  - name: DS_ELASTICSEARCH
+    type: elasticsearch
+    url: ${GF_ES_URL}
+    access: proxy
+    basicAuth: true
+    uid: ds_elasticsearch
+    basicAuthUser: ${GF_ES_USER}
+    secureJsonData:
+      basicAuthPassword: ${GF_ES_PASSWORD}
+      tlsCACert: "${GF_ES_CA_CERT}"
+    jsonData:
+      index: "dfs-audit"
+      timeField: "timestamp"
+      esVersion: "${STACK_VERSION}" 
+      logMessageField: "action"
+      logLevelField: "status"
+      tlsAuth: true
+      tlsAuthWithCACert: true
+    editable: true

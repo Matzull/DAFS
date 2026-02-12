@@ -1,29 +1,14 @@
-# volumes:
-#  certs:
-#    driver: local
-#  esdata01:
-#    driver: local
-#  kibanadata:
-#    driver: local
-#  metricbeatdata01:
-#    driver: local
-#  filebeatdata01:
-#    driver: local
-#  logstashdata01:
-#    driver: local
-
-
 networks:
  default:
    name: elastic
    external: false
-
 
 services:
   setup:
     image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
     volumes:
       - ./certs:/usr/share/elasticsearch/config/certs
+      - ./grafana/storage:/var/lib/grafana
     user: "0"
     command: >
       bash -c '
@@ -60,15 +45,18 @@ services:
           unzip config/certs/certs.zip -d config/certs;
         fi;
         echo "Setting file permissions"
+        chown -R 472:472 /var/lib/grafana;
         chown -R root:root config/certs;
         find . -type d -exec chmod 750 \{\} \;;
         find . -type f -exec chmod 640 \{\} \;;
         echo "Waiting for Elasticsearch availability";
         until curl -s --cacert config/certs/ca/ca.crt https://es01:9200 | grep -q "missing authentication credentials"; do sleep 30; done;
         echo "Setting kibana_system password";
+        echo "Waiting for Elasticsearch to accept API requests";
         until curl -s -X POST --cacert config/certs/ca/ca.crt -u "elastic:${ELASTIC_PASSWORD}" -H "Content-Type: application/json" https://es01:9200/_security/user/kibana_system/_password -d "{\"password\":\"${KIBANA_PASSWORD}\"}" | grep -q "^{}"; do sleep 10; done;
+        echo "Importing Elasticsearch index template";
         until curl -s -X PUT --cacert config/certs/ca/ca.crt -u "elastic:${ELASTIC_PASSWORD}"  -H "Content-Type: application/json" https://es01:9200/_index_template/dfs_audit_template     -d '@template.json' | grep -q "acknowledged\":true"; do sleep 5; done;
-        curl -X POST "http://localhost:5601/api/saved_objects/_import" -u elastic:${ELASTIC_PASSWORD} -H "kbn-xsrf: true" --form file=@kibana_template.ndjson echo "All done!";
+        echo "All done!";
       '
     healthcheck:
       test: ["CMD-SHELL", "[ -f config/certs/es01/es01.crt ]"]
@@ -84,7 +72,7 @@ services:
     labels:
       co.elastic.logs/module: elasticsearch
     volumes:
-      - ./certs:/usr/share/elasticsearch/config/certs
+      - ./certs:/usr/share/elasticsearch/config/certs:ro
       - ./esdata01:/usr/share/elasticsearch/data
     ports:
       - ${ES_PORT}:9200
@@ -120,34 +108,35 @@ services:
       timeout: 10s
       retries: 120
 
-  kibana:
-   depends_on:
+  grafana:
+    image: grafana/grafana-enterprise:latest
+    container_name: grafana
+    ports:
+      - "${GRAFANA_PORT}:3000"
+    entrypoint: 
+      - sh
+      - -euc
+      - |
+        # Read the CA certificate and set it as an environment variable
+        export GF_ES_CA_CERT=$$(cat /etc/grafana/certs/ca/ca.crt)
+        # Execute the normal Grafana startup
+        exec /run.sh
+    volumes:
+      - ./grafana/storage:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./certs:/etc/grafana/certs:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+      - GF_AUTH_ANONYMOUS_ENABLED=${GRAFANA_ANONYMOUS_ENABLED}
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=${GRAFANA_ANONYMOUS_ORG_ROLE}
+      - GF_AUTH_BASIC_ENABLED=${GRAFANA_BASIC_AUTH_ENABLED}
+      - GF_AUTH_DISABLE_LOGIN_FORM=${GRAFANA_DISABLE_LOGIN_FORM}
+      - GF_ES_PASSWORD=${ELASTIC_PASSWORD} 
+      - GF_ES_USER=${ELASTIC_USER}
+      - GF_ES_URL=${ES_URL}:${ES_PORT}
+    depends_on:
      es01:
        condition: service_healthy
-   image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
-   labels:
-     co.elastic.logs/module: kibana
-   volumes:
-     - ./certs:/usr/share/kibana/config/certs
-     - ./kibanadata:/usr/share/kibana/data
-   ports:
-     - ${KIBANA_PORT}:5601
-   environment:
-     - SERVERNAME=kibana
-     - ELASTICSEARCH_HOSTS=https://es01:9200
-     - ELASTICSEARCH_USERNAME=kibana_system
-     - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
-     - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=config/certs/ca/ca.crt
-     - XPACK_SECURITY_ENCRYPTIONKEY=${ENCRYPTION_KEY}
-     - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=${ENCRYPTION_KEY}
-     - XPACK_REPORTING_ENCRYPTIONKEY=${ENCRYPTION_KEY}
-   mem_limit: ${KB_MEM_LIMIT}
-   healthcheck:
-     test:
-       [
-         "CMD-SHELL",
-         "curl -s -I http://localhost:5601 | grep -q 'HTTP/1.1 302 Found'",
-       ]
-     interval: 10s
-     timeout: 10s
-     retries: 120
+
+volumes:
+  grafana-storage:
