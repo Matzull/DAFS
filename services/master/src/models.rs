@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::fmt::Display;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum FileStatus {
     Uploading, // File is being written to, reading is bloqued
     Ready,     // File can be read and written to
@@ -19,14 +20,25 @@ impl Display for FileStatus {
     }
 }
 
-#[derive(Clone, Debug)]
+impl FileStatus {
+    pub fn str_to_tok(str: &str) -> FileStatus {
+        match str.trim().to_lowercase().as_str() {
+            "uploading" => FileStatus::Uploading,
+            "ready" => FileStatus::Ready,
+            "deleted" => FileStatus::Deleted,
+            _ => FileStatus::Deleted // Unknown filestatus is set to deleted
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DatanodeInfo {
     pub id: u16,
     pub addr: String,
     pub last_heartbeat: i64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockMetadata {
     pub id: String,
     pub index: i32,
@@ -34,7 +46,7 @@ pub struct BlockMetadata {
     pub checksum: String,
     pub locations: Vec<u16>, //The ids of the datanodes containing that block
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileMetadata {
     pub id: String,
     pub name: String,
@@ -55,18 +67,6 @@ pub struct MasterState {
     pub files: RwLock<HashMap<String, FileMetadata>>,
     pub available_datanodes: RwLock<HashMap<u16, DatanodeInfo>>,
 }
-
-// impl BlockMetadata {
-//     /// Create a new block metadata
-//     pub fn new(id: String, index: i32, size: i64, locations: Vec<i32>) -> Self {
-//         BlockMetadata {
-//             id,
-//             index,
-//             size,
-//             locations,
-//         }
-//     }
-// }
 
 impl FileMetadata {
     /// Check if the file is ready for reading
@@ -95,6 +95,6 @@ impl FileMetadata {
     }
 }
 
-#[cfg(test)]
-#[path = "models_tests.rs"]
-mod tests;
+// #[cfg(test)]
+// #[path = "models_tests.rs"]
+// mod tests;

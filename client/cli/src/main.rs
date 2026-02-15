@@ -6,7 +6,7 @@ use common::dfs::read_block_response::ResponseData;
 use common::dfs::write_block_request::RequestData;
 use common::dfs::{
     CreateFileRequest, CreateFileResponse, GetFileRequest, ListDirectoryRequest, ReadBlockRequest,
-    RenameFileRequest, WriteBlockRequest, WriteBlockResponse,
+    RenameFileRequest, SetFileStatusRequest, WriteBlockRequest, WriteBlockResponse,
 };
 use crc32fast::Hasher;
 use figment::{
@@ -38,7 +38,7 @@ fn format_file_size(bytes: i64) -> String {
     } else if bytes >= KB {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
-        format!("{} B", bytes)
+        format!("{bytes} B")
     }
 }
 
@@ -174,7 +174,7 @@ async fn upload_block(
     let mut bytes_remaining = block_size as usize;
     let mut internal_block_offset = offset;
     while bytes_remaining > 0 {
-        let bytes_to_read = std::cmp::min(bytes_remaining, 64 * 1024 as usize); //TODO set in config
+        let bytes_to_read = std::cmp::min(bytes_remaining, 64 * 1024_usize); //TODO set in config
         let mut buffer = BytesMut::with_capacity(bytes_to_read);
         buffer.resize(bytes_to_read, 0);
         let file = Arc::clone(&file_handle);
@@ -228,10 +228,11 @@ async fn upload_file(
     file_path: String,
 ) -> Result<CreateFileResponse, Box<dyn Error>> {
     info!(file_path, "Starting file upload");
-    let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
+    let mut meta_client =
+        MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
 
     let file_handle = std::fs::File::open(&file_path)?;
-    let create_file_response = client
+    let create_file_response = meta_client
         .create_file(CreateFileRequest {
             path: file_path.clone(),
             size: file_handle.metadata()?.size() as i64, //TODO: file can be larger than 4GB
@@ -293,6 +294,12 @@ async fn upload_file(
         blocks = create_file_response.blocks.len(),
         "File upload completed successfully"
     );
+    meta_client
+        .set_file_status(SetFileStatusRequest {
+            path: file_path,
+            status: "READY".to_string(),
+        })
+        .await?;
     Ok(create_file_response)
 }
 
@@ -305,7 +312,7 @@ async fn download_block(
     settings: Arc<InternalSettings>,
 ) -> Result<bool, String> {
     debug!(block_id, "Starting block download");
-    let mut hasher = Hasher::new();
+    let hasher = Hasher::new();
     let mut client = data_node_client;
 
     let mut current_offset = offset;
@@ -327,9 +334,7 @@ async fn download_block(
                     "Checksum mismatch: expected {}, got {}", checksum, calculated_checksum
                 );
                 return Err(format!(
-                    "Checksum mismatch for block {}: expected {}, got {}",
-                    block_id, checksum, calculated_checksum
-                ));
+                    "Checksum mismatch for block {block_id}: expected {checksum}, got {calculated_checksum}"));
             }
             debug!(
                 block_id,
@@ -342,9 +347,7 @@ async fn download_block(
             _ => {
                 error!(block_id, "Received unexpected response data type");
                 return Err(format!(
-                    "Received unexpected response data type for block {}",
-                    block_id
-                ));
+                    "Received unexpected response data type for block {block_id}"));
             }
         };
         let data_len = chunk_data.len() as u64;
@@ -391,6 +394,7 @@ async fn download_file(
     let file_handle = OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(true)
         .open(&out_file_path)?;
     file_handle.set_len(get_file_response.size as u64)?;
     let shared_file_handle = Arc::new(file_handle);
@@ -522,7 +526,7 @@ async fn main() {
     let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| settings.log_level.clone());
 
     let filter = tracing_subscriber::EnvFilter::new("info")
-        .add_directive(format!("cli={}", log_level).parse().unwrap());
+        .add_directive(format!("cli={log_level}").parse().unwrap());
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_file(true)
@@ -578,3 +582,6 @@ async fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests;

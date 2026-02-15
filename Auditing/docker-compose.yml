@@ -134,7 +134,7 @@ services:
       - GF_ES_PASSWORD=${ELASTIC_PASSWORD} 
       - GF_ES_USER=${ELASTIC_USER}
       - GF_ES_URL=${ES_URL}:${ES_PORT}
-      - GF_INSTALL_PLUGINS=grafana-llm-app
+      - GF_PLUGINS_PREINSTALL=grafana-llm-app
       - GF_SECURITY_SECRET_KEY=${GRAFANA_SECRET_KEY}
       - GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=grafana-llm-app
       - GF_APP_MODE=production

@@ -300,7 +300,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| settings.log_level.clone());
     let filter = tracing_subscriber::EnvFilter::new("info")
-        .add_directive(format!("datanode={}", log_level).parse().unwrap());
+        .add_directive(format!("datanode={log_level}").parse().unwrap());
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_file(true)

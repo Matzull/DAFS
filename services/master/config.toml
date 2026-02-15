@@ -11,3 +11,11 @@ replication_factor = 2
 
 # Logging level (trace, debug, info, warn, error)
 log_level = "info"
+
+# Audit service gRPC address
+audit_service_addr = "http://[::1]:9090"
+
+# WAL persistence settings
+wal_path = "services/master/master.wal"
+wal_batch_size = 128
+wal_flush_interval_ms = 250

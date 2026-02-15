@@ -24,6 +24,9 @@ service MetadataService {
     
     // Heartbeat sent by the datanodes to the master server.
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
+
+    // Updates file metadata (e.g., after a successful upload).
+  rpc SetFileStatus (SetFileStatusRequest) returns (SetFileStatusResponse);
 }
 
 // -----------------------------------------------------------------------
@@ -143,6 +146,16 @@ message HeartbeatRequest {
 message HeartbeatResponse {
   bool   acknowledgement   = 1;
   uint32 assigned_node_id  = 2; // If node_id was 0 in request, master assigns a new ID here
+}
+
+message SetFileStatusRequest {
+  string path    = 1;
+  string status  = 2; // "AVAILABLE", "DELETED", "CORRUPTED"
+}
+
+message SetFileStatusResponse {
+  bool   success       = 1;
+  string error_message = 2;
 }
 
 // --- DataNode Messages ---

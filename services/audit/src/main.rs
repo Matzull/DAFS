@@ -1,87 +1,110 @@
 use common::dfs::audit_service_server::{AuditService, AuditServiceServer};
 use common::dfs::{AuditRequest, AuditResponse};
 use serde::Serialize;
+use serde_json::{json, Value};
 use tonic::{transport::Server, Request, Response, Status};
+use tracing::{error, info, warn};
 
-// 1. Definimos una estructura "Espejo" para Elasticsearch.
-// Necesitamos que derive 'Serialize' para convertirse en JSON.
-// Los structs generados por gRPC no tienen 'Serialize' por defecto.
 #[derive(Serialize)]
 struct AuditLogDocument {
     timestamp: i64,
     user_id: String,
     action: String,
-    resource: String,
+    resource: Option<String>,
     component: String,
     status: String,
-    details: String,
+    success: bool,
+    details: Value,
 }
 
-// 2. Definimos nuestro servicio
 #[derive(Debug, Default)]
 pub struct MyAuditService {
-    // Podríamos guardar aquí el cliente HTTP para reutilizarlo
     http_client: reqwest::Client,
+}
+
+fn parse_details(details: &str) -> Value {
+    let trimmed = details.trim();
+    if trimmed.is_empty() {
+        return json!({});
+    }
+
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => value,
+        Err(_) => json!({ "message": trimmed }),
+    }
+}
+
+fn infer_success(status: &str) -> bool {
+    matches!(
+        status.trim().to_uppercase().as_str(),
+        "SUCCESS" | "OK" | "ACK"
+    )
 }
 
 #[tonic::async_trait]
 impl AuditService for MyAuditService {
     async fn log_operation(
         &self,
-        request: Request<AuditRequest>, // <-- Lo que llega por gRPC
+        request: Request<AuditRequest>,
     ) -> Result<Response<AuditResponse>, Status> {
         let req = request.into_inner();
-        println!(
-            "📝 Recibido log: [{}] {} -> {}",
-            req.component, req.user_id, req.action
+        info!(
+            component = req.component,
+            user_id = req.user_id,
+            action = req.action,
+            "Audit log received"
         );
 
-        // 3. Mapeo: Protobuf -> Struct Rust -> JSON
+        let normalized_status = if req.status.trim().is_empty() {
+            "UNKNOWN".to_string()
+        } else {
+            req.status.clone()
+        };
+
+        let resource = if req.resource.trim().is_empty() {
+            None
+        } else {
+            Some(req.resource.clone())
+        };
+
         let doc = AuditLogDocument {
             timestamp: req.timestamp,
             user_id: req.user_id,
             action: req.action,
-            resource: req.resource,
+            resource,
             component: req.component,
-            status: req.status,
-            details: req.details,
+            success: infer_success(&normalized_status),
+            status: normalized_status,
+            details: parse_details(&req.details),
         };
 
-        // 4. Enviamos a Elasticsearch (Asíncrono)
-        // URL: localhost:9200 / índice "audit-logs" / tipo "_doc"
         let es_url = "http://localhost:9200/audit-logs/_doc";
-
-        // Hacemos la petición HTTP POST
-        // Nota: En un sistema real, esto debería ir a una cola (Kafka) para no bloquear.
-        // Para el TFM, el HTTP directo demuestra integración.
         let response = self.http_client.post(es_url).json(&doc).send().await;
 
         match response {
             Ok(res) => {
                 if res.status().is_success() {
-                    // Todo OK
+                    info!(status = ?res.status(), "Audit log indexed in Elasticsearch");
                 } else {
-                    eprintln!("⚠️ Error Elasticsearch: {:?}", res.status());
+                    warn!(status = ?res.status(), "Elasticsearch rejected audit log");
                 }
             }
-            Err(e) => eprintln!("❌ Error conexión Elastic: {e}"),
+            Err(e) => error!(error = %e, "Failed to send audit log to Elasticsearch"),
         }
 
-        // 5. Respondemos al cliente gRPC "Todo OK" (ACK)
         Ok(Response::new(AuditResponse { ack: true }))
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Inicializar logs de consola
     tracing_subscriber::fmt::init();
 
-    let addr = "127.0.0.1:50053".parse()?; // Puerto para Auditoría
+    let addr = "127.0.0.1:50053".parse()?;
     let service = MyAuditService::default();
 
-    println!("🛡️  Audit Service escuchando en {addr}");
-    println!("📊 Conectando con Elasticsearch en localhost:9200...");
+    info!(%addr, "Audit Service listening");
+    info!("Elasticsearch target: http://localhost:9200/audit-logs/_doc");
 
     Server::builder()
         .add_service(AuditServiceServer::new(service))
