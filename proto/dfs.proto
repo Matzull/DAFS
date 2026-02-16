@@ -45,6 +45,9 @@ service DataNodeService {
 
     // Configuration command from Master to DataNode.
   rpc ConfigureNode (ConfigureNodeRequest) returns (ConfigureNodeResponse);
+
+    // Replication command from Master to DataNode.
+  rpc ReplicateBlock (ReplicateBlockRequest) returns (ReplicateBlockResponse);
 }
 
 // -----------------------------------------------------------------------
@@ -209,6 +212,16 @@ message ConfigureNodeRequest {
 }
 
 message ConfigureNodeResponse {
+  bool   success       = 1;
+  string error_message = 2;
+}
+
+message ReplicateBlockRequest {
+  string block_id = 1;
+  string target_node_address = 2; // Where to replicate the block
+}
+
+message ReplicateBlockResponse {
   bool   success       = 1;
   string error_message = 2;
 }

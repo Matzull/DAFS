@@ -2,11 +2,7 @@ mod models;
 use crate::models::{BlockMetadata, DatanodeInfo, FileMetadata, FileStatus, MasterState};
 use common::dfs::metadata_service_server::{MetadataService, MetadataServiceServer};
 use common::dfs::{
-    data_node_service_client, BlockAssignment, CreateFileRequest, CreateFileResponse,
-    DeleteBlockRequest, DeleteFileRequest, DeleteFileResponse, FileInfo, GetFileRequest,
-    GetFileResponse, HeartbeatRequest, HeartbeatResponse, ListDirectoryRequest,
-    ListDirectoryResponse, RenameFileRequest, RenameFileResponse, SetFileStatusRequest,
-    SetFileStatusResponse,
+    BlockAssignment, CreateFileRequest, CreateFileResponse, DeleteBlockRequest, DeleteFileRequest, DeleteFileResponse, FileInfo, GetFileRequest, GetFileResponse, HeartbeatRequest, HeartbeatResponse, ListDirectoryRequest, ListDirectoryResponse, RenameFileRequest, RenameFileResponse, ReplicateBlockRequest, SetFileStatusRequest, SetFileStatusResponse, data_node_service_client
 };
 // use tokio::net::unix::pipe::Receiver;
 use std::path::PathBuf;
@@ -161,6 +157,7 @@ enum WalOperation {
 pub struct Metadatanode {
     pub state: Arc<MasterState>,
     pub garbage_collector_tx: mpsc::Sender<Vec<BlockMetadata>>,
+    pub block_replicator_tx: mpsc::Sender<Vec<BlockMetadata>>,
     pub audit_tx: mpsc::Sender<AuditLog>,
     wal_tx: mpsc::Sender<WalRecord>,
     pub settings: Arc<InternalSettings>,
@@ -172,6 +169,7 @@ impl Clone for Metadatanode {
         Metadatanode {
             state: Arc::clone(&self.state),
             garbage_collector_tx: self.garbage_collector_tx.clone(),
+            block_replicator_tx: self.block_replicator_tx.clone(),
             audit_tx: self.audit_tx.clone(),
             wal_tx: self.wal_tx.clone(),
             settings: Arc::clone(&self.settings),
@@ -686,6 +684,71 @@ impl Metadatanode {
         }
     }
 
+    async fn notify_datanode_to_replicate(&self, block_id: &str, datanode_src: String, datanode_dst: String) -> Result<bool, String> {
+        info!(block_id, datanode_src, "Requesting datanode to replicate block");
+        let mut client = match data_node_service_client::DataNodeServiceClient::connect(
+            datanode_src.clone(),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(err) => {
+                error!(block_id, datanode_src, "Could not connect to datanode: {}", err);
+                self.audit(
+                    "Delete block",
+                    Some(block_id.to_string()),
+                    false,
+                    "CONNECTION_ERROR",
+                    json!({
+                        "datanode": datanode_src,
+                        "error": err.to_string(),
+                    }),
+                )
+                .await;
+                return Err(format!("Could not connect to datanode: {err}"));
+            }
+        };
+        match client
+            .replicate_block(ReplicateBlockRequest{block_id: block_id.to_string(), target_node_address: datanode_dst.clone()})
+            .await
+        {
+            Ok(_) => {
+                info!(block_id, datanode_src, "Block replication confirmed by datanode");
+                self.audit(
+                    "Delete block",
+                    Some(block_id.to_string()),
+                    true,
+                    "SUCCESS",
+                    json!({
+                        "datanode_src": datanode_src,
+                        "datanode_dst": datanode_dst,
+                    }),
+                )
+                .await;
+                Ok(true)
+            }
+            Err(err) => {
+                error!(
+                    block_id,
+                    datanode_src, "Failed to replicate block on datanode: {}", err
+                );
+                self.audit(
+                    "Delete block",
+                    Some(block_id.to_string()),
+                    false,
+                    "DELETE_ERROR",
+                    json!({
+                        "datanode_src": datanode_src,
+                        "datanode_src": datanode_dst,
+                        "error": err.to_string(),
+                    }),
+                )
+                .await;
+                Err(format!("Could not delete block on datanode: {err}"))
+            }
+        }
+    }
+
     async fn audit(
         &self,
         action: impl Into<String>,
@@ -747,6 +810,38 @@ fn garbage_collector(
                     };
                     drop(datanodes);
                     if let Err(e) = master_ref.notify_datanode_to_delete(&block.id, addr).await {
+                        error!("Error deleting block {} in {}: {}", block.id, location, e);
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn block_replicator(
+    mut block_replicator_rx: mpsc::Receiver<Vec<BlockMetadata>>,
+    master_ref: Arc<Metadatanode>,
+) {
+    todo!("Get real first location of block and then replicate from that node to all other nodes");
+    tokio::spawn(async move {
+        info!("Block replicator started");
+        while let Some(blocks) = block_replicator_rx.recv().await {
+            for block in blocks {
+                for location in block.locations {
+                    let datanodes = master_ref.state.available_datanodes.read().await;
+
+                    let addr = match datanodes.get(&location) {
+                        Some(a) => a.addr.clone(),
+                        None => {
+                            warn!(
+                                "DataNode {} not available to delete block {}",
+                                location, block.id
+                            );
+                            continue;
+                        }
+                    };
+                    drop(datanodes);
+                    if let Err(e) = master_ref.notify_datanode_to_replicate(&block.id, addr).await {
                         error!("Error deleting block {} in {}: {}", block.id, location, e);
                     }
                 }
@@ -818,7 +913,11 @@ fn wal_writer(
         if let Some(parent) = Path::new(&wal_path).parent() {
             if !parent.as_os_str().is_empty() {
                 if let Err(err) = tokio::fs::create_dir_all(parent).await {
-                    error!("Could not create WAL directory {}: {}", parent.display(), err);
+                    error!(
+                        "Could not create WAL directory {}: {}",
+                        parent.display(),
+                        err
+                    );
                     return;
                 }
             }
@@ -876,7 +975,14 @@ fn wal_writer(
 
 fn replay_wal(
     wal_path: &str,
-) -> Result<(HashMap<String, FileMetadata>, HashMap<u16, DatanodeInfo>, u16), std::io::Error> {
+) -> Result<
+    (
+        HashMap<String, FileMetadata>,
+        HashMap<u16, DatanodeInfo>,
+        u16,
+    ),
+    std::io::Error,
+> {
     let mut files = HashMap::<String, FileMetadata>::new();
     let mut datanodes = HashMap::<u16, DatanodeInfo>::new();
     let mut max_node_id = 0u16;
@@ -916,11 +1022,7 @@ fn replay_wal(
             WalOperation::RenameFile { old_path, new_path } => {
                 if let Some(mut metadata) = files.remove(&old_path) {
                     metadata.path = new_path.clone();
-                    metadata.name = new_path
-                        .split('/')
-                        .next_back()
-                        .unwrap_or("")
-                        .to_string();
+                    metadata.name = new_path.split('/').next_back().unwrap_or("").to_string();
                     files.insert(new_path, metadata);
                 }
             }
@@ -965,6 +1067,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let (garbage_collector_tx, garbage_collector_rx) = mpsc::channel::<Vec<BlockMetadata>>(1000);
+    let (block_replicator_tx, block_replicator_rx) = mpsc::channel::<Vec<BlockMetadata>>(1000);
     let (audit_tx, audit_rx) = mpsc::channel::<AuditLog>(10000); // Buffer grande
     let (wal_tx, wal_rx) = mpsc::channel::<WalRecord>(20000);
 
@@ -975,6 +1078,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         settings: Arc::clone(&settings),
         garbage_collector_tx,
+        block_replicator_tx,
         audit_tx,
         wal_tx,
         next_node_id: AtomicU16::new(next_node_id),
@@ -985,8 +1089,8 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting MetadataNode server on {}", address);
     info!("Datanodes will self-register via heartbeat");
-    let master_ref = Arc::clone(&metadatanode);
-    garbage_collector(garbage_collector_rx, master_ref);
+    let master_ref_gc = Arc::clone(&metadatanode);
+    garbage_collector(garbage_collector_rx, master_ref_gc);
     log_sender(audit_rx);
     wal_writer(
         wal_rx,
@@ -994,6 +1098,8 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings.wal_batch_size,
         settings.wal_flush_interval_ms,
     );
+    let master_ref_br = Arc::clone(&metadatanode);
+    block_replicator(block_replicator_rx, master_ref_br);
 
     Server::builder()
         .add_service(service)
