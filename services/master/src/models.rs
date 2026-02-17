@@ -1,13 +1,14 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Display;
-use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FileStatus {
-    Uploading, // File is being written to, reading is bloqued
-    Ready,     // File can be read and written to
-    Deleted,   // Marked to be deleted
+    Uploading,  // File is being written to, reading is bloqued
+    Ready,      // File can be read and written to
+    Replicated, // File has been replicated to other nodes
+    Deleted,    // Marked to be deleted
 }
 
 impl Display for FileStatus {
@@ -15,6 +16,7 @@ impl Display for FileStatus {
         match self {
             FileStatus::Uploading => write!(f, "Uploading"),
             FileStatus::Ready => write!(f, "Ready"),
+            FileStatus::Replicated => write!(f, "Replicated"),
             FileStatus::Deleted => write!(f, "Deleted"),
         }
     }
@@ -25,8 +27,9 @@ impl FileStatus {
         match str.trim().to_lowercase().as_str() {
             "uploading" => FileStatus::Uploading,
             "ready" => FileStatus::Ready,
+            "replicated" => FileStatus::Replicated,
             "deleted" => FileStatus::Deleted,
-            _ => FileStatus::Deleted // Unknown filestatus is set to deleted
+            _ => FileStatus::Deleted, // Unknown filestatus is set to deleted
         }
     }
 }

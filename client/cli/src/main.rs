@@ -1,4 +1,4 @@
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use clap::{Parser, Subcommand};
 use common::dfs::data_node_service_client::DataNodeServiceClient;
 use common::dfs::metadata_service_client::MetadataServiceClient;
@@ -13,7 +13,7 @@ use figment::{
     providers::{Format, Serialized, Toml},
     Figment,
 };
-use serde::{de, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::OpenOptions;
@@ -347,7 +347,8 @@ async fn download_block(
             _ => {
                 error!(block_id, "Received unexpected response data type");
                 return Err(format!(
-                    "Received unexpected response data type for block {block_id}"));
+                    "Received unexpected response data type for block {block_id}"
+                ));
             }
         };
         let data_len = chunk_data.len() as u64;

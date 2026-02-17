@@ -2,7 +2,11 @@ mod models;
 use crate::models::{BlockMetadata, DatanodeInfo, FileMetadata, FileStatus, MasterState};
 use common::dfs::metadata_service_server::{MetadataService, MetadataServiceServer};
 use common::dfs::{
-    BlockAssignment, CreateFileRequest, CreateFileResponse, DeleteBlockRequest, DeleteFileRequest, DeleteFileResponse, FileInfo, GetFileRequest, GetFileResponse, HeartbeatRequest, HeartbeatResponse, ListDirectoryRequest, ListDirectoryResponse, RenameFileRequest, RenameFileResponse, ReplicateBlockRequest, SetFileStatusRequest, SetFileStatusResponse, data_node_service_client
+    data_node_service_client, BlockAssignment, CreateFileRequest, CreateFileResponse,
+    DeleteBlockRequest, DeleteFileRequest, DeleteFileResponse, FileInfo, GetFileRequest,
+    GetFileResponse, HeartbeatRequest, HeartbeatResponse, ListDirectoryRequest,
+    ListDirectoryResponse, RenameFileRequest, RenameFileResponse, ReplicateBlockRequest,
+    SetFileStatusRequest, SetFileStatusResponse,
 };
 // use tokio::net::unix::pipe::Receiver;
 use std::path::PathBuf;
@@ -157,7 +161,7 @@ enum WalOperation {
 pub struct Metadatanode {
     pub state: Arc<MasterState>,
     pub garbage_collector_tx: mpsc::Sender<Vec<BlockMetadata>>,
-    pub block_replicator_tx: mpsc::Sender<Vec<BlockMetadata>>,
+    pub block_replicator_tx: mpsc::Sender<FileMetadata>,
     pub audit_tx: mpsc::Sender<AuditLog>,
     wal_tx: mpsc::Sender<WalRecord>,
     pub settings: Arc<InternalSettings>,
@@ -598,6 +602,12 @@ impl MetadataService for Metadatanode {
         let mut files_lock = self.state.files.write().await;
         if let Some(file_metadata) = files_lock.get_mut(&file_path) {
             file_metadata.file_status = FileStatus::str_to_tok(&new_status);
+            if FileStatus::str_to_tok(&new_status) == FileStatus::Ready {
+                self.block_replicator_tx
+                    .send(file_metadata.clone())
+                    .await
+                    .ok();
+            }
         } else {
             return Err(Status::not_found("File not found"));
         }
@@ -684,38 +694,54 @@ impl Metadatanode {
         }
     }
 
-    async fn notify_datanode_to_replicate(&self, block_id: &str, datanode_src: String, datanode_dst: String) -> Result<bool, String> {
-        info!(block_id, datanode_src, "Requesting datanode to replicate block");
-        let mut client = match data_node_service_client::DataNodeServiceClient::connect(
-            datanode_src.clone(),
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(err) => {
-                error!(block_id, datanode_src, "Could not connect to datanode: {}", err);
-                self.audit(
-                    "Delete block",
-                    Some(block_id.to_string()),
-                    false,
-                    "CONNECTION_ERROR",
-                    json!({
-                        "datanode": datanode_src,
-                        "error": err.to_string(),
-                    }),
-                )
-                .await;
-                return Err(format!("Could not connect to datanode: {err}"));
-            }
-        };
+    async fn notify_datanode_to_replicate(
+        &self,
+        block_id: &str,
+        datanode_src: String,
+        datanode_dst: String,
+    ) -> Result<bool, String> {
+        debug!(
+            block_id,
+            datanode_src, "Requesting datanode to replicate block"
+        );
+        let mut client =
+            match data_node_service_client::DataNodeServiceClient::connect(datanode_src.clone())
+                .await
+            {
+                Ok(c) => c,
+                Err(err) => {
+                    error!(
+                        block_id,
+                        datanode_src, "Could not connect to datanode: {}", err
+                    );
+                    self.audit(
+                        "Replicate block",
+                        Some(block_id.to_string()),
+                        false,
+                        "CONNECTION_ERROR",
+                        json!({
+                            "datanode": datanode_src,
+                            "error": err.to_string(),
+                        }),
+                    )
+                    .await;
+                    return Err(format!("Could not connect to datanode: {err}"));
+                }
+            };
         match client
-            .replicate_block(ReplicateBlockRequest{block_id: block_id.to_string(), target_node_address: datanode_dst.clone()})
+            .replicate_block(ReplicateBlockRequest {
+                block_id: block_id.to_string(),
+                target_node_address: datanode_dst.clone(),
+            })
             .await
         {
             Ok(_) => {
-                info!(block_id, datanode_src, "Block replication confirmed by datanode");
+                debug!(
+                    block_id,
+                    datanode_src, "Block replication confirmed by datanode"
+                );
                 self.audit(
-                    "Delete block",
+                    "Replicate block",
                     Some(block_id.to_string()),
                     true,
                     "SUCCESS",
@@ -733,7 +759,7 @@ impl Metadatanode {
                     datanode_src, "Failed to replicate block on datanode: {}", err
                 );
                 self.audit(
-                    "Delete block",
+                    "Replicate block",
                     Some(block_id.to_string()),
                     false,
                     "DELETE_ERROR",
@@ -819,33 +845,71 @@ fn garbage_collector(
 }
 
 fn block_replicator(
-    mut block_replicator_rx: mpsc::Receiver<Vec<BlockMetadata>>,
+    mut block_replicator_rx: mpsc::Receiver<FileMetadata>,
     master_ref: Arc<Metadatanode>,
 ) {
-    todo!("Get real first location of block and then replicate from that node to all other nodes");
+    // todo!("Get real first location of block and then replicate from that node to all other nodes");
     tokio::spawn(async move {
         info!("Block replicator started");
-        while let Some(blocks) = block_replicator_rx.recv().await {
-            for block in blocks {
-                for location in block.locations {
+        while let Some(file_metadata) = block_replicator_rx.recv().await {
+            for block in file_metadata.blocks {
+                let mut locations = block.locations.iter();
+                let block_location = match locations.next() {
+                    Some(loc) => loc,
+                    None => {
+                        warn!("Block {} has no locations, skipping replication", block.id);
+                        continue;
+                    }
+                };
+                let src_datanode_addr = {
                     let datanodes = master_ref.state.available_datanodes.read().await;
-
-                    let addr = match datanodes.get(&location) {
-                        Some(a) => a.addr.clone(),
+                    match datanodes.get(block_location) {
+                        Some(info) => info.addr.clone(),
                         None => {
                             warn!(
-                                "DataNode {} not available to delete block {}",
-                                location, block.id
+                                "Source DataNode {} not available for block {}",
+                                block_location, block.id
                             );
                             continue;
                         }
+                    }
+                };
+                for location in locations {
+                    let dst_datanode_addr = {
+                        let datanodes = master_ref.state.available_datanodes.read().await;
+                        match datanodes.get(location) {
+                            Some(a) => a.addr.clone(),
+                            None => {
+                                warn!(
+                                    "DataNode {} not available to have block {}",
+                                    location, block.id
+                                );
+                                continue;
+                            }
+                        }
                     };
-                    drop(datanodes);
-                    if let Err(e) = master_ref.notify_datanode_to_replicate(&block.id, addr).await {
-                        error!("Error deleting block {} in {}: {}", block.id, location, e);
+                    if let Err(e) = master_ref
+                        .notify_datanode_to_replicate(
+                            &block.id,
+                            src_datanode_addr.clone(),
+                            dst_datanode_addr,
+                        )
+                        .await
+                    {
+                        error!(
+                            "Error replicating block {} to {}: {}",
+                            block.id, location, e
+                        );
                     }
                 }
             }
+            master_ref
+                .set_file_status(Request::new(SetFileStatusRequest {
+                    path: file_metadata.path.clone(),
+                    status: FileStatus::Replicated.to_string(),
+                }))
+                .await
+                .unwrap();
         }
     });
 }
@@ -867,7 +931,7 @@ fn log_sender(mut audit_rx: mpsc::Receiver<AuditLog>) {
         );
 
         while let Some(log) = audit_rx.recv().await {
-            info!("Sending log");
+            debug!("Sending log");
             let res = client
                 .post(&es_url)
                 .basic_auth(&es_user, Some(&es_pass))
@@ -876,7 +940,7 @@ fn log_sender(mut audit_rx: mpsc::Receiver<AuditLog>) {
                 .await;
 
             match res {
-                Ok(response) => info!("Respuesta Elastic: {:?}", response.status()),
+                Ok(response) => debug!("Respuesta Elastic: {:?}", response.status()),
                 Err(e) => error!("Error enviando log: {:?}", e),
             }
         }
@@ -973,6 +1037,7 @@ fn wal_writer(
     });
 }
 
+#[allow(clippy::type_complexity)]
 fn replay_wal(
     wal_path: &str,
 ) -> Result<
@@ -1067,7 +1132,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let (garbage_collector_tx, garbage_collector_rx) = mpsc::channel::<Vec<BlockMetadata>>(1000);
-    let (block_replicator_tx, block_replicator_rx) = mpsc::channel::<Vec<BlockMetadata>>(1000);
+    let (block_replicator_tx, block_replicator_rx) = mpsc::channel::<FileMetadata>(1000);
     let (audit_tx, audit_rx) = mpsc::channel::<AuditLog>(10000); // Buffer grande
     let (wal_tx, wal_rx) = mpsc::channel::<WalRecord>(20000);
 
