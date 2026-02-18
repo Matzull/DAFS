@@ -98,7 +98,7 @@ impl AuditService for MyAuditService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    common::init_tracing("audit", "info");
 
     let addr = "127.0.0.1:50053".parse()?;
     let service = MyAuditService::default();

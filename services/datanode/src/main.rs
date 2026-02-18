@@ -420,16 +420,7 @@ impl DataNodeService for Datanode {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = Arc::new(load_config());
 
-    let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| settings.log_level.clone());
-    let filter = tracing_subscriber::EnvFilter::new("info")
-        .add_directive(format!("datanode={log_level}").parse().unwrap());
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_file(true)
-        .with_line_number(true)
-        .with_thread_ids(true)
-        .with_target(false)
-        .init();
+    common::init_tracing("datanode", &settings.log_level);
     info!("Starting DataNode with settings: {:?}", settings);
     debug!("Creating directory to store files");
     create_dir_all(&settings.data_folder).await?;

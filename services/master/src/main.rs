@@ -267,7 +267,7 @@ impl Metadatanode {
 
 #[tonic::async_trait]
 impl MetadataService for Metadatanode {
-    #[instrument(skip(self))]
+    #[instrument(skip(self, request))]
     async fn create_file(
         &self,
         request: Request<CreateFileRequest>,
@@ -314,7 +314,7 @@ impl MetadataService for Metadatanode {
         }))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, request))]
     async fn get_file_metadata(
         &self,
         request: Request<GetFileRequest>,
@@ -358,7 +358,7 @@ impl MetadataService for Metadatanode {
         }))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, request))]
     async fn delete_file(
         &self,
         request: Request<DeleteFileRequest>,
@@ -398,7 +398,7 @@ impl MetadataService for Metadatanode {
         }
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, request))]
     async fn list_directory(
         &self,
         request: Request<ListDirectoryRequest>,
@@ -438,7 +438,7 @@ impl MetadataService for Metadatanode {
         Ok(Response::new(ListDirectoryResponse { files }))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, request))]
     async fn rename_file(
         &self,
         request: Request<RenameFileRequest>,
@@ -490,7 +490,7 @@ impl MetadataService for Metadatanode {
         }))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, request))]
     async fn heartbeat(
         &self,
         request: Request<HeartbeatRequest>,
@@ -1109,16 +1109,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::from_path(std::path::Path::new("services/master/.env")).ok();
     let settings = Arc::new(load_config());
 
-    let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| settings.log_level.clone());
-    let filter = tracing_subscriber::EnvFilter::new("info")
-        .add_directive(format!("master={log_level}").parse().unwrap());
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_file(true)
-        .with_line_number(true)
-        .with_thread_ids(true)
-        .with_target(false)
-        .init();
+    common::init_tracing("master", &settings.log_level);
 
     info!("Configuration loaded: {:?}", settings);
     let (files, available_data_nodes, next_node_id) = replay_wal(&settings.wal_path)?;

@@ -523,18 +523,7 @@ async fn main() {
     let cli = Cli::parse();
     let settings = Arc::new(load_config());
 
-    // Initialize tracing with the specified log level
-    let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| settings.log_level.clone());
-
-    let filter = tracing_subscriber::EnvFilter::new("info")
-        .add_directive(format!("cli={log_level}").parse().unwrap());
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_file(true)
-        .with_line_number(true)
-        .with_thread_ids(true)
-        .with_target(false)
-        .init();
+    common::init_tracing("cli", &settings.log_level);
     debug!("CLI configuration loaded: {:?}", settings);
     info!("DAFS CLI starting");
     info!("Master node: {}", settings.master_endpoints.join(", "));
