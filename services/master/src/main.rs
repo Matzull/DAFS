@@ -274,7 +274,7 @@ impl MetadataService for Metadatanode {
     ) -> Result<Response<CreateFileResponse>, Status> {
         info!("Received create_file request");
         let file_request = request.into_inner();
-        let file_metadata = self
+        let file_metadata = match self
             ._create_file(
                 &self.state,
                 &self.settings,
@@ -282,9 +282,24 @@ impl MetadataService for Metadatanode {
                 file_request.size,
             )
             .await
-            .map_err(Status::internal)?;
+        {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                self.audit_failure(
+                    "FILE_CREATE",
+                    Some(file_request.path.clone()),
+                    "CREATE_ERROR",
+                    json!({
+                        "size": file_request.size,
+                        "error": err,
+                    }),
+                )
+                .await;
+                return Err(Status::internal("Could not create file metadata"));
+            }
+        };
         let datanodes = self.state.available_datanodes.read().await;
-        let block_assignments = file_metadata
+        let block_assignments: Vec<BlockAssignment> = file_metadata
             .blocks
             .iter()
             .map(|block| BlockAssignment {
@@ -294,13 +309,13 @@ impl MetadataService for Metadatanode {
                 order: block.index as i64, //TODO: check var size i64 vs i32
             })
             .collect();
-        self.audit(
-            "Creating file",
+        self.audit_success(
+            "FILE_CREATE",
             Some(file_request.path.clone()),
-            true,
-            "SUCCESS",
             json!({
                 "size": file_request.size,
+                "file_id": file_metadata.id.clone(),
+                "block_count": block_assignments.len(),
             }),
         )
         .await;
@@ -324,7 +339,16 @@ impl MetadataService for Metadatanode {
         let files_lock = self.state.files.read().await;
         let file_metadata = match files_lock.get(&file_path) {
             Some(filemetadata) => filemetadata,
-            None => return Err(Status::not_found("File not found")),
+            None => {
+                self.audit_failure(
+                    "FILE_GET_METADATA",
+                    Some(file_path.clone()),
+                    "NOT_FOUND",
+                    json!({}),
+                )
+                .await;
+                return Err(Status::not_found("File not found"));
+            }
         };
         let datanodes = self.state.available_datanodes.read().await;
         let block_assignments = file_metadata
@@ -337,11 +361,9 @@ impl MetadataService for Metadatanode {
                 order: block.index as i64, //TODO: check var size i64 vs i32
             })
             .collect();
-        self.audit(
-            "Getting file",
+        self.audit_success(
+            "FILE_GET_METADATA",
             Some(file_path.to_string()),
-            true,
-            "SUCCESS",
             json!({}),
         )
         .await;
@@ -374,11 +396,9 @@ impl MetadataService for Metadatanode {
                 file_path,
                 block_count, "File deleted, blocks queued for garbage collection"
             );
-            self.audit(
-                "Deleting file",
+            self.audit_success(
+                "FILE_DELETE",
                 Some(file_path.to_string()),
-                true,
-                "SUCCESS",
                 json!({
                     "queued_blocks": block_count,
                 }),
@@ -394,6 +414,13 @@ impl MetadataService for Metadatanode {
             }))
         } else {
             warn!(file_path, "Attempted to delete non-existent file");
+            self.audit_failure(
+                "FILE_DELETE",
+                Some(file_path.to_string()),
+                "NOT_FOUND",
+                json!({}),
+            )
+            .await;
             return Err(Status::not_found("File not found"));
         }
     }
@@ -425,11 +452,9 @@ impl MetadataService for Metadatanode {
             file_count = files.len(),
             "Directory listing completed"
         );
-        self.audit(
-            "Listing dir",
+        self.audit_success(
+            "DIRECTORY_LIST",
             Some(dir_path.to_string()),
-            true,
-            "SUCCESS",
             json!({
                 "file_count": files.len(),
             }),
@@ -451,6 +476,15 @@ impl MetadataService for Metadatanode {
                 new_path = rename_req.new_path,
                 "Rename target already exists"
             );
+            self.audit_failure(
+                "FILE_RENAME",
+                Some(rename_req.old_path.clone()),
+                "ALREADY_EXISTS",
+                json!({
+                    "new_path": rename_req.new_path,
+                }),
+            )
+            .await;
             return Err(Status::already_exists(format!(
                 "File {} already exists",
                 rename_req.new_path
@@ -466,13 +500,20 @@ impl MetadataService for Metadatanode {
             files_lock.insert(rename_req.new_path.clone(), file_metadata);
         } else {
             warn!(old_path = rename_req.old_path, "File not found for rename");
+            self.audit_failure(
+                "FILE_RENAME",
+                Some(rename_req.old_path.clone()),
+                "NOT_FOUND",
+                json!({
+                    "new_path": rename_req.new_path,
+                }),
+            )
+            .await;
             return Err(Status::not_found("Couldnt rename file"));
         }
-        self.audit(
-            "Renamed file",
+        self.audit_success(
+            "FILE_RENAME",
             Some(rename_req.old_path.to_string()),
-            true,
-            "SUCCESS",
             json!({
                 "new_path": rename_req.new_path,
             }),
@@ -518,11 +559,9 @@ impl MetadataService for Metadatanode {
                         .as_millis() as i64,
                 },
             );
-            self.audit(
-                "New datanode registration",
+            self.audit_success(
+                "DATANODE_REGISTER",
                 Some(format!("node:{new_id}")),
-                true,
-                "SUCCESS",
                 json!({
                     "assigned_node_id": new_id,
                     "datanode_addr": datanode_addr,
@@ -574,19 +613,32 @@ impl MetadataService for Metadatanode {
                 "Heartbeat from unknown node"
             );
         }
-        self.audit(
-            "Heartbeat",
-            Some(format!("node:{}", node_request.node_id)),
-            audit_success,
-            audit_status,
-            json!({
-                "cpu_usage": node_request.cpu_usage,
-                "free_space": node_request.free_space,
-                "used_space": node_request.used_space,
-                "addr": node_request.addr,
-            }),
-        )
-        .await;
+        if audit_success {
+            self.audit_success(
+                "DATANODE_HEARTBEAT",
+                Some(format!("node:{}", node_request.node_id)),
+                json!({
+                    "cpu_usage": node_request.cpu_usage,
+                    "free_space": node_request.free_space,
+                    "used_space": node_request.used_space,
+                    "addr": node_request.addr,
+                }),
+            )
+            .await;
+        } else {
+            self.audit_failure(
+                "DATANODE_HEARTBEAT",
+                Some(format!("node:{}", node_request.node_id)),
+                audit_status,
+                json!({
+                    "cpu_usage": node_request.cpu_usage,
+                    "free_space": node_request.free_space,
+                    "used_space": node_request.used_space,
+                    "addr": node_request.addr,
+                }),
+            )
+            .await;
+        }
         Ok(Response::new(HeartbeatResponse {
             acknowledgement: true,
             assigned_node_id: node_request.node_id,
@@ -603,13 +655,32 @@ impl MetadataService for Metadatanode {
         let mut files_lock = self.state.files.write().await;
         if let Some(file_metadata) = files_lock.get_mut(&file_path) {
             file_metadata.file_status = FileStatus::str_to_tok(&new_status);
-            if FileStatus::str_to_tok(&new_status) == FileStatus::Ready {
+            let queued_for_replication = FileStatus::str_to_tok(&new_status) == FileStatus::Ready;
+            if queued_for_replication {
                 self.block_replicator_tx
                     .send(file_metadata.clone())
                     .await
                     .ok();
             }
+            self.audit_success(
+                "FILE_SET_STATUS",
+                Some(file_path.clone()),
+                json!({
+                    "status": new_status,
+                    "queued_for_replication": queued_for_replication,
+                }),
+            )
+            .await;
         } else {
+            self.audit_failure(
+                "FILE_SET_STATUS",
+                Some(file_path.clone()),
+                "NOT_FOUND",
+                json!({
+                    "status": new_status,
+                }),
+            )
+            .await;
             return Err(Status::not_found("File not found"));
         }
         self.wal(WalOperation::SetFileStatus {
@@ -640,10 +711,9 @@ impl Metadatanode {
             Ok(c) => c,
             Err(err) => {
                 error!(block_id, datanode, "Could not connect to datanode: {}", err);
-                self.audit(
-                    "Delete block",
+                self.audit_failure(
+                    "BLOCK_DELETE",
                     Some(block_id.to_string()),
-                    false,
                     "CONNECTION_ERROR",
                     json!({
                         "datanode": datanode,
@@ -662,11 +732,9 @@ impl Metadatanode {
         {
             Ok(_) => {
                 info!(block_id, datanode, "Block deletion confirmed by datanode");
-                self.audit(
-                    "Delete block",
+                self.audit_success(
+                    "BLOCK_DELETE",
                     Some(block_id.to_string()),
-                    true,
-                    "SUCCESS",
                     json!({
                         "datanode": datanode,
                     }),
@@ -679,10 +747,9 @@ impl Metadatanode {
                     block_id,
                     datanode, "Failed to delete block on datanode: {}", err
                 );
-                self.audit(
-                    "Delete block",
+                self.audit_failure(
+                    "BLOCK_DELETE",
                     Some(block_id.to_string()),
-                    false,
                     "DELETE_ERROR",
                     json!({
                         "datanode": datanode,
@@ -739,10 +806,9 @@ impl Metadatanode {
                     Ok(c) => c,
                     Err(err) => {
                         error!(datanode_src, "Could not connect to datanode: {}", err);
-                        self.audit(
-                            "Replicate block",
+                        self.audit_failure(
+                            "BLOCK_REPLICATE",
                             Some(format!("datanode:{datanode_src}")),
-                            false,
                             "CONNECTION_ERROR",
                             json!({
                                 "datanode": datanode_src,
@@ -761,11 +827,9 @@ impl Metadatanode {
                 match client.replicate_blocks(request).await {
                     Ok(_) => {
                         debug!(datanode_src, "Block replication confirmed by datanode");
-                        this.audit(
-                            "Replicate block",
+                        this.audit_success(
+                            "BLOCK_REPLICATE",
                             Some(format!("datanode:{datanode_src}")),
-                            true,
-                            "SUCCESS",
                             json!({
                                 "datanode_src": datanode_src,
                             }),
@@ -777,10 +841,9 @@ impl Metadatanode {
                             datanode_src,
                             "Failed to replicate block on datanode: {}", err
                         );
-                        this.audit(
-                            "Replicate block",
+                        this.audit_failure(
+                            "BLOCK_REPLICATE",
                             Some(format!("datanode:{datanode_src}")),
-                            false,
                             "REPLICATION_ERROR",
                             json!({
                                 "datanode_src": datanode_src,
@@ -802,6 +865,20 @@ impl Metadatanode {
             }
         }
         Ok(true)
+    }
+
+    async fn audit_success(&self, action: &'static str, resource: Option<String>, details: Value) {
+        self.audit(action, resource, true, "SUCCESS", details).await;
+    }
+
+    async fn audit_failure(
+        &self,
+        action: &'static str,
+        resource: Option<String>,
+        status: &'static str,
+        details: Value,
+    ) {
+        self.audit(action, resource, false, status, details).await;
     }
 
     async fn audit(
