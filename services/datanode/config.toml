@@ -15,4 +15,19 @@ mpsc_channel_size = 64
 # Buffer size for reading blocks (in bytes)
 read_buffer_size = 65536
 
+# Buffer size for writing blocks (in bytes)
+write_buffer_size = 131072
+
 metadata_node_address = "http://[::1]:9090"
+
+# Replication worker settings
+replication_max_parallel_blocks = 16
+
+# Heartbeat behavior
+heartbeat_retry_initial_ms = 500
+heartbeat_retry_max_ms = 30000
+heartbeat_interval_ms = 3000
+heartbeat_nack_retry_ms = 1000
+heartbeat_cpu_usage = 1.0
+heartbeat_free_space = 4
+heartbeat_used_space = 4

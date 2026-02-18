@@ -13,3 +13,15 @@ download_concurrency = 16
 
 # Logging level (trace, debug, info, warn, error)
 log_level = "info"
+
+# Upload streaming chunk size (bytes)
+upload_chunk_size = 65536
+
+# Metadata user identity and status defaults
+default_user_id = "1"
+upload_ready_status = "READY"
+
+# Command defaults
+default_list_path = "/"
+default_rename_old_path = "/"
+default_rename_new_path = "/"

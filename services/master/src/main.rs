@@ -45,6 +45,15 @@ const DEFAULT_AUDIT_SERVICE_ADDR: &str = "http://[::1]:9090";
 const DEFAULT_WAL_PATH: &str = "services/master/master.wal";
 const DEFAULT_WAL_BATCH_SIZE: usize = 128;
 const DEFAULT_WAL_FLUSH_INTERVAL_MS: u64 = 250;
+const DEFAULT_ENV_FILE_PATH: &str = "services/master/.env";
+const DEFAULT_GARBAGE_COLLECTOR_CHANNEL_SIZE: usize = 1000;
+const DEFAULT_BLOCK_REPLICATOR_CHANNEL_SIZE: usize = 1000;
+const DEFAULT_AUDIT_CHANNEL_SIZE: usize = 10000;
+const DEFAULT_WAL_CHANNEL_SIZE: usize = 20000;
+const DEFAULT_REPLICATION_MAX_PARALLEL_SOURCES: usize = 8;
+const DEFAULT_AUDIT_DEFAULT_USER: &str = "system";
+const DEFAULT_FILE_DEFAULT_OWNER: &str = "SYSTEM";
+const DEFAULT_ELASTIC_ALLOW_INVALID_CERTS: bool = true;
 
 #[derive(Parser, Debug, Serialize, Deserialize)]
 pub struct InternalSettings {
@@ -56,6 +65,15 @@ pub struct InternalSettings {
     pub wal_path: String,
     pub wal_batch_size: usize,
     pub wal_flush_interval_ms: u64,
+    pub env_file_path: String,
+    pub garbage_collector_channel_size: usize,
+    pub block_replicator_channel_size: usize,
+    pub audit_channel_size: usize,
+    pub wal_channel_size: usize,
+    pub replication_max_parallel_sources: usize,
+    pub audit_default_user: String,
+    pub file_default_owner: String,
+    pub elastic_allow_invalid_certs: bool,
 }
 
 pub fn load_config() -> InternalSettings {
@@ -71,6 +89,15 @@ pub fn load_config() -> InternalSettings {
             wal_path: DEFAULT_WAL_PATH.to_string(),
             wal_batch_size: DEFAULT_WAL_BATCH_SIZE,
             wal_flush_interval_ms: DEFAULT_WAL_FLUSH_INTERVAL_MS,
+            env_file_path: DEFAULT_ENV_FILE_PATH.to_string(),
+            garbage_collector_channel_size: DEFAULT_GARBAGE_COLLECTOR_CHANNEL_SIZE,
+            block_replicator_channel_size: DEFAULT_BLOCK_REPLICATOR_CHANNEL_SIZE,
+            audit_channel_size: DEFAULT_AUDIT_CHANNEL_SIZE,
+            wal_channel_size: DEFAULT_WAL_CHANNEL_SIZE,
+            replication_max_parallel_sources: DEFAULT_REPLICATION_MAX_PARALLEL_SOURCES,
+            audit_default_user: DEFAULT_AUDIT_DEFAULT_USER.to_string(),
+            file_default_owner: DEFAULT_FILE_DEFAULT_OWNER.to_string(),
+            elastic_allow_invalid_certs: DEFAULT_ELASTIC_ALLOW_INVALID_CERTS,
         }))
         .merge(Toml::file(&cli.config_path))
         .merge(Serialized::globals(cli));
@@ -122,6 +149,51 @@ struct Cli {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     wal_flush_interval_ms: Option<u64>,
+
+    /// Dotenv file path
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    env_file_path: Option<String>,
+
+    /// Garbage collector channel size
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    garbage_collector_channel_size: Option<usize>,
+
+    /// Block replicator channel size
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_replicator_channel_size: Option<usize>,
+
+    /// Audit channel size
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audit_channel_size: Option<usize>,
+
+    /// WAL channel size
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wal_channel_size: Option<usize>,
+
+    /// Maximum parallel source datanodes for replication tasks
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replication_max_parallel_sources: Option<usize>,
+
+    /// Default user identity used in audit logs when no actor is available
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audit_default_user: Option<String>,
+
+    /// Default owner used for new file metadata
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_default_owner: Option<String>,
+
+    /// Allow invalid TLS certificates for Elasticsearch client
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elastic_allow_invalid_certs: Option<bool>,
 
     #[arg(short, long, default_value = "config.toml")]
     #[serde(skip)]
@@ -252,7 +324,7 @@ impl Metadatanode {
             name: file_path.split('/').next_back().unwrap_or("").to_string(),
             path: file_path.clone(),
             size: file_size,
-            owner: "SYSTEM".to_string(),
+            owner: settings.file_default_owner.clone(),
             created_at: now_miliseconds,
             last_modified_at: now_miliseconds,
             file_status: FileStatus::Uploading,
@@ -768,7 +840,7 @@ impl Metadatanode {
     ) -> Result<bool, String> {
         debug!("Notifying datanodes");
         let datanodes = self.state.available_datanodes.read().await;
-        let max_parallel_src = 8;
+        let max_parallel_src = self.settings.replication_max_parallel_sources.max(1);
         let sem = Arc::new(Semaphore::new(max_parallel_src));
         let mut set = JoinSet::new();
         for (datanode_src, targets) in mapping {
@@ -898,7 +970,7 @@ impl Metadatanode {
                 component: "MASTER".to_string(),
                 success,
                 status: status.into(),
-                user: "1".to_string(),
+                user: self.settings.audit_default_user.clone(),
                 details,
             })
             .await
@@ -989,15 +1061,14 @@ fn block_replicator(
     });
 }
 
-fn log_sender(mut audit_rx: mpsc::Receiver<AuditLog>) {
-    dotenvy::from_path(std::path::Path::new("services/master/.env")).ok();
+fn log_sender(mut audit_rx: mpsc::Receiver<AuditLog>, allow_invalid_certs: bool) {
     let es_url = env::var("ELASTIC_URL").expect("URL not defined");
     let es_user = env::var("ELASTIC_USER").expect("User not defined");
     let es_pass = env::var("ELASTIC_PASSWORD").expect("Pass not defined");
 
     tokio::spawn(async move {
         let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_certs(allow_invalid_certs)
             .build()
             .expect("Failed to build client");
         info!(
@@ -1183,8 +1254,8 @@ fn replay_wal(
 
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenvy::from_path(std::path::Path::new("services/master/.env")).ok();
     let settings = Arc::new(load_config());
+    dotenvy::from_path(std::path::Path::new(&settings.env_file_path)).ok();
 
     common::init_tracing("master", &settings.log_level);
 
@@ -1197,10 +1268,15 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_node_id
     );
 
-    let (garbage_collector_tx, garbage_collector_rx) = mpsc::channel::<Vec<BlockMetadata>>(1000);
-    let (block_replicator_tx, block_replicator_rx) = mpsc::channel::<FileMetadata>(1000);
-    let (audit_tx, audit_rx) = mpsc::channel::<AuditLog>(10000); // Buffer grande
-    let (wal_tx, wal_rx) = mpsc::channel::<WalRecord>(20000);
+    let (garbage_collector_tx, garbage_collector_rx) = mpsc::channel::<Vec<BlockMetadata>>(
+        settings.garbage_collector_channel_size.max(1),
+    );
+    let (block_replicator_tx, block_replicator_rx) = mpsc::channel::<FileMetadata>(
+        settings.block_replicator_channel_size.max(1),
+    );
+    let (audit_tx, audit_rx) =
+        mpsc::channel::<AuditLog>(settings.audit_channel_size.max(1)); // Buffer grande
+    let (wal_tx, wal_rx) = mpsc::channel::<WalRecord>(settings.wal_channel_size.max(1));
 
     let metadatanode = Arc::new(Metadatanode {
         state: Arc::new(MasterState {
@@ -1222,7 +1298,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Datanodes will self-register via heartbeat");
     let master_ref_gc = Arc::clone(&metadatanode);
     garbage_collector(garbage_collector_rx, master_ref_gc);
-    log_sender(audit_rx);
+    log_sender(audit_rx, settings.elastic_allow_invalid_certs);
     wal_writer(
         wal_rx,
         settings.wal_path.clone(),

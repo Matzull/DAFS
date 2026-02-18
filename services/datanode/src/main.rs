@@ -37,7 +37,16 @@ pub struct InternalSettings {
     pub log_level: String,
     pub mpsc_channel_size: u8,
     pub read_buffer_size: usize,
+    pub write_buffer_size: usize,
     pub metadata_node_address: String,
+    pub replication_max_parallel_blocks: usize,
+    pub heartbeat_retry_initial_ms: u64,
+    pub heartbeat_retry_max_ms: u64,
+    pub heartbeat_interval_ms: u64,
+    pub heartbeat_nack_retry_ms: u64,
+    pub heartbeat_cpu_usage: f32,
+    pub heartbeat_free_space: i64,
+    pub heartbeat_used_space: i64,
 }
 
 pub fn load_config() -> InternalSettings {
@@ -50,7 +59,16 @@ pub fn load_config() -> InternalSettings {
             log_level: DEFAULT_LOG_LEVEL.to_string(),
             mpsc_channel_size: 4,
             read_buffer_size: 64 * 1024,
+            write_buffer_size: 128 * 1024,
             metadata_node_address: DEFAULT_METADATA_NODE_ADDRESS.to_string(),
+            replication_max_parallel_blocks: 16,
+            heartbeat_retry_initial_ms: 500,
+            heartbeat_retry_max_ms: 30_000,
+            heartbeat_interval_ms: 3_000,
+            heartbeat_nack_retry_ms: 1_000,
+            heartbeat_cpu_usage: 1.0,
+            heartbeat_free_space: 4,
+            heartbeat_used_space: 4,
         }))
         .merge(Toml::file(&cli.config_path))
         .merge(Serialized::globals(cli));
@@ -77,6 +95,66 @@ struct Cli {
     #[arg(long, global = true)]
     #[serde(skip_serializing_if = "Option::is_none")]
     log_level: Option<String>,
+
+    /// MPSC channel size for read/write operations
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mpsc_channel_size: Option<u8>,
+
+    /// Read buffer size in bytes
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    read_buffer_size: Option<usize>,
+
+    /// Write buffer size in bytes
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    write_buffer_size: Option<usize>,
+
+    /// Metadata node address
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata_node_address: Option<String>,
+
+    /// Maximum parallel replication block tasks
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replication_max_parallel_blocks: Option<usize>,
+
+    /// Initial heartbeat retry delay in milliseconds
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heartbeat_retry_initial_ms: Option<u64>,
+
+    /// Maximum heartbeat retry delay in milliseconds
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heartbeat_retry_max_ms: Option<u64>,
+
+    /// Heartbeat interval in milliseconds
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heartbeat_interval_ms: Option<u64>,
+
+    /// Retry delay when heartbeat is not acknowledged in milliseconds
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heartbeat_nack_retry_ms: Option<u64>,
+
+    /// CPU usage value sent in heartbeat
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heartbeat_cpu_usage: Option<f32>,
+
+    /// Free space value sent in heartbeat
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heartbeat_free_space: Option<i64>,
+
+    /// Used space value sent in heartbeat
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heartbeat_used_space: Option<i64>,
 
     #[arg(short, long, default_value = "config.toml")]
     #[serde(skip)]
@@ -217,7 +295,7 @@ impl DataNodeService for Datanode {
                             Status::internal(err.to_string())
                         })?;
 
-                    writer = Some(BufWriter::with_capacity(128 * 1024, f));
+                    writer = Some(BufWriter::with_capacity(self.settings.write_buffer_size, f));
                     // file = Some(f);
                 }
                 Some(RequestData::ChunkData(chunkdata)) => {
@@ -286,6 +364,7 @@ impl DataNodeService for Datanode {
         file_path_pathbuf.push(&block_id[2..4]);
         file_path_pathbuf.push(&block_id);
         let (tx, rx) = mpsc::channel(self.settings.mpsc_channel_size as usize);
+        let read_buffer_size = self.settings.read_buffer_size;
 
         tokio::spawn(async move {
             let file_res = File::open(file_path_pathbuf).await;
@@ -298,7 +377,7 @@ impl DataNodeService for Datanode {
                 }
             };
 
-            let mut buffer = [0u8; 64 * 1024];
+            let mut buffer = vec![0u8; read_buffer_size];
             loop {
                 match file.read(&mut buffer).await {
                     Ok(0) => {
@@ -383,7 +462,7 @@ impl DataNodeService for Datanode {
         request: Request<ReplicateBlocksRequest>,
     ) -> Result<Response<ReplicateBlocksResponse>, Status> {
         let block_locs = request.into_inner().block_locations;
-        let max_parallel_blocks = 16;
+        let max_parallel_blocks = self.settings.replication_max_parallel_blocks.max(1);
         let sem = Arc::new(Semaphore::new(max_parallel_blocks));
         let mut set = JoinSet::new();
         for (node_to_replicate_to, blocks) in block_locs {
@@ -438,8 +517,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("HeartBeat sender starting - will register with master");
 
         // Retry connection with exponential backoff
-        let mut retry_delay = tokio::time::Duration::from_millis(500);
-        let max_retry_delay = tokio::time::Duration::from_secs(30);
+        let mut retry_delay =
+            tokio::time::Duration::from_millis(settings.heartbeat_retry_initial_ms.max(1));
+        let max_retry_delay =
+            tokio::time::Duration::from_millis(settings.heartbeat_retry_max_ms.max(1));
 
         let mut client = loop {
             match MetadataServiceClient::connect(
@@ -468,10 +549,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Sending heartbeat");
             let result = client
                 .heartbeat(HeartbeatRequest {
-                    cpu_usage: 1.0,
+                    cpu_usage: settings.heartbeat_cpu_usage,
                     node_id: current_node_id,
-                    free_space: 4,
-                    used_space: 4,
+                    free_space: settings.heartbeat_free_space,
+                    used_space: settings.heartbeat_used_space,
                     addr: address.to_string(),
                 })
                 .await;
@@ -488,16 +569,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             debug!(node_id = current_node_id, "Heartbeat acknowledged");
                         }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(3000)).await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            settings.heartbeat_interval_ms.max(1),
+                        ))
+                        .await;
                     } else {
                         error!("Heartbeat not acknowledged by master");
-                        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            settings.heartbeat_nack_retry_ms.max(1),
+                        ))
+                        .await;
                     }
                 }
                 Err(e) => {
                     error!("Heartbeat failed: {}. Attempting to reconnect...", e);
                     // Try to reconnect
-                    retry_delay = tokio::time::Duration::from_millis(500);
+                    retry_delay =
+                        tokio::time::Duration::from_millis(settings.heartbeat_retry_initial_ms.max(1));
                     loop {
                         match MetadataServiceClient::connect(
                             settings.metadata_node_address.parse::<Uri>().unwrap(),

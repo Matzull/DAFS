@@ -19,3 +19,22 @@ audit_service_addr = "http://[::1]:9090"
 wal_path = "services/master/master.wal"
 wal_batch_size = 128
 wal_flush_interval_ms = 250
+
+# Environment
+env_file_path = "services/master/.env"
+
+# Internal channel capacities
+garbage_collector_channel_size = 1000
+block_replicator_channel_size = 1000
+audit_channel_size = 10000
+wal_channel_size = 20000
+
+# Replication worker parallelism
+replication_max_parallel_sources = 8
+
+# Metadata defaults
+file_default_owner = "SYSTEM"
+audit_default_user = "system"
+
+# Elasticsearch TLS behavior
+elastic_allow_invalid_certs = true

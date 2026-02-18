@@ -57,6 +57,12 @@ pub struct InternalSettings {
     pub upload_concurrency: usize,
     pub download_concurrency: usize,
     pub log_level: String,
+    pub upload_chunk_size: usize,
+    pub default_user_id: String,
+    pub upload_ready_status: String,
+    pub default_list_path: String,
+    pub default_rename_old_path: String,
+    pub default_rename_new_path: String,
 }
 
 pub fn load_config() -> InternalSettings {
@@ -74,6 +80,12 @@ pub fn load_config() -> InternalSettings {
             upload_concurrency: 2,
             download_concurrency: 10,
             log_level: "info".to_string(),
+            upload_chunk_size: 64 * 1024,
+            default_user_id: "1".to_string(),
+            upload_ready_status: "READY".to_string(),
+            default_list_path: "/".to_string(),
+            default_rename_old_path: "/".to_string(),
+            default_rename_new_path: "/".to_string(),
         }))
         .merge(Toml::file(&cli.config_path))
         .merge(Serialized::globals(cli));
@@ -99,6 +111,16 @@ struct Cli {
     #[arg(short, long, global = true)]
     #[serde(skip_serializing_if = "Option::is_none")]
     log_level: Option<String>,
+
+    /// Default user id sent to metadata service
+    #[arg(long, global = true)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_user_id: Option<String>,
+
+    /// Upload block read chunk size in bytes
+    #[arg(long, global = true)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upload_chunk_size: Option<usize>,
 
     #[command(subcommand)]
     #[serde(skip)]
@@ -134,16 +156,16 @@ enum Commands {
     /// List directory contents
     List {
         /// Directory path to list
-        #[arg(short, long, default_value = "/")]
-        path: String,
+        #[arg(short, long)]
+        path: Option<String>,
     },
     /// Rename a file or move it from old_path to new_path
     Rename {
-        #[arg(short, long, default_value = "/")]
-        old_path: String,
+        #[arg(short, long)]
+        old_path: Option<String>,
 
-        #[arg(short, long, default_value = "/")]
-        new_path: String,
+        #[arg(short, long)]
+        new_path: Option<String>,
     },
 }
 
@@ -174,7 +196,7 @@ async fn upload_block(
     let mut bytes_remaining = block_size as usize;
     let mut internal_block_offset = offset;
     while bytes_remaining > 0 {
-        let bytes_to_read = std::cmp::min(bytes_remaining, 64 * 1024_usize); //TODO set in config
+        let bytes_to_read = std::cmp::min(bytes_remaining, settings.upload_chunk_size.max(1));
         let mut buffer = BytesMut::with_capacity(bytes_to_read);
         buffer.resize(bytes_to_read, 0);
         let file = Arc::clone(&file_handle);
@@ -236,7 +258,7 @@ async fn upload_file(
         .create_file(CreateFileRequest {
             path: file_path.clone(),
             size: file_handle.metadata()?.size() as i64, //TODO: file can be larger than 4GB
-            user_id: "1".to_string(),
+            user_id: settings.default_user_id.clone(),
         })
         .await?
         .into_inner();
@@ -297,7 +319,7 @@ async fn upload_file(
     meta_client
         .set_file_status(SetFileStatusRequest {
             path: file_path,
-            status: "READY".to_string(),
+            status: settings.upload_ready_status.clone(),
         })
         .await?;
     Ok(create_file_response)
@@ -388,7 +410,7 @@ async fn download_file(
     let get_file_response = client
         .get_file_metadata(GetFileRequest {
             path: file_path.clone(),
-            user_id: "1".to_string(),
+            user_id: settings.default_user_id.clone(),
         })
         .await?
         .into_inner();
@@ -511,7 +533,7 @@ async fn rename_file(
         .rename_file(RenameFileRequest {
             old_path: old_path.clone(),
             new_path: new_path.clone(),
-            user_id: "1".to_string(),
+            user_id: settings.default_user_id.clone(),
         })
         .await?;
     info!(old_path, new_path, "File rename completed successfully");
@@ -552,12 +574,19 @@ async fn main() {
                 .await
                 .map(|_| info!("File downloaded successfully"))
         }
-        Some(Commands::List { path }) => list_directory(Arc::clone(&settings), path)
+        Some(Commands::List { path }) => list_directory(
+            Arc::clone(&settings),
+            path.unwrap_or_else(|| settings.default_list_path.clone()),
+        )
             .await
             .map(|_| ()),
         Some(Commands::Rename { old_path, new_path }) => {
-            info!("Renaming/Moving from {} to {}", old_path, new_path);
-            rename_file(Arc::clone(&settings), old_path, new_path)
+            let resolved_old =
+                old_path.unwrap_or_else(|| settings.default_rename_old_path.clone());
+            let resolved_new =
+                new_path.unwrap_or_else(|| settings.default_rename_new_path.clone());
+            info!("Renaming/Moving from {} to {}", resolved_old, resolved_new);
+            rename_file(Arc::clone(&settings), resolved_old, resolved_new)
                 .await
                 .map(|_| info!("File renamed/moved successfully"))
         }
