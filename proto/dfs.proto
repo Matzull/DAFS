@@ -47,7 +47,7 @@ service DataNodeService {
   rpc ConfigureNode (ConfigureNodeRequest) returns (ConfigureNodeResponse);
 
     // Replication command from Master to DataNode.
-  rpc ReplicateBlock (ReplicateBlockRequest) returns (ReplicateBlockResponse);
+  rpc ReplicateBlocks (ReplicateBlocksRequest) returns (ReplicateBlocksResponse);
 }
 
 // -----------------------------------------------------------------------
@@ -216,15 +216,28 @@ message ConfigureNodeResponse {
   string error_message = 2;
 }
 
-message ReplicateBlockRequest {
-  string block_id = 1;
-  string target_node_address = 2; // Where to replicate the block
+message BlockList {
+  repeated string block_ids = 1;
 }
 
-message ReplicateBlockResponse {
+message ReplicateBlocksRequest {
+  map<string, BlockList> block_locations = 1;
+}
+
+message ReplicateBlocksResponse {
   bool   success       = 1;
   string error_message = 2;
 }
+
+//message ReplicateBlockRequest {
+//  string block_id = 1;
+//  string target_node_address = 2; // Where to replicate the block
+//}
+//
+//message ReplicateBlockResponse {
+//  bool   success       = 1;
+//  string error_message = 2;
+//}
 
 // --- Audit Messages ---
 

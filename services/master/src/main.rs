@@ -2,12 +2,13 @@ mod models;
 use crate::models::{BlockMetadata, DatanodeInfo, FileMetadata, FileStatus, MasterState};
 use common::dfs::metadata_service_server::{MetadataService, MetadataServiceServer};
 use common::dfs::{
-    data_node_service_client, BlockAssignment, CreateFileRequest, CreateFileResponse,
+    data_node_service_client, BlockAssignment, BlockList, CreateFileRequest, CreateFileResponse,
     DeleteBlockRequest, DeleteFileRequest, DeleteFileResponse, FileInfo, GetFileRequest,
     GetFileResponse, HeartbeatRequest, HeartbeatResponse, ListDirectoryRequest,
-    ListDirectoryResponse, RenameFileRequest, RenameFileResponse, ReplicateBlockRequest,
+    ListDirectoryResponse, RenameFileRequest, RenameFileResponse, ReplicateBlocksRequest,
     SetFileStatusRequest, SetFileStatusResponse,
 };
+use tokio::task::JoinSet;
 // use tokio::net::unix::pipe::Receiver;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -29,7 +30,7 @@ use serde_json::{json, Value};
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 use tokio::time::{self as tokio_time, Duration};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -694,85 +695,113 @@ impl Metadatanode {
         }
     }
 
-    async fn notify_datanode_to_replicate(
+    async fn notify_datanodes_to_replicate(
         &self,
-        block_id: &str,
-        datanode_src: String,
-        datanode_dst: String,
+        mapping: HashMap<u16, HashMap<u16, Vec<String>>>,
     ) -> Result<bool, String> {
-        debug!(
-            block_id,
-            datanode_src, "Requesting datanode to replicate block"
-        );
-        let mut client =
-            match data_node_service_client::DataNodeServiceClient::connect(datanode_src.clone())
-                .await
-            {
-                Ok(c) => c,
-                Err(err) => {
-                    error!(
-                        block_id,
-                        datanode_src, "Could not connect to datanode: {}", err
+        debug!("Notifying datanodes");
+        let datanodes = self.state.available_datanodes.read().await;
+        let max_parallel_src = 8;
+        let sem = Arc::new(Semaphore::new(max_parallel_src));
+        let mut set = JoinSet::new();
+        for (datanode_src, targets) in mapping {
+            let src_addr = match datanodes.get(&datanode_src) {
+                Some(info) => info.addr.clone(),
+                None => {
+                    warn!(
+                        datanode_src,
+                        "Source DataNode not available for replication"
                     );
-                    self.audit(
-                        "Replicate block",
-                        Some(block_id.to_string()),
-                        false,
-                        "CONNECTION_ERROR",
-                        json!({
-                            "datanode": datanode_src,
-                            "error": err.to_string(),
-                        }),
-                    )
-                    .await;
-                    return Err(format!("Could not connect to datanode: {err}"));
+                    continue;
                 }
             };
-        match client
-            .replicate_block(ReplicateBlockRequest {
-                block_id: block_id.to_string(),
-                target_node_address: datanode_dst.clone(),
-            })
-            .await
-        {
-            Ok(_) => {
-                debug!(
-                    block_id,
-                    datanode_src, "Block replication confirmed by datanode"
-                );
-                self.audit(
-                    "Replicate block",
-                    Some(block_id.to_string()),
-                    true,
-                    "SUCCESS",
-                    json!({
-                        "datanode_src": datanode_src,
-                        "datanode_dst": datanode_dst,
-                    }),
-                )
-                .await;
-                Ok(true)
+
+            let block_locations: HashMap<String, BlockList> = targets
+                .into_iter()
+                .filter_map(|(dst_id, block_ids)| {
+                    datanodes
+                        .get(&dst_id)
+                        .map(|info| (info.addr.clone(), BlockList { block_ids }))
+                })
+                .collect();
+
+            if block_locations.is_empty() {
+                continue;
             }
-            Err(err) => {
-                error!(
-                    block_id,
-                    datanode_src, "Failed to replicate block on datanode: {}", err
-                );
-                self.audit(
-                    "Replicate block",
-                    Some(block_id.to_string()),
-                    false,
-                    "DELETE_ERROR",
-                    json!({
-                        "datanode_src": datanode_src,
-                        "datanode_src": datanode_dst,
-                        "error": err.to_string(),
-                    }),
-                )
-                .await;
-                Err(format!("Could not delete block on datanode: {err}"))
+
+            // drop(datanodes);
+            debug!("Connecting to datanode {src_addr}");
+
+            let mut client =
+                match data_node_service_client::DataNodeServiceClient::connect(src_addr.clone())
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(err) => {
+                        error!(datanode_src, "Could not connect to datanode: {}", err);
+                        self.audit(
+                            "Replicate block",
+                            Some(format!("datanode:{datanode_src}")),
+                            false,
+                            "CONNECTION_ERROR",
+                            json!({
+                                "datanode": datanode_src,
+                                "error": err.to_string(),
+                            }),
+                        )
+                        .await;
+                        return Err(format!("Could not connect to datanode: {err}"));
+                    }
+                };
+            let request = ReplicateBlocksRequest { block_locations };
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let this = self.clone();
+            set.spawn(async move {
+                let _permit = permit;
+                match client.replicate_blocks(request).await {
+                    Ok(_) => {
+                        debug!(datanode_src, "Block replication confirmed by datanode");
+                        this.audit(
+                            "Replicate block",
+                            Some(format!("datanode:{datanode_src}")),
+                            true,
+                            "SUCCESS",
+                            json!({
+                                "datanode_src": datanode_src,
+                            }),
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        error!(
+                            datanode_src,
+                            "Failed to replicate block on datanode: {}", err
+                        );
+                        this.audit(
+                            "Replicate block",
+                            Some(format!("datanode:{datanode_src}")),
+                            false,
+                            "REPLICATION_ERROR",
+                            json!({
+                                "datanode_src": datanode_src,
+                                "error": err.to_string(),
+                            }),
+                        )
+                        .await;
+                    }
+                }
+            });
+        }
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok(()) => { /* optional: audit success */ }
+                Err(join_err) => {
+                    error!("Task join error: {}", join_err);
+                    return Err(join_err.to_string());
+                }
             }
         }
+        Ok(true)
     }
 
     async fn audit(
@@ -848,61 +877,30 @@ fn block_replicator(
     mut block_replicator_rx: mpsc::Receiver<FileMetadata>,
     master_ref: Arc<Metadatanode>,
 ) {
-    // todo!("Get real first location of block and then replicate from that node to all other nodes");
     tokio::spawn(async move {
         info!("Block replicator started");
         while let Some(file_metadata) = block_replicator_rx.recv().await {
+            debug!("Got file to replicate");
+            let mut mapping = HashMap::<u16, HashMap<u16, Vec<String>>>::new(); //Datanode_src:[Datanode_dst: [Blocks]]
             for block in file_metadata.blocks {
                 let mut locations = block.locations.iter();
                 let block_location = match locations.next() {
-                    Some(loc) => loc,
+                    Some(loc) => *loc,
                     None => {
                         warn!("Block {} has no locations, skipping replication", block.id);
                         continue;
                     }
                 };
-                let src_datanode_addr = {
-                    let datanodes = master_ref.state.available_datanodes.read().await;
-                    match datanodes.get(block_location) {
-                        Some(info) => info.addr.clone(),
-                        None => {
-                            warn!(
-                                "Source DataNode {} not available for block {}",
-                                block_location, block.id
-                            );
-                            continue;
-                        }
-                    }
-                };
-                for location in locations {
-                    let dst_datanode_addr = {
-                        let datanodes = master_ref.state.available_datanodes.read().await;
-                        match datanodes.get(location) {
-                            Some(a) => a.addr.clone(),
-                            None => {
-                                warn!(
-                                    "DataNode {} not available to have block {}",
-                                    location, block.id
-                                );
-                                continue;
-                            }
-                        }
-                    };
-                    if let Err(e) = master_ref
-                        .notify_datanode_to_replicate(
-                            &block.id,
-                            src_datanode_addr.clone(),
-                            dst_datanode_addr,
-                        )
-                        .await
-                    {
-                        error!(
-                            "Error replicating block {} to {}: {}",
-                            block.id, location, e
-                        );
-                    }
+                for dst_node in locations {
+                    mapping
+                        .entry(block_location)
+                        .or_default()
+                        .entry(*dst_node)
+                        .or_default()
+                        .push(block.id.clone());
                 }
             }
+            let _ = master_ref.notify_datanodes_to_replicate(mapping).await;
             master_ref
                 .set_file_status(Request::new(SetFileStatusRequest {
                     path: file_metadata.path.clone(),

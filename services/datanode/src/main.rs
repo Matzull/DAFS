@@ -6,8 +6,8 @@ use common::dfs::read_block_response::ResponseData;
 use common::dfs::write_block_request::RequestData;
 use common::dfs::{
     ConfigureNodeRequest, ConfigureNodeResponse, DeleteBlockRequest, DeleteBlockResponse,
-    HeartbeatRequest, ReadBlockRequest, ReadBlockResponse, ReplicateBlockRequest,
-    ReplicateBlockResponse, WriteBlockRequest, WriteBlockResponse,
+    HeartbeatRequest, ReadBlockRequest, ReadBlockResponse, ReplicateBlocksRequest,
+    ReplicateBlocksResponse, WriteBlockRequest, WriteBlockResponse,
 };
 use crc32fast::Hasher;
 use figment::{
@@ -15,13 +15,13 @@ use figment::{
     Figment,
 };
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::{self, create_dir_all, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::StreamExt;
 use tonic::transport::{Server, Uri};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, instrument, warn};
@@ -87,6 +87,90 @@ struct Cli {
 pub struct Datanode {
     pub node_id: Arc<Mutex<u16>>,
     pub settings: Arc<InternalSettings>,
+}
+
+impl Datanode {
+    async fn replicate_single_block_to_dst(
+        settings: Arc<InternalSettings>,
+        dst_addr: String,
+        block_id: String,
+    ) -> Result<(), Status> {
+        if block_id.contains('/') || block_id.contains('.') {
+            return Err(Status::invalid_argument("Invalid block_id"));
+        }
+
+        let mut file_path = PathBuf::from(&settings.data_folder);
+        file_path.push(&block_id[..2]);
+        file_path.push(&block_id[2..4]);
+        file_path.push(&block_id);
+
+        let mut source_file = File::open(file_path).await.map_err(|err| {
+            error!(%err, block_id = %block_id, "Failed to open source block for replication");
+            Status::not_found(err.to_string())
+        })?;
+
+        let mut client = DataNodeServiceClient::connect(dst_addr.clone())
+            .await
+            .map_err(|err| {
+                error!(%err, dst = %dst_addr, "Failed to connect to destination datanode");
+                Status::unavailable(err.to_string())
+            })?;
+
+        let (tx, rx) = mpsc::channel(settings.mpsc_channel_size as usize);
+        let write_future = client.write_block(Request::new(ReceiverStream::new(rx)));
+
+        tx.send(WriteBlockRequest {
+            request_data: Some(RequestData::Metadata(common::dfs::BlockMetadata {
+                block_id: block_id.clone(),
+                total_size: 0,
+            })),
+        })
+        .await
+        .map_err(|err| {
+            Status::internal(format!("Failed to send block metadata for {block_id}: {err}"))
+        })?;
+
+        let mut hasher = Hasher::new();
+        let mut buffer = vec![0u8; settings.read_buffer_size];
+        loop {
+            let bytes_read = source_file.read(&mut buffer).await.map_err(|err| {
+                error!(%err, block_id = %block_id, "Failed to read source block during replication");
+                Status::internal(err.to_string())
+            })?;
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            hasher.update(&buffer[..bytes_read]);
+            tx.send(WriteBlockRequest {
+                request_data: Some(RequestData::ChunkData(buffer[..bytes_read].to_vec())),
+            })
+            .await
+            .map_err(|err| {
+                Status::internal(format!("Failed to send chunk data for {block_id}: {err}"))
+            })?;
+        }
+
+        let checksum = hasher.finalize().to_string();
+        tx.send(WriteBlockRequest {
+            request_data: Some(RequestData::Checksum(checksum)),
+        })
+        .await
+        .map_err(|err| Status::internal(format!("Failed to send checksum for {block_id}: {err}")))?;
+
+        drop(tx);
+        let write_response = write_future.await.map_err(|err| {
+            error!(%err, block_id = %block_id, dst = %dst_addr, "Failed to write replicated block");
+            Status::internal(format!("Failed to write replicated block: {err}"))
+        })?;
+        let write_result = write_response.into_inner();
+        if !write_result.success {
+            return Err(Status::internal(write_result.message));
+        }
+
+        Ok(())
+    }
 }
 
 #[tonic::async_trait]
@@ -294,161 +378,42 @@ impl DataNodeService for Datanode {
         }))
     }
 
-    async fn replicate_block(
+    async fn replicate_blocks(
         &self,
-        request: Request<ReplicateBlockRequest>,
-    ) -> Result<Response<ReplicateBlockResponse>, Status> {
-        let request = request.into_inner();
-        let block_id = request.block_id;
-        let node_to_replicate_to = request.target_node_address;
+        request: Request<ReplicateBlocksRequest>,
+    ) -> Result<Response<ReplicateBlocksResponse>, Status> {
+        let block_locs = request.into_inner().block_locations;
+        let max_parallel_blocks = 16;
+        let sem = Arc::new(Semaphore::new(max_parallel_blocks));
+        let mut set = JoinSet::new();
+        for (node_to_replicate_to, blocks) in block_locs {
+            for block_id in blocks.block_ids {
+                let permit = sem.clone().acquire_owned().await.unwrap();
+                let dst_clone = node_to_replicate_to.clone();
+                let settings = Arc::clone(&self.settings);
+                set.spawn(async move {
+                    let _permit = permit;
+                    Datanode::replicate_single_block_to_dst(settings, dst_clone, block_id).await
+                });
+            }
+        }
 
-        let mut client = DataNodeServiceClient::connect(node_to_replicate_to)
-            .await
-            .map_err(|err| {
-                error!(%err, "Failed to connect to datanode");
-                Status::unavailable(err.to_string())
-            })?;
-        let read_response = self
-            .read_block(Request::new(ReadBlockRequest {
-                block_id: block_id.clone(),
-            }))
-            .await?;
-        let mut read_stream = read_response.into_inner();
-
-        let (tx, rx) = mpsc::channel(self.settings.mpsc_channel_size as usize);
-        let write_future = client.write_block(Request::new(ReceiverStream::new(rx)));
-
-        tx.send(WriteBlockRequest {
-            request_data: Some(RequestData::Metadata(common::dfs::BlockMetadata {
-                block_id: block_id.clone(),
-                total_size: 0,
-            })),
-        })
-        .await
-        .map_err(|e| Status::internal(format!("Failed to send block metadata: {e}")))?;
-
-        while let Some(msg) = read_stream.next().await {
-            let msg = msg?;
-            match msg.response_data {
-                Some(ResponseData::ChunkData(chunk)) => {
-                    tx.send(WriteBlockRequest {
-                        request_data: Some(RequestData::ChunkData(chunk)),
-                    })
-                    .await
-                    .map_err(|e| Status::internal(format!("Failed to send chunk data: {e}")))?;
-                }
-                Some(ResponseData::Checksum(checksum)) => {
-                    tx.send(WriteBlockRequest {
-                        request_data: Some(RequestData::Checksum(checksum)),
-                    })
-                    .await
-                    .map_err(|e| Status::internal(format!("Failed to send checksum: {e}")))?;
-                    break;
-                }
-                None => {
-                    return Err(Status::invalid_argument(
-                        "Received empty read response while replicating block",
-                    ));
+        while let Some(join_result) = set.join_next().await {
+            match join_result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(err) => {
+                    error!(%err, "Replication task panicked or was cancelled");
+                    return Err(Status::internal(err.to_string()));
                 }
             }
         }
 
-        drop(tx);
-        let write_response = write_future.await.map_err(|err| {
-            error!(%err, "Failed to write replicated block");
-            Status::internal(format!("Failed to write replicated block: {err}"))
-        })?;
-        let write_result = write_response.into_inner();
-
-        if !write_result.success {
-            return Err(Status::internal(write_result.message));
-        }
-
-        Ok(Response::new(ReplicateBlockResponse {
+        Ok(Response::new(ReplicateBlocksResponse {
             success: true,
             error_message: "".to_string(),
         }))
     }
-
-    // async fn replicate_block2(
-    //     &self,
-    //     request: Request<ReplicateBlockRequest>,
-    // ) -> Result<Response<ReplicateBlockResponse>, Status> {
-    //     let request = request.into_inner();
-    //     let block_id = request.block_id;
-    //     let node_to_replicate_to = request.target_node_address;
-    //     let file_handle = Arc::new(std::fs::File::open(&block_id)?);
-    //     let block_size = file_handle.metadata()?.len() as i64;
-    //     let mut client = DataNodeServiceClient::connect(node_to_replicate_to)
-    //         .await
-    //         .map_err(|err| {
-    //             error!(%err, "Failed to connect to datanode");
-    //             Status::unavailable(err.to_string())
-    //         })?;
-    //     let mut hasher = Hasher::new();
-    //     let (tx, rx) = mpsc::channel(5_usize);
-    //     let response_fut = client.write_block(ReceiverStream::new(rx));
-    //     tx.send(WriteBlockRequest {
-    //         request_data: Some(RequestData::Metadata(common::dfs::BlockMetadata {
-    //             block_id: block_id.clone(),
-    //             total_size: block_size,
-    //         })),
-    //     })
-    //     .await
-    //     .map_err(|e: mpsc::error::SendError<WriteBlockRequest>| Status::internal(format!("Failed to send block metadata: {e}")))?;
-    //     let mut bytes_remaining = block_size as usize;
-    //     let mut internal_block_offset = 0;
-    //     while bytes_remaining > 0 {
-    //         let bytes_to_read = std::cmp::min(bytes_remaining, 64 * 1024_usize); //TODO set in config
-    //         let mut buffer = BytesMut::with_capacity(bytes_to_read);
-    //         let file = Arc::clone(&file_handle);
-    //         buffer.resize(bytes_to_read, 0);
-    //         let (bytes_read, buffer) = tokio::task::spawn_blocking(move || {
-    //             file.read_at(&mut buffer[..], internal_block_offset)
-    //                 .map(|n| (n, buffer))
-    //         })
-    //         .await
-    //         .map_err(|e| Status::internal(format!("Block read task failed: {e}")))?
-    //         .map_err(|e| Status::internal(format!("Failed to read file at offset {internal_block_offset}: {e}")))?;
-    //         if bytes_read == 0 {
-    //             break;
-    //         }
-    //         let mut final_data = buffer.freeze();
-    //         if bytes_read < bytes_to_read {
-    //             final_data = final_data.slice(0..bytes_read);
-    //         }
-    //         hasher.update(&final_data);
-    //         tx.send(WriteBlockRequest {
-    //             request_data: Some(RequestData::ChunkData(final_data.to_vec())),
-    //         })
-    //         .await
-    //         .map_err(|e| Status::internal(format!("Failed to send chunk data: {e}")))?;
-
-    //         bytes_remaining -= bytes_read;
-    //         internal_block_offset += bytes_read as u64;
-    //     }
-    //     let checksum = hasher.finalize();
-    //     tx.send(WriteBlockRequest {
-    //         request_data: Some(RequestData::Checksum(checksum.to_string())),
-    //     })
-    //     .await
-    //     .map_err(|e| Status::internal(format!("Failed to send checksum: {e}")))?;
-    //     drop(tx);
-    //     let response = response_fut.await.map_err(|e| {
-    //         error!("Failed to get write block response: {}", e);
-    //         Status::internal(format!("Failed to get write block response: {e}"))
-    //     })?;
-    //     let inner = response.into_inner();
-    //     debug!(
-    //         block_id = &block_id,
-    //         bytes_written = inner.bytes_written,
-    //         "Block upload completed successfully"
-    //     );
-    //     Ok(Response::new(ReplicateBlockResponse {
-    //         success: true,
-    //         error_message: "".to_string(),
-    //     }))
-    // }
 }
 
 #[tokio::main]
