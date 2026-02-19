@@ -392,7 +392,7 @@ async fn download_block(
     access_token: Arc<String>,
 ) -> Result<bool, String> {
     debug!(block_id, "Starting block download");
-    let hasher = Hasher::new();
+    let mut hasher = Hasher::new();
     let mut client = data_node_client;
 
     let mut current_offset = offset;
@@ -436,6 +436,7 @@ async fn download_block(
                 ));
             }
         };
+        hasher.update(&chunk_data);
         let data_len = chunk_data.len() as u64;
         let write_offset = current_offset;
         let file = Arc::clone(&file_handle);
