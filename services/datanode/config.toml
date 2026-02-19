@@ -31,3 +31,7 @@ heartbeat_nack_retry_ms = 1000
 heartbeat_cpu_usage = 1.0
 heartbeat_free_space = 4
 heartbeat_used_space = 4
+
+# Authentication
+jwt_secret = "change-me-master-secret"
+service_token_exp_seconds = 300

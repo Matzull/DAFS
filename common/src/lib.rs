@@ -1,10 +1,7 @@
 struct CompactTimestamp;
 
 impl tracing_subscriber::fmt::time::FormatTime for CompactTimestamp {
-    fn format_time(
-        &self,
-        w: &mut tracing_subscriber::fmt::format::Writer<'_>,
-    ) -> std::fmt::Result {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
         use chrono::{Datelike, Timelike};
 
         let now = chrono::Local::now();
@@ -30,6 +27,112 @@ pub mod dfs {
     // The build script generates a file named "dfs.rs" (based on package name in proto)
     // inside the OUT_DIR. We include it here.
     tonic::include_proto!("dfs");
+}
+
+pub const AUTHORIZATION_HEADER: &str = "authorization";
+pub const ROLE_USER: &str = "user";
+pub const ROLE_MASTER: &str = "master";
+pub const ROLE_DATANODE: &str = "datanode";
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AuthClaims {
+    pub sub: String,
+    pub role: String,
+    pub exp: usize,
+    pub iat: usize,
+}
+
+pub fn create_access_token(
+    secret: &str,
+    subject: &str,
+    role: &str,
+    expires_in_seconds: i64,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    use chrono::Utc;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+
+    let issued_at = Utc::now().timestamp();
+    let expiration = (issued_at + expires_in_seconds.max(1)) as usize;
+    let claims = AuthClaims {
+        sub: subject.to_string(),
+        role: role.to_string(),
+        exp: expiration,
+        iat: issued_at as usize,
+    };
+
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+}
+
+pub fn decode_access_token(
+    token: &str,
+    secret: &str,
+) -> Result<AuthClaims, jsonwebtoken::errors::Error> {
+    use jsonwebtoken::{decode, DecodingKey, Validation};
+
+    let data = decode::<AuthClaims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &Validation::default(),
+    )?;
+
+    Ok(data.claims)
+}
+
+#[allow(clippy::result_large_err)]
+pub fn extract_bearer_token(
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<String, tonic::Status> {
+    let auth_header = metadata
+        .get(AUTHORIZATION_HEADER)
+        .ok_or_else(|| tonic::Status::unauthenticated("Missing authorization header"))?
+        .to_str()
+        .map_err(|_| tonic::Status::unauthenticated("Invalid authorization header"))?;
+
+    let Some(token) = auth_header.strip_prefix("Bearer ") else {
+        return Err(tonic::Status::unauthenticated(
+            "Authorization header must be Bearer token",
+        ));
+    };
+
+    if token.trim().is_empty() {
+        return Err(tonic::Status::unauthenticated("Empty bearer token"));
+    }
+
+    Ok(token.to_string())
+}
+
+#[allow(clippy::result_large_err)]
+pub fn authorize_metadata(
+    metadata: &tonic::metadata::MetadataMap,
+    secret: &str,
+) -> Result<AuthClaims, tonic::Status> {
+    let token = extract_bearer_token(metadata)?;
+    decode_access_token(&token, secret)
+        .map_err(|_| tonic::Status::unauthenticated("Invalid or expired access token"))
+}
+
+#[allow(clippy::result_large_err)]
+pub fn require_role(claims: &AuthClaims, expected_role: &str) -> Result<(), tonic::Status> {
+    if claims.role != expected_role {
+        return Err(tonic::Status::permission_denied("Insufficient role"));
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+pub fn attach_bearer_token<T>(
+    request: &mut tonic::Request<T>,
+    token: &str,
+) -> Result<(), tonic::Status> {
+    let value = tonic::metadata::MetadataValue::try_from(format!("Bearer {token}"))
+        .map_err(|_| tonic::Status::internal("Invalid token metadata"))?;
+    request.metadata_mut().insert(AUTHORIZATION_HEADER, value);
+    Ok(())
 }
 
 pub fn init_tracing(component: &str, default_level: &str) {

@@ -5,8 +5,9 @@ use common::dfs::metadata_service_client::MetadataServiceClient;
 use common::dfs::read_block_response::ResponseData;
 use common::dfs::write_block_request::RequestData;
 use common::dfs::{
-    CreateFileRequest, CreateFileResponse, GetFileRequest, ListDirectoryRequest, ReadBlockRequest,
-    RenameFileRequest, SetFileStatusRequest, WriteBlockRequest, WriteBlockResponse,
+    CreateFileRequest, CreateFileResponse, GetFileRequest, ListDirectoryRequest, LoginUserRequest,
+    ReadBlockRequest, RegisterUserRequest, RenameFileRequest, SetFileStatusRequest,
+    WriteBlockRequest, WriteBlockResponse,
 };
 use crc32fast::Hasher;
 use figment::{
@@ -16,7 +17,9 @@ use figment::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::fs;
 use std::fs::OpenOptions;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -24,6 +27,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tonic::Request;
 use tracing::{debug, error, info, instrument};
 
 fn format_file_size(bytes: i64) -> String {
@@ -49,6 +53,29 @@ fn format_timestamp(millis: i64) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+fn read_access_token(path: &str) -> Result<String, Box<dyn Error>> {
+    let token = fs::read_to_string(path).map_err(|_| format!("Cannot read access token from '{path}'. Please log in first using the 'login' command or register with 'register' command"))?;
+    let trimmed = token.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("Stored access token is empty".into());
+    }
+    Ok(trimmed)
+}
+
+fn save_access_token(path: &str, token: &str) -> Result<(), Box<dyn Error>> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    fs::write(path, token)?;
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
 #[derive(Parser, Debug, Serialize, Deserialize)]
 pub struct InternalSettings {
     pub mpsc_upload_channel_size: u8,
@@ -63,6 +90,7 @@ pub struct InternalSettings {
     pub default_list_path: String,
     pub default_rename_old_path: String,
     pub default_rename_new_path: String,
+    pub access_token_path: String,
 }
 
 pub fn load_config() -> InternalSettings {
@@ -86,6 +114,7 @@ pub fn load_config() -> InternalSettings {
             default_list_path: "/".to_string(),
             default_rename_old_path: "/".to_string(),
             default_rename_new_path: "/".to_string(),
+            access_token_path: "client/cli/.token".to_string(),
         }))
         .merge(Toml::file(&cli.config_path))
         .merge(Serialized::globals(cli));
@@ -122,6 +151,11 @@ struct Cli {
     #[serde(skip_serializing_if = "Option::is_none")]
     upload_chunk_size: Option<usize>,
 
+    /// Path to persisted access token
+    #[arg(long, global = true)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access_token_path: Option<String>,
+
     #[command(subcommand)]
     #[serde(skip)]
     command: Option<Commands>,
@@ -133,6 +167,20 @@ struct Cli {
 
 #[derive(Subcommand, Debug, Serialize, Deserialize)]
 enum Commands {
+    /// Register a new user account
+    Register {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
+    },
+    /// Login and store access token locally
+    Login {
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        password: String,
+    },
     /// Upload a file to the distributed file system
     Upload {
         /// Path to the local file to upload
@@ -178,13 +226,17 @@ async fn upload_block(
     block_size: i64,
     file_handle: Arc<std::fs::File>,
     settings: Arc<InternalSettings>,
+    access_token: Arc<String>,
 ) -> Result<WriteBlockResponse, String> {
     debug!(block_id, "Starting block upload");
     let mut hasher = Hasher::new();
     let (tx, rx) = mpsc::channel(settings.mpsc_upload_channel_size as usize);
     let mut client = data_node_client;
     debug!(block_id, "Connected to datanode for upload");
-    let response_fut = client.write_block(ReceiverStream::new(rx));
+    let mut write_request = Request::new(ReceiverStream::new(rx));
+    common::attach_bearer_token(&mut write_request, access_token.as_str())
+        .map_err(|e| format!("Failed to attach access token: {e}"))?;
+    let response_fut = client.write_block(write_request);
     tx.send(WriteBlockRequest {
         request_data: Some(RequestData::Metadata(common::dfs::BlockMetadata {
             block_id: block_id.clone(),
@@ -250,16 +302,19 @@ async fn upload_file(
     file_path: String,
 ) -> Result<CreateFileResponse, Box<dyn Error>> {
     info!(file_path, "Starting file upload");
+    let access_token = Arc::new(read_access_token(&settings.access_token_path)?);
     let mut meta_client =
         MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
 
     let file_handle = std::fs::File::open(&file_path)?;
+    let mut create_file_request = Request::new(CreateFileRequest {
+        path: file_path.clone(),
+        size: file_handle.metadata()?.size() as i64, //TODO: file can be larger than 4GB
+        user_id: settings.default_user_id.clone(),
+    });
+    common::attach_bearer_token(&mut create_file_request, access_token.as_str())?;
     let create_file_response = meta_client
-        .create_file(CreateFileRequest {
-            path: file_path.clone(),
-            size: file_handle.metadata()?.size() as i64, //TODO: file can be larger than 4GB
-            user_id: settings.default_user_id.clone(),
-        })
+        .create_file(create_file_request)
         .await?
         .into_inner();
 
@@ -286,6 +341,7 @@ async fn upload_file(
         let block_id = block_assignment.block_id.clone();
         let f_handle = Arc::clone(&shared_file_handle);
         let settings_clone = Arc::clone(&settings);
+        let token_clone = Arc::clone(&access_token);
         let sem = Arc::clone(&semaphore); // Clonamos el Arc fuera
         let client = clients.get(&block_assignment.node_address).unwrap().clone();
         set.spawn(async move {
@@ -298,6 +354,7 @@ async fn upload_file(
                 block_assignment.block_size,
                 f_handle,
                 settings_clone,
+                token_clone,
             )
             .await;
 
@@ -316,12 +373,12 @@ async fn upload_file(
         blocks = create_file_response.blocks.len(),
         "File upload completed successfully"
     );
-    meta_client
-        .set_file_status(SetFileStatusRequest {
-            path: file_path,
-            status: settings.upload_ready_status.clone(),
-        })
-        .await?;
+    let mut set_status_request = Request::new(SetFileStatusRequest {
+        path: file_path,
+        status: settings.upload_ready_status.clone(),
+    });
+    common::attach_bearer_token(&mut set_status_request, access_token.as_str())?;
+    meta_client.set_file_status(set_status_request).await?;
     Ok(create_file_response)
 }
 
@@ -332,6 +389,7 @@ async fn download_block(
     offset: u64,
     file_handle: Arc<std::fs::File>,
     settings: Arc<InternalSettings>,
+    access_token: Arc<String>,
 ) -> Result<bool, String> {
     debug!(block_id, "Starting block download");
     let hasher = Hasher::new();
@@ -339,8 +397,13 @@ async fn download_block(
 
     let mut current_offset = offset;
     let mut stream = client
-        .read_block(ReadBlockRequest {
-            block_id: block_id.clone(),
+        .read_block({
+            let mut req = Request::new(ReadBlockRequest {
+                block_id: block_id.clone(),
+            });
+            common::attach_bearer_token(&mut req, access_token.as_str())
+                .map_err(|e| format!("Could not attach access token: {e}"))?;
+            req
         })
         .await
         .map_err(|e| format!("Couldnt read block {e}"))?
@@ -405,13 +468,16 @@ async fn download_file(
     out_file_path: String,
 ) -> Result<bool, Box<dyn Error>> {
     info!(file_path, "Starting file download");
+    let access_token = Arc::new(read_access_token(&settings.access_token_path)?);
     let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
 
+    let mut get_file_request = Request::new(GetFileRequest {
+        path: file_path.clone(),
+        user_id: settings.default_user_id.clone(),
+    });
+    common::attach_bearer_token(&mut get_file_request, access_token.as_str())?;
     let get_file_response = client
-        .get_file_metadata(GetFileRequest {
-            path: file_path.clone(),
-            user_id: settings.default_user_id.clone(),
-        })
+        .get_file_metadata(get_file_request)
         .await?
         .into_inner();
     let file_handle = OpenOptions::new()
@@ -444,6 +510,7 @@ async fn download_file(
         let block_id = block_assignment.block_id.clone();
         let f_handle = Arc::clone(&shared_file_handle);
         let settings_clone = Arc::clone(&settings);
+        let token_clone = Arc::clone(&access_token);
         let client = clients.get(&block_assignment.node_address).unwrap().clone();
         set.spawn(async move {
             let result = download_block(
@@ -452,6 +519,7 @@ async fn download_file(
                 block_offset as u64,
                 f_handle,
                 settings_clone,
+                token_clone,
             )
             .await;
             let _ptr = permit;
@@ -479,13 +547,13 @@ async fn list_directory(
 ) -> Result<bool, Box<dyn Error>> {
     info!(directory, "Starting listing directory");
     let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
+    let access_token = read_access_token(&settings.access_token_path)?;
 
-    let get_file_response = client
-        .list_directory(ListDirectoryRequest {
-            path: directory.clone(),
-        })
-        .await?
-        .into_inner();
+    let mut list_request = Request::new(ListDirectoryRequest {
+        path: directory.clone(),
+    });
+    common::attach_bearer_token(&mut list_request, &access_token)?;
+    let get_file_response = client.list_directory(list_request).await?.into_inner();
     let file_count = get_file_response.files.len();
     println!(
         "{:<30} {:<12} {:<15} {:<15} {:<20} {:<20} {:<12}",
@@ -528,15 +596,54 @@ async fn rename_file(
 ) -> Result<bool, Box<dyn Error>> {
     info!(old_path, new_path, "Starting renaming file");
     let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
+    let access_token = read_access_token(&settings.access_token_path)?;
 
-    client
-        .rename_file(RenameFileRequest {
-            old_path: old_path.clone(),
-            new_path: new_path.clone(),
-            user_id: settings.default_user_id.clone(),
-        })
-        .await?;
+    let mut request = Request::new(RenameFileRequest {
+        old_path: old_path.clone(),
+        new_path: new_path.clone(),
+        user_id: settings.default_user_id.clone(),
+    });
+    common::attach_bearer_token(&mut request, &access_token)?;
+    client.rename_file(request).await?;
     info!(old_path, new_path, "File rename completed successfully");
+    Ok(true)
+}
+
+#[instrument(skip(settings))]
+async fn register_user(
+    settings: Arc<InternalSettings>,
+    username: String,
+    password: String,
+) -> Result<bool, Box<dyn Error>> {
+    let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
+    client
+        .register_user(Request::new(RegisterUserRequest {
+            username: username.clone(),
+            password: password.clone(),
+        }))
+        .await?;
+    login_user(settings, username, password).await?;
+    Ok(true)
+}
+
+#[instrument(skip(settings))]
+async fn login_user(
+    settings: Arc<InternalSettings>,
+    username: String,
+    password: String,
+) -> Result<bool, Box<dyn Error>> {
+    let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
+    let response = client
+        .login_user(Request::new(LoginUserRequest { username, password }))
+        .await?
+        .into_inner();
+
+    save_access_token(&settings.access_token_path, &response.access_token)?;
+    info!(
+        expires_at = response.expires_at,
+        token_path = settings.access_token_path,
+        "Access token saved"
+    );
     Ok(true)
 }
 
@@ -551,6 +658,16 @@ async fn main() {
     info!("Master node: {}", settings.master_endpoints.join(", "));
 
     let result = match cli.command {
+        Some(Commands::Register { username, password }) => {
+            register_user(Arc::clone(&settings), username, password)
+                .await
+                .map(|_| info!("User registered successfully"))
+        }
+        Some(Commands::Login { username, password }) => {
+            login_user(Arc::clone(&settings), username, password)
+                .await
+                .map(|_| info!("Login successful"))
+        }
         Some(Commands::Upload { file, remote_path }) => {
             let remote = remote_path.unwrap_or_else(|| {
                 std::path::Path::new(&file)
@@ -578,13 +695,11 @@ async fn main() {
             Arc::clone(&settings),
             path.unwrap_or_else(|| settings.default_list_path.clone()),
         )
-            .await
-            .map(|_| ()),
+        .await
+        .map(|_| ()),
         Some(Commands::Rename { old_path, new_path }) => {
-            let resolved_old =
-                old_path.unwrap_or_else(|| settings.default_rename_old_path.clone());
-            let resolved_new =
-                new_path.unwrap_or_else(|| settings.default_rename_new_path.clone());
+            let resolved_old = old_path.unwrap_or_else(|| settings.default_rename_old_path.clone());
+            let resolved_new = new_path.unwrap_or_else(|| settings.default_rename_new_path.clone());
             info!("Renaming/Moving from {} to {}", resolved_old, resolved_new);
             rename_file(Arc::clone(&settings), resolved_old, resolved_new)
                 .await

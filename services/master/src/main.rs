@@ -1,11 +1,14 @@
+mod auth;
 mod models;
+use crate::auth::AuthManager;
 use crate::models::{BlockMetadata, DatanodeInfo, FileMetadata, FileStatus, MasterState};
 use common::dfs::metadata_service_server::{MetadataService, MetadataServiceServer};
 use common::dfs::{
     data_node_service_client, BlockAssignment, BlockList, CreateFileRequest, CreateFileResponse,
     DeleteBlockRequest, DeleteFileRequest, DeleteFileResponse, FileInfo, GetFileRequest,
     GetFileResponse, HeartbeatRequest, HeartbeatResponse, ListDirectoryRequest,
-    ListDirectoryResponse, RenameFileRequest, RenameFileResponse, ReplicateBlocksRequest,
+    ListDirectoryResponse, LoginUserRequest, LoginUserResponse, RegisterUserRequest,
+    RegisterUserResponse, RenameFileRequest, RenameFileResponse, ReplicateBlocksRequest,
     SetFileStatusRequest, SetFileStatusResponse,
 };
 use tokio::task::JoinSet;
@@ -38,7 +41,7 @@ use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 const DEFAULT_BLOCK_SIZE: i64 = 64 * 1024;
-const DEFAULT_REPLICATION: i32 = 2; //Minimum number of nodes that must contain a block
+const DEFAULT_REPLICATION: i32 = 2;
 const DEFAULT_LISTEN_ADDRESS: &str = "[::1]:9090";
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_AUDIT_SERVICE_ADDR: &str = "http://[::1]:9090";
@@ -54,6 +57,10 @@ const DEFAULT_REPLICATION_MAX_PARALLEL_SOURCES: usize = 8;
 const DEFAULT_AUDIT_DEFAULT_USER: &str = "system";
 const DEFAULT_FILE_DEFAULT_OWNER: &str = "SYSTEM";
 const DEFAULT_ELASTIC_ALLOW_INVALID_CERTS: bool = true;
+const DEFAULT_AUTH_DB_PATH: &str = "services/master/users.db";
+const DEFAULT_JWT_SECRET: &str = "change-me-master-secret";
+const DEFAULT_JWT_EXP_SECONDS: i64 = 3600;
+const DEFAULT_SERVICE_TOKEN_EXP_SECONDS: i64 = 300;
 
 #[derive(Parser, Debug, Serialize, Deserialize)]
 pub struct InternalSettings {
@@ -74,6 +81,10 @@ pub struct InternalSettings {
     pub audit_default_user: String,
     pub file_default_owner: String,
     pub elastic_allow_invalid_certs: bool,
+    pub auth_db_path: String,
+    pub jwt_secret: String,
+    pub jwt_exp_seconds: i64,
+    pub service_token_exp_seconds: i64,
 }
 
 pub fn load_config() -> InternalSettings {
@@ -98,6 +109,10 @@ pub fn load_config() -> InternalSettings {
             audit_default_user: DEFAULT_AUDIT_DEFAULT_USER.to_string(),
             file_default_owner: DEFAULT_FILE_DEFAULT_OWNER.to_string(),
             elastic_allow_invalid_certs: DEFAULT_ELASTIC_ALLOW_INVALID_CERTS,
+            auth_db_path: DEFAULT_AUTH_DB_PATH.to_string(),
+            jwt_secret: DEFAULT_JWT_SECRET.to_string(),
+            jwt_exp_seconds: DEFAULT_JWT_EXP_SECONDS,
+            service_token_exp_seconds: DEFAULT_SERVICE_TOKEN_EXP_SECONDS,
         }))
         .merge(Toml::file(&cli.config_path))
         .merge(Serialized::globals(cli));
@@ -195,6 +210,26 @@ struct Cli {
     #[serde(skip_serializing_if = "Option::is_none")]
     elastic_allow_invalid_certs: Option<bool>,
 
+    /// SQLite path for users database
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_db_path: Option<String>,
+
+    /// Secret used to sign and verify JWTs
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jwt_secret: Option<String>,
+
+    /// Access token validity (seconds)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jwt_exp_seconds: Option<i64>,
+
+    /// Internal service token validity (seconds)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_token_exp_seconds: Option<i64>,
+
     #[arg(short, long, default_value = "config.toml")]
     #[serde(skip)]
     pub config_path: String,
@@ -238,6 +273,7 @@ pub struct Metadatanode {
     pub audit_tx: mpsc::Sender<AuditLog>,
     wal_tx: mpsc::Sender<WalRecord>,
     pub settings: Arc<InternalSettings>,
+    pub auth: Arc<AuthManager>,
     pub next_node_id: AtomicU16,
 }
 
@@ -250,12 +286,47 @@ impl Clone for Metadatanode {
             audit_tx: self.audit_tx.clone(),
             wal_tx: self.wal_tx.clone(),
             settings: Arc::clone(&self.settings),
+            auth: Arc::clone(&self.auth),
             next_node_id: AtomicU16::new(self.next_node_id.load(Ordering::SeqCst)),
         }
     }
 }
 
 impl Metadatanode {
+    #[allow(clippy::result_large_err)]
+    fn authorize_any(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<common::AuthClaims, Status> {
+        common::authorize_metadata(metadata, self.auth.jwt_secret())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn authorize_user_or_master(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<common::AuthClaims, Status> {
+        let claims = self.authorize_any(metadata)?;
+        if claims.role != common::ROLE_USER && claims.role != common::ROLE_MASTER {
+            return Err(Status::permission_denied("User or master role required"));
+        }
+        Ok(claims)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn authorize_datanode(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<common::AuthClaims, Status> {
+        let claims = self.authorize_any(metadata)?;
+        common::require_role(&claims, common::ROLE_DATANODE)?;
+        Ok(claims)
+    }
+
+    fn can_access_path(&self, owner: &str, claims: &common::AuthClaims) -> bool {
+        claims.role == common::ROLE_MASTER || owner == claims.sub
+    }
+
     #[instrument(skip(state, settings))]
     async fn _create_file(
         &self,
@@ -263,6 +334,7 @@ impl Metadatanode {
         settings: &Arc<InternalSettings>,
         file_path: String,
         file_size: i64,
+        owner: String,
     ) -> Result<FileMetadata, String> {
         if file_size < 0 {
             error!("File size cannot be negative");
@@ -324,7 +396,7 @@ impl Metadatanode {
             name: file_path.split('/').next_back().unwrap_or("").to_string(),
             path: file_path.clone(),
             size: file_size,
-            owner: settings.file_default_owner.clone(),
+            owner,
             created_at: now_miliseconds,
             last_modified_at: now_miliseconds,
             file_status: FileStatus::Uploading,
@@ -335,16 +407,107 @@ impl Metadatanode {
         info!("File metadata created successfully for {}", file.id);
         return Ok(file);
     }
+
+    async fn update_file_status_internal(
+        &self,
+        file_path: String,
+        new_status: String,
+    ) -> Result<(), Status> {
+        let mut files_lock = self.state.files.write().await;
+        if let Some(file_metadata) = files_lock.get_mut(&file_path) {
+            file_metadata.file_status = FileStatus::str_to_tok(&new_status);
+            let queued_for_replication = FileStatus::str_to_tok(&new_status) == FileStatus::Ready;
+            if queued_for_replication {
+                self.block_replicator_tx
+                    .send(file_metadata.clone())
+                    .await
+                    .ok();
+            }
+            self.audit_success(
+                "FILE_SET_STATUS",
+                Some(file_path.clone()),
+                json!({
+                    "status": new_status,
+                    "queued_for_replication": queued_for_replication,
+                }),
+            )
+            .await;
+        } else {
+            self.audit_failure(
+                "FILE_SET_STATUS",
+                Some(file_path.clone()),
+                "NOT_FOUND",
+                json!({
+                    "status": new_status,
+                }),
+            )
+            .await;
+            return Err(Status::not_found("File not found"));
+        }
+
+        self.wal(WalOperation::SetFileStatus {
+            path: file_path,
+            status: new_status,
+        })
+        .await;
+
+        Ok(())
+    }
 }
 
 #[tonic::async_trait]
 impl MetadataService for Metadatanode {
+    #[instrument(skip(self, request))]
+    async fn register_user(
+        &self,
+        request: Request<RegisterUserRequest>,
+    ) -> Result<Response<RegisterUserResponse>, Status> {
+        let payload = request.into_inner();
+        self.auth
+            .register_user(&payload.username, &payload.password)
+            .map_err(Status::invalid_argument)?;
+
+        self.audit_success("USER_REGISTER", Some(payload.username), json!({}))
+            .await;
+
+        Ok(Response::new(RegisterUserResponse {
+            success: true,
+            error_message: String::new(),
+        }))
+    }
+
+    #[instrument(skip(self, request))]
+    async fn login_user(
+        &self,
+        request: Request<LoginUserRequest>,
+    ) -> Result<Response<LoginUserResponse>, Status> {
+        let payload = request.into_inner();
+        let (access_token, expires_at) = self
+            .auth
+            .login_user(&payload.username, &payload.password)
+            .map_err(Status::unauthenticated)?;
+
+        self.audit_success(
+            "USER_LOGIN",
+            Some(payload.username),
+            json!({ "expires_at": expires_at }),
+        )
+        .await;
+
+        Ok(Response::new(LoginUserResponse {
+            access_token,
+            expires_at,
+            error_message: String::new(),
+        }))
+    }
+
     #[instrument(skip(self, request))]
     async fn create_file(
         &self,
         request: Request<CreateFileRequest>,
     ) -> Result<Response<CreateFileResponse>, Status> {
         info!("Received create_file request");
+        let claims = self.authorize_user_or_master(request.metadata())?;
         let file_request = request.into_inner();
         let file_metadata = match self
             ._create_file(
@@ -352,6 +515,7 @@ impl MetadataService for Metadatanode {
                 &self.settings,
                 file_request.path.clone(),
                 file_request.size,
+                claims.sub.clone(),
             )
             .await
         {
@@ -407,6 +571,7 @@ impl MetadataService for Metadatanode {
         request: Request<GetFileRequest>,
     ) -> Result<Response<GetFileResponse>, Status> {
         info!("Received get_file_metadata request");
+        let claims = self.authorize_user_or_master(request.metadata())?;
         let file_path = request.into_inner().path;
         let files_lock = self.state.files.read().await;
         let file_metadata = match files_lock.get(&file_path) {
@@ -422,6 +587,16 @@ impl MetadataService for Metadatanode {
                 return Err(Status::not_found("File not found"));
             }
         };
+        if !self.can_access_path(&file_metadata.owner, &claims) {
+            self.audit_failure(
+                "FILE_GET_METADATA",
+                Some(file_path.clone()),
+                "FORBIDDEN",
+                json!({}),
+            )
+            .await;
+            return Err(Status::permission_denied("Not allowed to access this file"));
+        }
         let datanodes = self.state.available_datanodes.read().await;
         let block_assignments = file_metadata
             .blocks
@@ -433,12 +608,8 @@ impl MetadataService for Metadatanode {
                 order: block.index as i64, //TODO: check var size i64 vs i32
             })
             .collect();
-        self.audit_success(
-            "FILE_GET_METADATA",
-            Some(file_path.to_string()),
-            json!({}),
-        )
-        .await;
+        self.audit_success("FILE_GET_METADATA", Some(file_path.to_string()), json!({}))
+            .await;
         Ok(Response::new(GetFileResponse {
             file_id: file_metadata.id.clone(),
             path: file_metadata.path.clone(),
@@ -458,8 +629,22 @@ impl MetadataService for Metadatanode {
         request: Request<DeleteFileRequest>,
     ) -> Result<Response<DeleteFileResponse>, Status> {
         info!("Received delete_file request");
+        let claims = self.authorize_user_or_master(request.metadata())?;
         let file_path = request.into_inner().path;
         let mut files = self.state.files.write().await;
+        if let Some(existing) = files.get(&file_path) {
+            if !self.can_access_path(&existing.owner, &claims) {
+                self.audit_failure(
+                    "FILE_DELETE",
+                    Some(file_path.clone()),
+                    "FORBIDDEN",
+                    json!({}),
+                )
+                .await;
+                return Err(Status::permission_denied("Not allowed to delete this file"));
+            }
+        }
+
         if let Some(filemetadata) = files.remove(&file_path) {
             let block_count = filemetadata.blocks.len();
             let to_delete = filemetadata.blocks;
@@ -503,11 +688,15 @@ impl MetadataService for Metadatanode {
         request: Request<ListDirectoryRequest>,
     ) -> Result<Response<ListDirectoryResponse>, Status> {
         info!("Received list_directory request");
+        let claims = self.authorize_user_or_master(request.metadata())?;
         let dir_path = request.into_inner().path;
         let files_lock = self.state.files.read().await;
         let files: Vec<FileInfo> = files_lock
             .iter()
-            .filter(|(path, _)| path.starts_with(&dir_path))
+            .filter(|(path, file)| {
+                path.starts_with(&dir_path)
+                    && (claims.role == common::ROLE_MASTER || file.owner == claims.sub)
+            })
             .map(|(_, v)| FileInfo {
                 filename: v.name.clone(),
                 is_directory: false,
@@ -541,6 +730,7 @@ impl MetadataService for Metadatanode {
         request: Request<RenameFileRequest>,
     ) -> Result<Response<RenameFileResponse>, Status> {
         info!("Received rename_file request");
+        let claims = self.authorize_user_or_master(request.metadata())?;
         let rename_req = request.into_inner();
         let mut files_lock = self.state.files.write().await;
         if files_lock.contains_key(&rename_req.new_path) {
@@ -562,6 +752,21 @@ impl MetadataService for Metadatanode {
                 rename_req.new_path
             )));
         }
+        if let Some(existing) = files_lock.get(&rename_req.old_path) {
+            if !self.can_access_path(&existing.owner, &claims) {
+                self.audit_failure(
+                    "FILE_RENAME",
+                    Some(rename_req.old_path.clone()),
+                    "FORBIDDEN",
+                    json!({
+                        "new_path": rename_req.new_path,
+                    }),
+                )
+                .await;
+                return Err(Status::permission_denied("Not allowed to rename this file"));
+            }
+        }
+
         if let Some(mut file_metadata) = files_lock.remove(&rename_req.old_path) {
             file_metadata.name = rename_req.new_path.clone();
             info!(
@@ -608,6 +813,8 @@ impl MetadataService for Metadatanode {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
+        let claims = self.authorize_datanode(request.metadata())?;
+        debug!(subject = %claims.sub, "Authenticated datanode heartbeat");
         let node_request = request.into_inner();
         let remote_addr = node_request.addr.clone();
         let mut datanodes_lock = self.state.available_datanodes.write().await;
@@ -721,45 +928,10 @@ impl MetadataService for Metadatanode {
         &self,
         request: Request<SetFileStatusRequest>,
     ) -> Result<Response<SetFileStatusResponse>, Status> {
+        self.authorize_user_or_master(request.metadata())?;
         let set_file_request = request.into_inner();
-        let file_path = set_file_request.path;
-        let new_status = set_file_request.status;
-        let mut files_lock = self.state.files.write().await;
-        if let Some(file_metadata) = files_lock.get_mut(&file_path) {
-            file_metadata.file_status = FileStatus::str_to_tok(&new_status);
-            let queued_for_replication = FileStatus::str_to_tok(&new_status) == FileStatus::Ready;
-            if queued_for_replication {
-                self.block_replicator_tx
-                    .send(file_metadata.clone())
-                    .await
-                    .ok();
-            }
-            self.audit_success(
-                "FILE_SET_STATUS",
-                Some(file_path.clone()),
-                json!({
-                    "status": new_status,
-                    "queued_for_replication": queued_for_replication,
-                }),
-            )
-            .await;
-        } else {
-            self.audit_failure(
-                "FILE_SET_STATUS",
-                Some(file_path.clone()),
-                "NOT_FOUND",
-                json!({
-                    "status": new_status,
-                }),
-            )
-            .await;
-            return Err(Status::not_found("File not found"));
-        }
-        self.wal(WalOperation::SetFileStatus {
-            path: file_path,
-            status: new_status,
-        })
-        .await;
+        self.update_file_status_internal(set_file_request.path, set_file_request.status)
+            .await?;
         Ok(Response::new(SetFileStatusResponse {
             success: true,
             error_message: "".to_string(),
@@ -797,8 +969,17 @@ impl Metadatanode {
             }
         };
         match client
-            .delete_block(DeleteBlockRequest {
-                block_id: block_id.to_string(),
+            .delete_block({
+                let mut req = Request::new(DeleteBlockRequest {
+                    block_id: block_id.to_string(),
+                });
+                let token = self
+                    .auth
+                    .create_master_service_token()
+                    .map_err(|err| format!("Could not create service token: {err}"))?;
+                common::attach_bearer_token(&mut req, &token)
+                    .map_err(|err| format!("Could not attach token metadata: {err}"))?;
+                req
             })
             .await
         {
@@ -891,7 +1072,13 @@ impl Metadatanode {
                         return Err(format!("Could not connect to datanode: {err}"));
                     }
                 };
-            let request = ReplicateBlocksRequest { block_locations };
+            let mut request = Request::new(ReplicateBlocksRequest { block_locations });
+            let token = self
+                .auth
+                .create_master_service_token()
+                .map_err(|err| format!("Could not create service token: {err}"))?;
+            common::attach_bearer_token(&mut request, &token)
+                .map_err(|err| format!("Could not attach token metadata: {err}"))?;
             let permit = sem.clone().acquire_owned().await.unwrap();
             let this = self.clone();
             set.spawn(async move {
@@ -1051,10 +1238,10 @@ fn block_replicator(
             }
             let _ = master_ref.notify_datanodes_to_replicate(mapping).await;
             master_ref
-                .set_file_status(Request::new(SetFileStatusRequest {
-                    path: file_metadata.path.clone(),
-                    status: FileStatus::Replicated.to_string(),
-                }))
+                .update_file_status_internal(
+                    file_metadata.path.clone(),
+                    FileStatus::Replicated.to_string(),
+                )
                 .await
                 .unwrap();
         }
@@ -1260,6 +1447,24 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     common::init_tracing("master", &settings.log_level);
 
     info!("Configuration loaded: {:?}", settings);
+
+    if settings.jwt_secret == DEFAULT_JWT_SECRET {
+        warn!("Using default JWT secret. Set jwt_secret in config.toml for production use");
+    }
+
+    if let Some(parent) = Path::new(&settings.auth_db_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+    }
+
+    let auth_manager = Arc::new(AuthManager::new(
+        settings.auth_db_path.clone(),
+        settings.jwt_secret.clone(),
+        settings.jwt_exp_seconds,
+        settings.service_token_exp_seconds,
+    )?);
+
     let (files, available_data_nodes, next_node_id) = replay_wal(&settings.wal_path)?;
     info!(
         "WAL replay completed: files={}, datanodes={}, next_node_id={}",
@@ -1268,14 +1473,11 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_node_id
     );
 
-    let (garbage_collector_tx, garbage_collector_rx) = mpsc::channel::<Vec<BlockMetadata>>(
-        settings.garbage_collector_channel_size.max(1),
-    );
-    let (block_replicator_tx, block_replicator_rx) = mpsc::channel::<FileMetadata>(
-        settings.block_replicator_channel_size.max(1),
-    );
-    let (audit_tx, audit_rx) =
-        mpsc::channel::<AuditLog>(settings.audit_channel_size.max(1)); // Buffer grande
+    let (garbage_collector_tx, garbage_collector_rx) =
+        mpsc::channel::<Vec<BlockMetadata>>(settings.garbage_collector_channel_size.max(1));
+    let (block_replicator_tx, block_replicator_rx) =
+        mpsc::channel::<FileMetadata>(settings.block_replicator_channel_size.max(1));
+    let (audit_tx, audit_rx) = mpsc::channel::<AuditLog>(settings.audit_channel_size.max(1)); // Buffer grande
     let (wal_tx, wal_rx) = mpsc::channel::<WalRecord>(settings.wal_channel_size.max(1));
 
     let metadatanode = Arc::new(Metadatanode {
@@ -1288,6 +1490,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         block_replicator_tx,
         audit_tx,
         wal_tx,
+        auth: auth_manager,
         next_node_id: AtomicU16::new(next_node_id),
     });
 

@@ -38,3 +38,9 @@ audit_default_user = "system"
 
 # Elasticsearch TLS behavior
 elastic_allow_invalid_certs = true
+
+# Authentication
+auth_db_path = "services/master/users.db"
+jwt_secret = "change-me-master-secret"
+jwt_exp_seconds = 3600
+service_token_exp_seconds = 300

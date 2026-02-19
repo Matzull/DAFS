@@ -7,6 +7,12 @@ package dfs;
 // Manages file structure, permissions, and block locations.
 // -----------------------------------------------------------------------
 service MetadataService {
+    // Public endpoint for user registration.
+  rpc RegisterUser (RegisterUserRequest) returns (RegisterUserResponse);
+
+    // Public endpoint for user login and token issuance.
+  rpc LoginUser (LoginUserRequest) returns (LoginUserResponse);
+
     // Client asks to upload a file. Master decides where blocks go.
   rpc CreateFile (CreateFileRequest) returns (CreateFileResponse);
 
@@ -64,6 +70,27 @@ service AuditService {
 // =======================================================================
 
 // --- Metadata Messages ---
+
+message RegisterUserRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message RegisterUserResponse {
+  bool   success       = 1;
+  string error_message = 2;
+}
+
+message LoginUserRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message LoginUserResponse {
+  string access_token = 1;
+  int64  expires_at   = 2; // Epoch seconds
+  string error_message = 3;
+}
 
 message CreateFileRequest {
   string path    = 1; // Full path e.g., "/home/user/thesis.pdf"

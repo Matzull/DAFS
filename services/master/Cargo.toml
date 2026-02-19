@@ -22,6 +22,8 @@ reqwest = { version = "0.13.1", features = ["json"] }
 chrono = { workspace = true}
 dotenvy = "0.15.7"
 raft = "0.7.0"
+argon2 = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

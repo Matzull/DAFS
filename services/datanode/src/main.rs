@@ -15,12 +15,12 @@ use figment::{
     Figment,
 };
 use serde::{Deserialize, Serialize};
-use tokio::task::JoinSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::{self, create_dir_all, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Server, Uri};
 use tonic::{Request, Response, Status, Streaming};
@@ -29,6 +29,8 @@ const DEFAULT_DATA_FOLDER: &str = "./testing/datanode";
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_LISTEN_ADDRESS: &str = "[::1]:8080";
 const DEFAULT_METADATA_NODE_ADDRESS: &str = "http://[::1]:9090";
+const DEFAULT_JWT_SECRET: &str = "change-me-master-secret";
+const DEFAULT_SERVICE_TOKEN_EXP_SECONDS: i64 = 300;
 
 #[derive(Parser, Debug, Serialize, Deserialize, Default)]
 pub struct InternalSettings {
@@ -47,6 +49,8 @@ pub struct InternalSettings {
     pub heartbeat_cpu_usage: f32,
     pub heartbeat_free_space: i64,
     pub heartbeat_used_space: i64,
+    pub jwt_secret: String,
+    pub service_token_exp_seconds: i64,
 }
 
 pub fn load_config() -> InternalSettings {
@@ -69,6 +73,8 @@ pub fn load_config() -> InternalSettings {
             heartbeat_cpu_usage: 1.0,
             heartbeat_free_space: 4,
             heartbeat_used_space: 4,
+            jwt_secret: DEFAULT_JWT_SECRET.to_string(),
+            service_token_exp_seconds: DEFAULT_SERVICE_TOKEN_EXP_SECONDS,
         }))
         .merge(Toml::file(&cli.config_path))
         .merge(Serialized::globals(cli));
@@ -156,6 +162,16 @@ struct Cli {
     #[serde(skip_serializing_if = "Option::is_none")]
     heartbeat_used_space: Option<i64>,
 
+    /// Secret used to validate and issue service JWTs
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jwt_secret: Option<String>,
+
+    /// Internal service token validity (seconds)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_token_exp_seconds: Option<i64>,
+
     #[arg(short, long, default_value = "config.toml")]
     #[serde(skip)]
     pub config_path: String,
@@ -168,6 +184,24 @@ pub struct Datanode {
 }
 
 impl Datanode {
+    #[allow(clippy::result_large_err)]
+    fn authorize_any(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<common::AuthClaims, Status> {
+        common::authorize_metadata(metadata, &self.settings.jwt_secret)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn authorize_master(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<common::AuthClaims, Status> {
+        let claims = self.authorize_any(metadata)?;
+        common::require_role(&claims, common::ROLE_MASTER)?;
+        Ok(claims)
+    }
+
     async fn replicate_single_block_to_dst(
         settings: Arc<InternalSettings>,
         dst_addr: String,
@@ -195,7 +229,18 @@ impl Datanode {
             })?;
 
         let (tx, rx) = mpsc::channel(settings.mpsc_channel_size as usize);
-        let write_future = client.write_block(Request::new(ReceiverStream::new(rx)));
+        let mut write_request = Request::new(ReceiverStream::new(rx));
+        let token = common::create_access_token(
+            &settings.jwt_secret,
+            "datanode-service",
+            common::ROLE_DATANODE,
+            settings.service_token_exp_seconds,
+        )
+        .map_err(|err| {
+            Status::internal(format!("Could not create datanode service token: {err}"))
+        })?;
+        common::attach_bearer_token(&mut write_request, &token)?;
+        let write_future = client.write_block(write_request);
 
         tx.send(WriteBlockRequest {
             request_data: Some(RequestData::Metadata(common::dfs::BlockMetadata {
@@ -205,7 +250,9 @@ impl Datanode {
         })
         .await
         .map_err(|err| {
-            Status::internal(format!("Failed to send block metadata for {block_id}: {err}"))
+            Status::internal(format!(
+                "Failed to send block metadata for {block_id}: {err}"
+            ))
         })?;
 
         let mut hasher = Hasher::new();
@@ -235,7 +282,9 @@ impl Datanode {
             request_data: Some(RequestData::Checksum(checksum)),
         })
         .await
-        .map_err(|err| Status::internal(format!("Failed to send checksum for {block_id}: {err}")))?;
+        .map_err(|err| {
+            Status::internal(format!("Failed to send checksum for {block_id}: {err}"))
+        })?;
 
         drop(tx);
         let write_response = write_future.await.map_err(|err| {
@@ -260,6 +309,7 @@ impl DataNodeService for Datanode {
         &self,
         request: Request<Streaming<WriteBlockRequest>>,
     ) -> Result<Response<WriteBlockResponse>, Status> {
+        self.authorize_any(request.metadata())?;
         debug!("Received write_block request");
         let mut hasher = Hasher::new();
         let mut stream = request.into_inner();
@@ -353,6 +403,7 @@ impl DataNodeService for Datanode {
         &self,
         request: Request<ReadBlockRequest>,
     ) -> Result<Response<Self::ReadBlockStream>, Status> {
+        self.authorize_any(request.metadata())?;
         let block_id = request.into_inner().block_id;
         let mut hasher = Hasher::new();
         debug!(block_id = %block_id, "Received read_block request");
@@ -421,6 +472,7 @@ impl DataNodeService for Datanode {
         &self,
         request: Request<DeleteBlockRequest>,
     ) -> Result<Response<DeleteBlockResponse>, Status> {
+        self.authorize_master(request.metadata())?;
         let block_id = request.into_inner().block_id;
         debug!(block_id = %block_id, "Received delete_block request");
 
@@ -441,11 +493,13 @@ impl DataNodeService for Datanode {
         }))
     }
 
+    #[allow(clippy::result_large_err)]
     #[instrument(skip(self, request))]
     async fn configure_node(
         &self,
         request: Request<ConfigureNodeRequest>,
     ) -> Result<Response<ConfigureNodeResponse>, Status> {
+        self.authorize_master(request.metadata())?;
         let req = request.into_inner();
         let new_node_id = req.node_id;
         info!(node_id = new_node_id, "Received configure_node request");
@@ -457,10 +511,12 @@ impl DataNodeService for Datanode {
         }))
     }
 
+    #[allow(clippy::result_large_err)]
     async fn replicate_blocks(
         &self,
         request: Request<ReplicateBlocksRequest>,
     ) -> Result<Response<ReplicateBlocksResponse>, Status> {
+        self.authorize_master(request.metadata())?;
         let block_locs = request.into_inner().block_locations;
         let max_parallel_blocks = self.settings.replication_max_parallel_blocks.max(1);
         let sem = Arc::new(Semaphore::new(max_parallel_blocks));
@@ -547,15 +603,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let current_node_id = *node_id_arc.lock().await as u32;
 
             info!("Sending heartbeat");
-            let result = client
-                .heartbeat(HeartbeatRequest {
-                    cpu_usage: settings.heartbeat_cpu_usage,
-                    node_id: current_node_id,
-                    free_space: settings.heartbeat_free_space,
-                    used_space: settings.heartbeat_used_space,
-                    addr: address.to_string(),
-                })
+            let token = match common::create_access_token(
+                &settings.jwt_secret,
+                &format!("datanode-{current_node_id}"),
+                common::ROLE_DATANODE,
+                settings.service_token_exp_seconds,
+            ) {
+                Ok(token) => token,
+                Err(e) => {
+                    error!("Could not create heartbeat token: {}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        settings.heartbeat_nack_retry_ms.max(1),
+                    ))
+                    .await;
+                    continue;
+                }
+            };
+
+            let mut heartbeat_request = Request::new(HeartbeatRequest {
+                cpu_usage: settings.heartbeat_cpu_usage,
+                node_id: current_node_id,
+                free_space: settings.heartbeat_free_space,
+                used_space: settings.heartbeat_used_space,
+                addr: address.to_string(),
+            });
+            if let Err(e) = common::attach_bearer_token(&mut heartbeat_request, &token) {
+                error!("Could not attach heartbeat token metadata: {}", e);
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    settings.heartbeat_nack_retry_ms.max(1),
+                ))
                 .await;
+                continue;
+            }
+
+            let result = client.heartbeat(heartbeat_request).await;
 
             match result {
                 Ok(response) => {
@@ -584,8 +665,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => {
                     error!("Heartbeat failed: {}. Attempting to reconnect...", e);
                     // Try to reconnect
-                    retry_delay =
-                        tokio::time::Duration::from_millis(settings.heartbeat_retry_initial_ms.max(1));
+                    retry_delay = tokio::time::Duration::from_millis(
+                        settings.heartbeat_retry_initial_ms.max(1),
+                    );
                     loop {
                         match MetadataServiceClient::connect(
                             settings.metadata_node_address.parse::<Uri>().unwrap(),
