@@ -29,3 +29,10 @@ Auditing/grafana/storage/*
 !Auditing/esdata01/.gitkeep
 !Auditing/grafana/storage/.gitkeep
 !Auditing/certs/.gitkeep
+.token
+*.db
+*.log
+
+Auditing/grafana/plugin/node_modules/
+Auditing/grafana/plugin/dist/
+Auditing/grafana/plugin/backend/__pycache__/

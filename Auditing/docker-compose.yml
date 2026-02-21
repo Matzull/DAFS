@@ -123,6 +123,7 @@ services:
     volumes:
       - ./grafana/storage:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/plugin:/var/lib/grafana/plugins/dafs-ai-assistant-panel
       - ./certs:/etc/grafana/certs:ro
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
@@ -135,11 +136,34 @@ services:
       - GF_ES_URL=${ES_URL}:${ES_PORT}
       - GF_PLUGINS_PREINSTALL=grafana-llm-app
       - GF_SECURITY_SECRET_KEY=${GRAFANA_SECRET_KEY}
-      - GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=grafana-llm-app
+      - GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=grafana-llm-app,dafs-ai-assistant-panel
       - GF_APP_MODE=production
     depends_on:
      es01:
        condition: service_healthy
+
+  ai-assistant-backend:
+    build:
+      context: ./grafana/plugin/backend
+    container_name: ai-assistant-backend
+    env_file:
+      - ./.env
+      - ./grafana/plugin/backend/.env
+    environment:
+      - OPENROUTER_BASE_URL=${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      - OPENROUTER_MODEL=${OPENROUTER_MODEL:-gpt-4.1-mini}
+      - LOG_LEVEL=DEBUG
+      - ES_VERIFY_TLS=${ES_VERIFY_TLS:-false}
+      - ES_CA_CERT_PATH=${ES_CA_CERT_PATH:-}
+    ports:
+      - "8008:8008"
+    volumes:
+      - ./certs:/app/certs:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8008/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 volumes:
   grafana-storage:
