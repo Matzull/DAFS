@@ -2,66 +2,69 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { PanelProps } from '@grafana/data';
 import { Button, Spinner } from '@grafana/ui';
 import { css, cx } from '@emotion/css';
+import { marked } from 'marked';
 import { PanelOptions, AssistantMessage, HistoryMessage, QueryResponse } from '../types';
 
 interface Props extends PanelProps<PanelOptions> {}
 
-// ---------------------------------------------------------------------------
-// Minimal markdown renderer: code blocks, inline code, bold, bullet lists
-// ---------------------------------------------------------------------------
-function renderMarkdown(text: string): React.ReactNode[] {
-  const nodes: React.ReactNode[] = [];
-  // Split on fenced code blocks first
-  const parts = text.split(/(```[\s\S]*?```)/g);
-  parts.forEach((part, i) => {
-    if (part.startsWith('```')) {
-      const inner = part.replace(/^```[^\n]*\n?/, '').replace(/```$/, '');
-      nodes.push(
-        <pre key={i} style={{ background: 'var(--color-bg-secondary,#1a1a2e)', padding: '8px 12px', borderRadius: 4, overflowX: 'auto', fontSize: 11, margin: '6px 0', lineHeight: 1.5 }}>
-          <code>{inner}</code>
-        </pre>
-      );
-      return;
-    }
-    // Process line by line
-    const lines = part.split('\n');
-    let inList = false;
-    lines.forEach((line, li) => {
-      const bullet = /^[\-\*]\s+(.+)/.exec(line);
-      if (bullet) {
-        if (!inList) { inList = true; }
-        nodes.push(<li key={`${i}-${li}`} style={{ marginLeft: 16, listStyleType: 'disc' }}>{renderInline(bullet[1])}</li>);
-        return;
-      }
-      if (inList) { inList = false; }
-      if (line === '') {
-        nodes.push(<br key={`${i}-${li}`} />);
-        return;
-      }
-      nodes.push(<span key={`${i}-${li}`} style={{ display: 'block', marginBottom: 2 }}>{renderInline(line)}</span>);
-    });
-  });
-  return nodes;
+// Configure marked once: GFM (tables, strikethrough, task lists) enabled by default in v9
+marked.use({
+  gfm: true,
+  breaks: true,
+  renderer: {
+    link(href: string, title: string | null | undefined, text: string) {
+      return `<a href="${href}" target="_blank" rel="noopener noreferrer"${title ? ` title="${title}"` : ''}>${text}</a>`;
+    },
+  },
+});
+
+// Scoped CSS injected once for markdown HTML rendered inside bubbles
+const MD_STYLE_ID = 'dafs-md-styles';
+if (!document.getElementById(MD_STYLE_ID)) {
+  const s = document.createElement('style');
+  s.id = MD_STYLE_ID;
+  s.textContent = `
+    .dafs-md { font-size: 13px; line-height: 1.6; word-break: break-word; }
+    .dafs-md p { margin: 3px 0 6px; }
+    .dafs-md h1,.dafs-md h2,.dafs-md h3,.dafs-md h4 { font-weight: 700; margin: 10px 0 4px; }
+    .dafs-md h1 { font-size: 1.1em; } .dafs-md h2 { font-size: 1.05em; } .dafs-md h3 { font-size: 1em; }
+    .dafs-md strong { font-weight: 700; }
+    .dafs-md em { font-style: italic; }
+    .dafs-md del { text-decoration: line-through; opacity: 0.7; }
+    .dafs-md a { color: #63b3ed; text-decoration: underline; }
+    .dafs-md ul { margin: 4px 0; padding-left: 18px; list-style-type: disc; }
+    .dafs-md ol { margin: 4px 0; padding-left: 18px; }
+    .dafs-md li { margin: 2px 0; }
+    .dafs-md code { background: rgba(255,255,255,0.1); padding: 1px 5px; border-radius: 3px; font-family: monospace; font-size: 0.88em; }
+    .dafs-md pre { background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; padding: 10px 12px; overflow-x: auto; margin: 8px 0; }
+    .dafs-md pre code { background: none; padding: 0; font-size: 12px; color: #e2e8f0; }
+    .dafs-md blockquote { border-left: 3px solid rgba(255,255,255,0.2); margin: 6px 0; padding-left: 10px; opacity: 0.8; font-style: italic; }
+    .dafs-md hr { border: none; border-top: 1px solid rgba(255,255,255,0.12); margin: 10px 0; }
+    .dafs-md table { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 12px; }
+    .dafs-md th { background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.15); padding: 5px 10px; text-align: left; font-weight: 600; white-space: nowrap; }
+    .dafs-md td { border: 1px solid rgba(255,255,255,0.1); padding: 4px 10px; }
+    .dafs-md tr:nth-child(even) td { background: rgba(255,255,255,0.03); }
+    .dafs-md input[type=checkbox] { margin-right: 5px; }
+  `;
+  document.head.appendChild(s);
 }
 
-function renderInline(text: string): React.ReactNode {
-  // inline code
-  const parts = text.split(/(`[^`]+`)/g);
-  return (
-    <>
-      {parts.map((p, i) =>
-        p.startsWith('`') && p.endsWith('`') ? (
-          <code key={i} style={{ background: 'rgba(255,255,255,0.1)', padding: '1px 4px', borderRadius: 3, fontSize: '0.9em' }}>
-            {p.slice(1, -1)}
-          </code>
-        ) : (
-          // bold
-          <span key={i} dangerouslySetInnerHTML={{ __html: p.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/\*(.+?)\*/g, '<em>$1</em>') }} />
-        )
-      )}
-    </>
-  );
-}
+// ---------------------------------------------------------------------------
+// Markdown renderer — uses marked to produce HTML, injected safely via div
+// Content is from our own controlled LLM backend, not user-supplied HTML
+// ---------------------------------------------------------------------------
+const MarkdownContent: React.FC<{ content: string }> = ({ content }) => {
+  const html = useMemo(() => {
+    try {
+      const raw = marked.parse(content) as string;
+      // Wrap tables in a scrollable div
+      return raw.replace(/<table/g, '<div style="overflow-x:auto"><table').replace(/<\/table>/g, '</table></div>');
+    } catch {
+      return content;
+    }
+  }, [content]);
+  return <div className="dafs-md" dangerouslySetInnerHTML={{ __html: html }} />;
+};
 
 // ---------------------------------------------------------------------------
 // Typing indicator
@@ -225,7 +228,7 @@ export const DAFSAssistantPanel: React.FC<Props> = ({ options, width, height, ti
               </div>
             )}
             <div className={msg.role === 'user' ? styles.bubbleUser : styles.bubbleAssistant}>
-              <div className={styles.bubbleContent}>{renderMarkdown(msg.content)}</div>
+              <div className={styles.bubbleContent}><MarkdownContent content={msg.content} /></div>
               <div className={styles.bubbleMeta}>
                 {typeof msg.esQueries === 'number' && msg.esQueries > 0 && (
                   <span className={styles.esBadge} title="Consultas Elasticsearch realizadas">

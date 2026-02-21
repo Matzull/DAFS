@@ -1,15 +1,32 @@
+"""
+DAFS Grafana Assistant Backend — LangChain agentic rewrite.
+
+The agent has 5 read-only Elasticsearch tools and a minimal system prompt.
+It self-discovers indices, mappings, field values, and chains queries to
+answer questions without any hardcoded domain knowledge.
+"""
+
+from __future__ import annotations
+
 import json
 import os
 import sys
 from typing import Any, Optional
 
-from fastapi import FastAPI
-from fastapi import HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
 from loguru import logger
 from pydantic import BaseModel, Field
 
+# ---------------------------------------------------------------------------
+# Pydantic models (FastAPI layer)
+# ---------------------------------------------------------------------------
 
 class QueryContext(BaseModel):
     dashboardTitle: Optional[str] = None
@@ -34,14 +51,37 @@ class QueryResponse(BaseModel):
     tool_calls_made: int = 0
 
 
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "gpt-4.1-mini")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
+# ES config — populated at startup
+ES_BASE_URL: str = ""
+ES_USER: str = ""
+ES_PASSWORD: str = ""
+ES_VERIFY_TLS: bool = False
+ES_CA_CERT_PATH: str = ""
+
+
+def _init_es_config() -> None:
+    global ES_BASE_URL, ES_USER, ES_PASSWORD, ES_VERIFY_TLS, ES_CA_CERT_PATH
+    base = os.getenv("ES_URL", "https://es01").rstrip("/")
+    if not base.rsplit(":", 1)[-1].isdigit():
+        base = f"{base}:{os.getenv('ES_PORT', '9200')}"
+    ES_BASE_URL = base
+    ES_USER = os.getenv("ELASTIC_USER", "elastic")
+    ES_PASSWORD = os.getenv("ELASTIC_PASSWORD", "")
+    ES_VERIFY_TLS = os.getenv("ES_VERIFY_TLS", "false").lower() == "true"
+    ES_CA_CERT_PATH = os.getenv("ES_CA_CERT_PATH", "")
+
 
 def _configure_logger() -> None:
-    valid_levels = {"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"}
-    level = LOG_LEVEL if LOG_LEVEL in valid_levels else "INFO"
+    valid = {"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"}
+    level = LOG_LEVEL if LOG_LEVEL in valid else "INFO"
     logger.remove()
     logger.add(
         sys.stdout,
@@ -51,73 +91,7 @@ def _configure_logger() -> None:
         diagnose=False,
         format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {message}",
     )
-    logger.info("Logger configurado con LOG_LEVEL={}", level)
-
-
-def _build_es_base_url() -> str:
-    es_url = os.getenv("ES_URL", "https://es01").rstrip("/")
-    if es_url.endswith(":9200"):
-        return es_url
-
-    es_port = os.getenv("ES_PORT", "9200")
-    if es_url.rsplit(":", 1)[-1].isdigit():
-        return es_url
-
-    return f"{es_url}:{es_port}"
-
-
-ES_BASE_URL = _build_es_base_url()
-ES_USER = os.getenv("ELASTIC_USER", "elastic")
-ES_PASSWORD = os.getenv("ELASTIC_PASSWORD", "")
-ES_VERIFY_TLS = os.getenv("ES_VERIFY_TLS", "false").lower() == "true"
-ES_CA_CERT_PATH = os.getenv("ES_CA_CERT_PATH", "")
-
-
-_configure_logger()
-
-
-READONLY_ES_SEARCH_TOOL: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "es_search",
-        "description": (
-            "Ejecuta una búsqueda de solo lectura en Elasticsearch. "
-            "Puedes incluir query DSL, aggregations, sort y size. "
-            "Para contar documentos o hacer agregaciones usa size=0."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "index": {
-                    "type": "string",
-                    "description": "Índice o patrón de índice (por ejemplo logs-*). Opcional.",
-                },
-                "query": {
-                    "type": "object",
-                    "description": (
-                        "Query clause de Elasticsearch (e.g. {\"match_all\":{}}, {\"range\":{...}}, "
-                        "{\"bool\":{...}}). NO incluyas la clave 'query' exterior; pon directamente "
-                        "el clause. Omite si quieres match_all."
-                    ),
-                },
-                "aggs": {
-                    "type": "object",
-                    "description": "Aggregations de Elasticsearch (mismo formato que el campo 'aggs' del body _search).",
-                },
-                "sort": {
-                    "description": "Campo sort del body _search (array u objeto).",
-                },
-                "size": {
-                    "type": "integer",
-                    "description": "Número máximo de hits a devolver (0-100). Usa 0 para agregaciones puras.",
-                    "minimum": 0,
-                    "maximum": 100,
-                },
-            },
-            "required": [],
-        },
-    },
-}
+    logger.info("Logger configured LOG_LEVEL={}", level)
 
 
 def _es_verify() -> bool | str:
@@ -126,216 +100,341 @@ def _es_verify() -> bool | str:
     return ES_VERIFY_TLS
 
 
-def _ensure_no_forbidden_query_keys(value: Any) -> None:
-    forbidden = {"script", "stored_script"}
-    if isinstance(value, dict):
-        for key, nested in value.items():
-            if key in forbidden:
-                raise HTTPException(status_code=400, detail="El query DSL incluye campos no permitidos para modo readonly.")
-            _ensure_no_forbidden_query_keys(nested)
-    elif isinstance(value, list):
-        for nested in value:
-            _ensure_no_forbidden_query_keys(nested)
+_init_es_config()
+_configure_logger()
 
 
-def _run_es_search(args: dict[str, Any]) -> dict[str, Any]:
-    index = str(args.get("index", "")).strip()
-    query = args.get("query")
-    aggs = args.get("aggs") or args.get("aggregations")
-    sort = args.get("sort")
-    size = int(args.get("size", 20))
-    size = max(0, min(size, 100))
+# ---------------------------------------------------------------------------
+# ES HTTP helpers — used by all tools
+# ---------------------------------------------------------------------------
 
-    logger.debug("es_search args recibidos index={!r} query={!r} aggs={} sort={} size={}",
-                 index, query, bool(aggs), bool(sort), size)
+def _es_get(path: str, timeout: float = 15.0) -> dict[str, Any] | str:
+    url = f"{ES_BASE_URL}{path}"
+    logger.debug("ES REQUEST  GET {}", url)
+    try:
+        with httpx.Client(timeout=timeout, verify=_es_verify()) as client:
+            r = client.get(url, auth=(ES_USER, ES_PASSWORD))
+        logger.debug("ES RESPONSE GET {} → status={} took={}ms",
+                     url, r.status_code, r.elapsed.microseconds // 1000)
+        if r.status_code >= 400:
+            logger.debug("ES RESPONSE body: {}", r.text[:500])
+            return f"ERROR {r.status_code}: {r.text[:300]}"
+        return r.json()
+    except Exception as exc:
+        logger.warning("ES GET {} failed: {}", url, exc)
+        return f"ERROR: {exc}"
 
-    # Coerce query string → dict
-    if isinstance(query, str):
-        stripped = query.strip()
-        if stripped:
-            try:
-                query = json.loads(stripped)
-            except json.JSONDecodeError as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"El campo 'query' no es un JSON válido: {exc}",
-                ) from exc
-        else:
-            query = None
 
-    if query is None:
-        query_clause: dict[str, Any] = {"match_all": {}}
-    elif not isinstance(query, dict):
-        raise HTTPException(
-            status_code=400,
-            detail=f"'query' debe ser un objeto JSON, recibido tipo {type(query).__name__}.",
-        )
-    else:
-        query_clause = query
+def _es_post(path: str, body: dict[str, Any], timeout: float = 30.0) -> dict[str, Any] | str:
+    url = f"{ES_BASE_URL}{path}"
+    logger.debug("ES REQUEST  POST {}\n  body: {}", url, json.dumps(body, ensure_ascii=False))
+    try:
+        with httpx.Client(timeout=timeout, verify=_es_verify()) as client:
+            r = client.post(
+                url,
+                auth=(ES_USER, ES_PASSWORD),
+                headers={"Content-Type": "application/json"},
+                json=body,
+            )
+        logger.debug("ES RESPONSE POST {} → status={} took={}ms",
+                     url, r.status_code, r.elapsed.microseconds // 1000)
+        if r.status_code >= 400:
+            logger.debug("ES RESPONSE body: {}", r.text[:1000])
+            return f"ERROR {r.status_code}: {r.text[:500]}"
+        return r.json()
+    except Exception as exc:
+        logger.warning("ES POST {} failed: {}", url, exc)
+        return f"ERROR: {exc}"
 
-    # If query_clause already looks like a full ES body, use it directly;
-    # otherwise wrap it under the 'query' key.
-    _ES_BODY_KEYS = {"query", "aggs", "aggregations", "sort", "from", "_source",
-                     "highlight", "post_filter", "knn", "track_total_hits",
-                     "fields", "collapse", "rescore", "explain", "timeout"}
-    if query_clause.keys() & _ES_BODY_KEYS:
-        body: dict[str, Any] = dict(query_clause)
-    else:
-        logger.debug("es_search: envolviéndolo en {{query: ...}}")
-        body = {"query": query_clause}
 
-    # Merge aggs/sort provided as sibling args (model often puts them at top level)
-    if aggs and "aggs" not in body and "aggregations" not in body:
-        body["aggs"] = aggs
-    if sort and "sort" not in body:
-        body["sort"] = sort
+def _fmt(obj: Any, max_len: int = 4000) -> str:
+    s = json.dumps(obj, ensure_ascii=False, default=str)
+    if len(s) > max_len:
+        s = s[:max_len] + f"\n... (truncated, {len(s)} chars total)"
+    return s
 
-    body["size"] = size
 
-    _ensure_no_forbidden_query_keys(body)
+# ---------------------------------------------------------------------------
+# LangChain tools
+# ---------------------------------------------------------------------------
 
-    if not ES_PASSWORD:
-        raise HTTPException(status_code=500, detail="Falta ELASTIC_PASSWORD en entorno del backend.")
+@tool
+def list_indices() -> str:
+    """
+    List all Elasticsearch indices with their document counts and sizes.
+    Use this first to discover what data is available before making any queries.
+    Returns index names, document count, and storage size.
+    """
+    result = _es_get("/_cat/indices?h=index,docs.count,store.size,status&s=index&format=json")
+    if isinstance(result, str):
+        return result
+    filtered = [r for r in result if not r.get("index", "").startswith(".")]
+    if not filtered:
+        return "No user indices found."
+    lines = [
+        f"  {r['index']}: {r.get('docs.count', '?')} docs, {r.get('store.size', '?')}"
+        for r in filtered
+    ]
+    out = "Available indices:\n" + "\n".join(lines)
+    logger.debug("ES RESULT   list_indices → {} indices", len(filtered))
+    return out
+
+
+@tool
+def get_mapping(index: str) -> str:
+    """
+    Get the complete field mapping (schema) for an Elasticsearch index.
+    Shows all field names and their data types.
+    IMPORTANT: For text fields that have a .keyword sub-field, you MUST use
+    fieldname.keyword for exact filtering and aggregations.
+    Always call this before querying an index you haven't inspected yet.
+
+    Args:
+        index: The index name (e.g. 'dfs-audit').
+    """
+    result = _es_get(f"/{index}/_mapping")
+    if isinstance(result, str):
+        return result
+
+    def collect(props: dict, prefix: str = "", depth: int = 0) -> list[str]:
+        if depth > 4:
+            return []
+        lines: list[str] = []
+        for fname, meta in sorted(props.items()):
+            full = f"{prefix}{fname}" if prefix else fname
+            ftype = meta.get("type", "object")
+            hint = ""
+            if ftype == "text" and "keyword" in meta.get("fields", {}):
+                hint = f"  → use {full}.keyword for filters/aggs"
+            lines.append(f"  {full}: {ftype}{hint}")
+            if "properties" in meta:
+                lines.extend(collect(meta["properties"], f"{full}.", depth + 1))
+        return lines
+
+    sections: list[str] = []
+    for idx, data in result.items():
+        if idx.startswith("."):
+            continue
+        props = data.get("mappings", {}).get("properties", {})
+        sections.append(f"{idx} fields:\n" + "\n".join(collect(props)))
+
+    out = "\n\n".join(sections) or "No mapping found."
+    logger.debug("ES RESULT   get_mapping index={} fields={}", index, out.count("\n"))
+    return out
+
+
+@tool
+def get_field_values(index: str, field: str, size: int = 20, filter_json: str = "") -> str:
+    """
+    Get the distinct values actually present in a field using a terms aggregation.
+    Use this to discover what values exist before filtering — never guess or invent
+    field values. Always use the .keyword sub-field for text fields.
+
+    Args:
+        index: Index name (e.g. 'dfs-audit').
+        field: Field to aggregate, use .keyword for text (e.g. 'action.keyword').
+        size: Max distinct values to return (default 20, max 100).
+        filter_json: Optional ES query clause (JSON string) to pre-filter documents
+                     before aggregating. Example: '{"term":{"user.keyword":"admin"}}'
+    """
+    size = max(1, min(int(size), 100))
+    body: dict[str, Any] = {
+        "size": 0,
+        "aggs": {"values": {"terms": {"field": field, "size": size}}},
+    }
+    if filter_json:
+        try:
+            body["query"] = json.loads(filter_json)
+        except json.JSONDecodeError as exc:
+            return f"ERROR: filter_json is not valid JSON: {exc}"
+
+    result = _es_post(f"/{index}/_search", body)
+    if isinstance(result, str):
+        return result
+
+    buckets = result.get("aggregations", {}).get("values", {}).get("buckets", [])
+    total = result.get("hits", {}).get("total", {})
+    lines = [f"  {b['key']!r}: {b['doc_count']} docs" for b in buckets]
+    out = (
+        f"Field '{field}' in '{index}' (total docs: {total}):\n"
+        + ("\n".join(lines) if lines else "  (no values found)")
+    )
+    logger.debug("ES RESULT   get_field_values field={} values={}", field,
+                 [b["key"] for b in buckets])
+    return out
+
+
+@tool
+def get_sample_documents(index: str, size: int = 3,
+                          query_json: str = "", sort_json: str = "") -> str:
+    """
+    Retrieve sample documents from an index to understand its structure and content.
+    Use this to explore what data looks like — see actual field values, understand
+    the data model, and discover what questions can be answered.
+
+    Args:
+        index: Index name.
+        size: Number of documents to retrieve (1–10, default 3).
+        query_json: Optional ES query clause (JSON string) to filter documents.
+                    Example: '{"term":{"action.keyword":"USER_REGISTER"}}'
+        sort_json: Optional sort array (JSON string).
+                   Example: '[{"timestamp":{"order":"desc"}}]'
+    """
+    size = max(1, min(int(size), 10))
+    body: dict[str, Any] = {"size": size}
+    if query_json:
+        try:
+            body["query"] = json.loads(query_json)
+        except json.JSONDecodeError as exc:
+            return f"ERROR: query_json is not valid JSON: {exc}"
+    if sort_json:
+        try:
+            body["sort"] = json.loads(sort_json)
+        except json.JSONDecodeError as exc:
+            return f"ERROR: sort_json is not valid JSON: {exc}"
+
+    result = _es_post(f"/{index}/_search", body)
+    if isinstance(result, str):
+        return result
+
+    hits = result.get("hits", {}).get("hits", [])
+    total = result.get("hits", {}).get("total", {})
+    if not hits:
+        return f"No documents found in '{index}'. Total: {total}"
+
+    docs = [h.get("_source", {}) for h in hits]
+    out = f"Sample documents from '{index}' (total matching: {total}):\n" + _fmt(docs)
+    logger.debug("ES RESULT   get_sample_documents index={} returned={}", index, len(docs))
+    return out
+
+
+@tool
+def search(index: str, body_json: str) -> str:
+    """
+    Execute a full Elasticsearch DSL search query.
+    Use this for any query: filters, aggregations, ranges, bool combinations, etc.
+    Use size=0 for pure aggregations (counts, stats, terms breakdowns).
+    Use size>0 to retrieve matching documents.
+
+    IMPORTANT: Only use field names that you have confirmed exist in the mapping
+    via get_mapping. A must_not or filter on a non-existent field will silently
+    match all documents — the total will equal the full index size, which is wrong.
+
+    Args:
+        index: Index name or pattern (e.g. 'dfs-audit', 'logs-*').
+               Use empty string '' to search all indices.
+        body_json: Complete ES _search body as a JSON string.
+          Examples:
+            Count by field:
+              '{"size":0,"aggs":{"by_action":{"terms":{"field":"action.keyword","size":20}}}}'
+            Filter by time range + get docs:
+              '{"size":5,"query":{"range":{"timestamp":{"gte":"now-1h"}}},"sort":[{"timestamp":{"order":"desc"}}]}'
+            Bool filter with aggregation:
+              '{"size":0,"query":{"bool":{"filter":[{"term":{"action.keyword":"USER_REGISTER"}},{"range":{"timestamp":{"gte":"now-24h"}}}]}}}'
+            Stats over a numeric field:
+              '{"size":0,"aggs":{"cpu_stats":{"stats":{"field":"details.cpu_usage"}}}}'
+            Failed operations (use actual field names from get_mapping):
+              '{"size":0,"query":{"term":{"success":false}}}'
+    """
+    try:
+        body = json.loads(body_json)
+    except json.JSONDecodeError as exc:
+        return f"ERROR: body_json is not valid JSON: {exc}"
+    if not isinstance(body, dict):
+        return "ERROR: body_json must be a JSON object, not an array or scalar."
+
+    # Safety: reject scripts
+    body_str_lower = json.dumps(body).lower()
+    for forbidden in ("\"script\"", "'script'"):
+        if forbidden in body_str_lower:
+            return "ERROR: 'script' queries are not allowed in read-only mode."
 
     path = f"/{index}/_search" if index else "/_search"
-    logger.debug("Ejecutando es_search readonly path={} size={} has_aggs={} verify_tls={}",
-                 path, size, "aggs" in body or "aggregations" in body, ES_VERIFY_TLS)
-
-    with httpx.Client(timeout=30.0, verify=_es_verify()) as client:
-        response = client.post(
-            f"{ES_BASE_URL}{path}",
-            auth=(ES_USER, ES_PASSWORD),
-            headers={"Content-Type": "application/json"},
-            json=body,
-        )
-        if response.status_code >= 400:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Elasticsearch respondió {response.status_code}: {response.text[:500]}",
-            )
-        data = response.json()
-
-    hits = data.get("hits", {}).get("hits", [])
-    summary: dict[str, Any] = {
-        "took": data.get("took"),
-        "total": data.get("hits", {}).get("total"),
-        "returned_hits": len(hits),
-        "hits": hits[:20],
-    }
-    # Include aggregations in the summary if present
-    if "aggregations" in data:
-        summary["aggregations"] = data["aggregations"]
-    logger.debug("es_search completado took={} total={} returned_hits={} has_aggs={}",
-                 summary.get("took"), summary.get("total"),
-                 summary.get("returned_hits"), "aggregations" in summary)
-    return summary
-
-
-def _openrouter_headers(api_key: str) -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-
-def _fetch_es_indices() -> str:
-    """Return a compact string listing all non-system ES indices with their doc counts."""
-    try:
-        with httpx.Client(timeout=10.0, verify=_es_verify()) as client:
-            response = client.get(
-                f"{ES_BASE_URL}/_cat/indices?h=index,docs.count&s=index",
-                auth=(ES_USER, ES_PASSWORD),
-            )
-            if response.status_code >= 400:
-                logger.warning("No se pudo obtener índices ES status={}", response.status_code)
-                return ""
-            lines = []
-            for line in response.text.strip().splitlines():
-                parts = line.split()
-                if not parts:
-                    continue
-                idx = parts[0]
-                if idx.startswith("."):
-                    continue
-                docs = parts[1] if len(parts) > 1 else "?"
-                lines.append(f"  - {idx} ({docs} docs)")
-            result = "\n".join(lines)
-            logger.debug("Índices ES descubiertos:\n{}", result)
-            return result
-    except Exception as exc:
-        logger.warning("Error al listar índices ES: {}", exc)
-        return ""
-
-
-def _fetch_es_schema() -> str:
-    """Return field names and types for each non-system index, to help the LLM build correct queries."""
-    try:
-        with httpx.Client(timeout=10.0, verify=_es_verify()) as client:
-            resp = client.get(
-                f"{ES_BASE_URL}/*/_mapping",
-                auth=(ES_USER, ES_PASSWORD),
-            )
-            if resp.status_code >= 400:
-                return ""
-            mappings = resp.json()
-
-        sections: list[str] = []
-        for idx, idx_data in sorted(mappings.items()):
-            if idx.startswith("."):
-                continue
-            props: dict[str, Any] = idx_data.get("mappings", {}).get("properties", {})
-            if not props:
-                continue
-            field_lines: list[str] = []
-            _collect_fields(props, prefix="", out=field_lines, max_depth=3)
-            sections.append(f"  {idx}:\n" + "\n".join(f"    {f}" for f in field_lines))
-
-        result = "\n".join(sections)
-        logger.debug("Schema ES descubierto:\n{}", result)
+    result = _es_post(path, body)
+    if isinstance(result, str):
         return result
-    except Exception as exc:
-        logger.warning("Error al obtener schema ES: {}", exc)
-        return ""
+
+    hits_data = result.get("hits", {})
+    hits = hits_data.get("hits", [])
+    total = hits_data.get("total")
+    took = result.get("took")
+    aggs = result.get("aggregations")
+
+    summary: dict[str, Any] = {
+        "took_ms": took,
+        "total": total,
+        "returned_hits": len(hits),
+    }
+    if hits:
+        summary["hits"] = [h.get("_source", {}) for h in hits[:20]]
+    if aggs:
+        summary["aggregations"] = aggs
+
+    out = _fmt(summary)
+    logger.debug("ES RESULT   search total={} returned={} has_aggs={}",
+                 total, len(hits), bool(aggs))
+    return out
 
 
-def _collect_fields(
-    props: dict[str, Any],
-    prefix: str,
-    out: list[str],
-    max_depth: int,
-    depth: int = 0,
-) -> None:
-    if depth >= max_depth:
-        return
-    for field, meta in props.items():
-        full = f"{prefix}{field}" if prefix else field
-        ftype = meta.get("type", "object")
-        # include .keyword sub-field hint for text fields
-        keyword_hint = ""
-        if ftype == "text" and "keyword" in meta.get("fields", {}):
-            keyword_hint = f"  (use {full}.keyword for aggregations/sorting)"
-        out.append(f"{full}: {ftype}{keyword_hint}")
-        nested = meta.get("properties")
-        if isinstance(nested, dict):
-            _collect_fields(nested, f"{full}.", out, max_depth, depth + 1)
+# All tools exposed to the agent
+ES_TOOLS = [list_indices, get_mapping, get_field_values, get_sample_documents, search]
 
+# ---------------------------------------------------------------------------
+# System prompt — minimal, no hardcoded domain knowledge
+# ---------------------------------------------------------------------------
 
-def _extract_text_from_message(message: dict[str, Any]) -> str:
-    content = message.get("content", "")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                text = item.get("text", "")
-                if isinstance(text, str):
-                    parts.append(text)
-        return "\n".join(parts)
-    return ""
+SYSTEM_PROMPT = """\
+You are an observability assistant with read-only access to an Elasticsearch cluster.
+You have tools to explore and query it. Use them proactively to answer questions.
 
+## Mandatory workflow — follow this every time
 
-app = FastAPI(title="DAFS Grafana Assistant Backend", version="0.1.0")
+**RULE: You MUST call `get_mapping` for an index before using ANY field name in a \
+`search` query, even if previous messages contain field names. Mappings must be \
+verified in the current session.**
+
+1. `list_indices` — discover what indices exist and their doc counts.
+2. `get_mapping` — verify the EXACT field names and their types.
+   - Never assume or invent a field name (e.g. `result`, `outcome`, `severity`).
+   - The mapping is the only source of truth for field names.
+3. `get_field_values` — check what values actually exist in a field before filtering.
+   - Never guess values (e.g. `"FAILED"`, `"ERROR"`) — fetch them first.
+4. `get_sample_documents` — look at real documents when you need to understand structure.
+5. `search` — only after steps 2–3 confirm the field names and values.
+
+## Sanity-checking results
+
+After every `search`, verify the result makes sense:
+- If `total` equals the full document count of the index, your filter probably
+  matched everything — a non-existent field in `must_not` or `filter` matches all docs.
+  → Re-check field names with `get_mapping` and retry.
+- If `total` is 0 and you expected results, the field name or value is likely wrong.
+  → Re-check with `get_mapping` and `get_field_values`, then retry.
+- Do not report a result to the user until it passes the sanity check.
+
+## Chaining queries
+
+Use results from one query to drive the next:
+- Found a suspicious total? Investigate with `get_field_values` or `get_sample_documents`.
+- Got aggregation buckets? Drill into specific buckets with another `search`.
+- Refine until you have a confident, correct answer.
+
+## Rules
+
+- Read-only: never use scripts or write operations.
+- Time filter: use the `timestamp` field with range queries when questions are
+  about recent activity. The dashboard time range is provided in the context.
+- For text fields, always use `fieldname.keyword` for exact filtering and aggregations.
+- Answer in the same language as the user's question.
+- Format the final answer clearly — use markdown tables or lists when helpful.
+- Do not expose raw query internals in your final answer unless the user asks.
+"""
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="DAFS Grafana Assistant Backend", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -348,178 +447,89 @@ app.add_middleware(
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    logger.debug("Health check solicitado")
+    logger.debug("Health check")
     return {"status": "ok"}
 
 
 @app.post("/query", response_model=QueryResponse)
 def query(payload: QueryRequest) -> QueryResponse:
     logger.info(
-        "Nueva query recibida dashboard={} has_time_range={} history_turns={}",
+        "Query received dashboard={} has_time_range={} history_turns={}",
         payload.context.dashboardTitle,
         bool(payload.context.from_ and payload.context.to),
         len(payload.history),
     )
+
     api_key = os.getenv("OPENROUTER_API_KEY", "")
     if not api_key:
-        logger.error("OPENROUTER_API_KEY no está definido en entorno")
-        raise HTTPException(status_code=500, detail="Falta OPENROUTER_API_KEY en entorno del backend.")
+        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY not set.")
+    if not ES_PASSWORD:
+        raise HTTPException(status_code=500, detail="ELASTIC_PASSWORD not set.")
 
-    context_parts = []
+    # Build context string injected into system message
+    ctx_parts: list[str] = []
     if payload.context.dashboardTitle:
-        context_parts.append(f"dashboard='{payload.context.dashboardTitle}'")
+        ctx_parts.append(f"dashboard='{payload.context.dashboardTitle}'")
     if payload.context.from_ and payload.context.to:
-        context_parts.append(f"range={payload.context.from_}..{payload.context.to}")
+        ctx_parts.append(f"time_range={payload.context.from_}..{payload.context.to}")
+    context_text = ", ".join(ctx_parts) if ctx_parts else "no dashboard context"
 
-    context_text = ", ".join(context_parts) if context_parts else "sin contexto"
-    system_prompt = (
-        payload.systemPrompt
-        or "Eres un asistente de observabilidad. Cuando necesites datos, usa es_search en modo readonly."
+    # Build LLM — points to OpenRouter via OpenAI-compatible API
+    llm = ChatOpenAI(
+        model=OPENROUTER_MODEL,
+        openai_api_key=api_key,
+        openai_api_base=OPENROUTER_BASE_URL,
+        temperature=0.2,
+        max_retries=2,
     )
 
-    es_indices = _fetch_es_indices()
-    es_schema = _fetch_es_schema()
+    # Prompt template
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", SYSTEM_PROMPT + "\n\nDashboard context: {context}"),
+        MessagesPlaceholder("chat_history", optional=True),
+        ("human", "{input}"),
+        MessagesPlaceholder("agent_scratchpad"),
+    ])
 
-    indices_section = (
-        f"\nÍndices disponibles en Elasticsearch (usa exactamente estos nombres):\n{es_indices}"
-        if es_indices else ""
-    )
-    schema_section = (
-        f"\nEsquema de campos por índice (usa EXACTAMENTE estos nombres de campo):\n{es_schema}"
-        if es_schema else ""
+    # Agent + executor
+    agent = create_tool_calling_agent(llm, ES_TOOLS, prompt)
+    executor = AgentExecutor(
+        agent=agent,
+        tools=ES_TOOLS,
+        verbose=False,
+        max_iterations=12,
+        max_execution_time=120,
+        handle_parsing_errors=True,
+        return_intermediate_steps=True,
     )
 
-    # Build message list: system → history turns → current user query
-    messages: list[dict[str, Any]] = [
-        {
-            "role": "system",
-            "content": (
-                f"{system_prompt}\n"
-                "Reglas: solo consultas de lectura en Elasticsearch; no generes acciones de escritura. "
-                f"Contexto dashboard: {context_text}."
-                f"{indices_section}"
-                f"{schema_section}"
-            ),
-        },
-    ]
+    # Convert history to LangChain messages
+    lc_history: list[HumanMessage | AIMessage] = []
     for h in payload.history:
-        if h.role in ("user", "assistant"):
-            messages.append({"role": h.role, "content": h.content})
-    messages.append({"role": "user", "content": payload.query})
+        if h.role == "user":
+            lc_history.append(HumanMessage(content=h.content))
+        elif h.role == "assistant":
+            lc_history.append(AIMessage(content=h.content))
 
-    MAX_ITERATIONS = 4
-    total_tool_calls = 0
+    try:
+        result = executor.invoke({
+            "input": payload.query,
+            "context": context_text,
+            "chat_history": lc_history,
+        })
+    except Exception as exc:
+        logger.exception("Agent execution failed")
+        raise HTTPException(status_code=500, detail=f"Agent error: {exc}") from exc
 
-    with httpx.Client(timeout=60.0) as client:
-        for iteration in range(MAX_ITERATIONS):
-            logger.debug("Agentic loop iteración={}", iteration + 1)
+    answer = result.get("output", "").strip() or "No response from agent."
+    steps = result.get("intermediate_steps", [])
+    tool_calls_made = len(steps)
 
-            response = client.post(
-                f"{OPENROUTER_BASE_URL}/chat/completions",
-                headers=_openrouter_headers(api_key),
-                json={
-                    "model": OPENROUTER_MODEL,
-                    "messages": messages,
-                    "tools": [READONLY_ES_SEARCH_TOOL],
-                    "tool_choice": "auto",
-                    "temperature": 0.2,
-                },
-            )
+    logger.info("Query answered tool_calls={} answer_len={}", tool_calls_made, len(answer))
+    for i, (action, observation) in enumerate(steps):
+        logger.debug("  step[{}] tool={} input={!r} → obs={!r}",
+                     i + 1, action.tool,
+                     str(action.tool_input)[:120],
+                     str(observation)[:200])
 
-            if response.status_code >= 400:
-                logger.error("Error OpenRouter it={} status={} body={}", iteration + 1, response.status_code, response.text[:500])
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"OpenRouter respondió {response.status_code}: {response.text[:500]}",
-                )
-
-            data = response.json()
-            choice = data.get("choices", [{}])[0]
-            message = choice.get("message", {})
-            tool_calls = message.get("tool_calls") or []
-            finish_reason = choice.get("finish_reason", "")
-
-            logger.debug("it={} finish_reason={} tool_calls={}", iteration + 1, finish_reason, len(tool_calls))
-
-            if not tool_calls:
-                # Model is done — extract final answer
-                answer = _extract_text_from_message(message).strip()
-                if not answer:
-                    answer = "No se recibió contenido de respuesta del modelo."
-                logger.info(
-                    "Respuesta generada it={} tool_calls_total={}",
-                    iteration + 1,
-                    total_tool_calls,
-                )
-                return QueryResponse(answer=answer, tool_calls_made=total_tool_calls)
-
-            # Execute all tool calls and append results
-            total_tool_calls += len(tool_calls)
-            tool_outputs: list[dict[str, Any]] = []
-
-            for tool_call in tool_calls:
-                function_data = tool_call.get("function", {})
-                function_name = function_data.get("name")
-                arguments_raw = function_data.get("arguments", "{}")
-                logger.debug("tool_call it={} name={} arguments_raw={!r}", iteration + 1, function_name, arguments_raw)
-
-                try:
-                    arguments = json.loads(arguments_raw)
-                except json.JSONDecodeError:
-                    logger.warning("json.JSONDecodeError al parsear arguments_raw={!r}", arguments_raw)
-                    arguments = {}
-
-                if function_name != "es_search":
-                    tool_result: dict[str, Any] = {"error": f"Tool no permitido: {function_name}"}
-                else:
-                    try:
-                        tool_result = _run_es_search(arguments)
-                    except HTTPException as exc:
-                        logger.warning(
-                            "Error controlado en es_search it={} status={} detail={}",
-                            iteration + 1, exc.status_code, exc.detail,
-                        )
-                        tool_result = {
-                            "error": exc.detail,
-                            "status_code": exc.status_code,
-                            "hint": "Revisa el índice y la estructura del query DSL e inténtalo de nuevo.",
-                        }
-                    except Exception as exc:
-                        logger.exception("Error inesperado ejecutando es_search it={}", iteration + 1)
-                        tool_result = {
-                            "error": f"{type(exc).__name__}: {exc}",
-                            "hint": "Inténtalo con una query más simple.",
-                        }
-
-                tool_outputs.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.get("id"),
-                    "content": json.dumps(tool_result, ensure_ascii=False),
-                })
-
-            # Append the assistant's tool-calling message and tool results to the conversation
-            messages.append({
-                "role": "assistant",
-                "content": message.get("content"),
-                "tool_calls": tool_calls,
-            })
-            messages.extend(tool_outputs)
-
-        # Exhausted iterations — ask model to summarize with what it has
-        logger.warning("Agentic loop agotó {} iteraciones, solicitando resumen final", MAX_ITERATIONS)
-        fallback = client.post(
-            f"{OPENROUTER_BASE_URL}/chat/completions",
-            headers=_openrouter_headers(api_key),
-            json={
-                "model": OPENROUTER_MODEL,
-                "messages": messages + [{"role": "user", "content": "Resume lo que has encontrado hasta ahora."}],
-                "temperature": 0.2,
-            },
-        )
-        if fallback.status_code < 400:
-            fb_message = fallback.json().get("choices", [{}])[0].get("message", {})
-            answer = _extract_text_from_message(fb_message).strip()
-        else:
-            answer = "Se superó el límite de iteraciones y no se pudo obtener una respuesta final."
-
-    return QueryResponse(answer=answer, tool_calls_made=total_tool_calls)
+    return QueryResponse(answer=answer, tool_calls_made=tool_calls_made)
