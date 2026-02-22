@@ -13,6 +13,18 @@ use common::dfs::{
 };
 use tokio::task::JoinSet;
 // use tokio::net::unix::pipe::Receiver;
+use chrono::{DateTime, Utc};
+use clap::Parser;
+use figment::{
+    providers::{Format, Serialized, Toml},
+    Figment,
+};
+use radix_trie::{Trie, TrieCommon};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::env;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::{
@@ -21,18 +33,6 @@ use std::{
     sync::Arc,
     time::{self},
 };
-use radix_trie::{Trie, TrieCommon};
-use chrono::{DateTime, Utc};
-use clap::Parser;
-use figment::{
-    providers::{Format, Serialized, Toml},
-    Figment,
-};
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::env;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use tokio::time::{self as tokio_time, Duration};
 use tonic::transport::Server;
@@ -471,9 +471,7 @@ impl Metadatanode {
         };
 
         match current_path {
-            Some(path) => {
-                self.update_file_status_internal(path, new_status).await
-            }
+            Some(path) => self.update_file_status_internal(path, new_status).await,
             None => {
                 self.audit_failure(
                     "FILE_SET_STATUS",
@@ -501,8 +499,13 @@ impl MetadataService for Metadatanode {
             .register_user(&payload.username, &payload.password)
             .map_err(Status::invalid_argument)?;
 
-        self.audit_success("USER_REGISTER", Some(payload.username.clone()), payload.username, json!({}))
-            .await;
+        self.audit_success(
+            "USER_REGISTER",
+            Some(payload.username.clone()),
+            payload.username,
+            json!({}),
+        )
+        .await;
 
         Ok(Response::new(RegisterUserResponse {
             success: true,
@@ -647,8 +650,13 @@ impl MetadataService for Metadatanode {
                 order: block.index as i64, //TODO: check var size i64 vs i32
             })
             .collect();
-        self.audit_success("FILE_GET_METADATA", Some(file_path.to_string()), claims.sub.clone(), json!({}))
-            .await;
+        self.audit_success(
+            "FILE_GET_METADATA",
+            Some(file_path.to_string()),
+            claims.sub.clone(),
+            json!({}),
+        )
+        .await;
         Ok(Response::new(GetFileResponse {
             file_id: file_metadata.id.clone(),
             path: file_metadata.path.clone(),
@@ -737,26 +745,26 @@ impl MetadataService for Metadatanode {
         }
         let files_lock = self.state.files.read().await;
         let files = match files_lock.get_raw_descendant(&dir_path) {
-            Some(sub_trie) => 
-            {
-                sub_trie.iter()
-                .filter(|(path, file)| {
-                    path.starts_with(&dir_path)
-                        && (claims.role == common::ROLE_MASTER || file.owner == claims.sub)
-                })
-                .map(|(_, v)| FileInfo {
-                    filename: v.name.clone(),
-                    is_directory: false,
-                    size: v.size,
-                    owner: v.owner.clone(),
-                    created_at: v.created_at,
-                    last_modified_at: v.last_modified_at,
-                    // checksum: v.checksum.clone(),
-                    file_status: v.file_status.to_string(),
-                })
-                .collect()
+            Some(sub_trie) => {
+                sub_trie
+                    .iter()
+                    .filter(|(path, file)| {
+                        path.starts_with(&dir_path)
+                            && (claims.role == common::ROLE_MASTER || file.owner == claims.sub)
+                    })
+                    .map(|(_, v)| FileInfo {
+                        filename: v.name.clone(),
+                        is_directory: false,
+                        size: v.size,
+                        owner: v.owner.clone(),
+                        created_at: v.created_at,
+                        last_modified_at: v.last_modified_at,
+                        // checksum: v.checksum.clone(),
+                        file_status: v.file_status.to_string(),
+                    })
+                    .collect()
             }
-            None => Vec::new()
+            None => Vec::new(),
         };
         info!(
             dir_path,
@@ -782,7 +790,7 @@ impl MetadataService for Metadatanode {
     ) -> Result<Response<RenameFileResponse>, Status> {
         info!("Received rename_file request");
         let claims = self.authorize_user_or_master(request.metadata())?;
-        
+
         let rename_req = request.into_inner();
         let mut files_lock = self.state.files.write().await;
         if files_lock.get(&rename_req.new_path).is_some() {
@@ -1191,8 +1199,15 @@ impl Metadatanode {
         Ok(true)
     }
 
-    async fn audit_success(&self, action: &'static str, resource: Option<String>, user: String, details: Value) {
-        self.audit(action, resource, true, "SUCCESS", user, details).await;
+    async fn audit_success(
+        &self,
+        action: &'static str,
+        resource: Option<String>,
+        user: String,
+        details: Value,
+    ) {
+        self.audit(action, resource, true, "SUCCESS", user, details)
+            .await;
     }
 
     async fn audit_failure(
@@ -1203,7 +1218,8 @@ impl Metadatanode {
         user: String,
         details: Value,
     ) {
-        self.audit(action, resource, false, status, user, details).await;
+        self.audit(action, resource, false, status, user, details)
+            .await;
     }
 
     async fn audit(
@@ -1442,14 +1458,7 @@ fn wal_writer(
 #[allow(clippy::type_complexity)]
 fn replay_wal(
     wal_path: &str,
-) -> Result<
-    (
-        Trie<String, FileMetadata>,
-        HashMap<u16, DatanodeInfo>,
-        u16,
-    ),
-    std::io::Error,
-> {
+) -> Result<(Trie<String, FileMetadata>, HashMap<u16, DatanodeInfo>, u16), std::io::Error> {
     let mut files = Trie::<String, FileMetadata>::new();
     let mut datanodes = HashMap::<u16, DatanodeInfo>::new();
     let mut max_node_id = 0u16;

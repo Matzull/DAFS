@@ -1,6 +1,6 @@
+use radix_trie::Trie;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use radix_trie::{Trie};
 use std::fmt::Display;
 use tokio::sync::RwLock;
 
