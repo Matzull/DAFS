@@ -719,8 +719,7 @@
       "fieldConfig": {
         "defaults": {
           "color": {
-            "fixedColor": "orange",
-            "mode": "fixed"
+            "mode": "palette-classic"
           },
           "custom": {
             "hideFrom": {
@@ -857,8 +856,8 @@
         "overrides": [
           {
             "matcher": {
-              "id": "byName",
-              "options": "SUCCESS"
+              "id": "byRegexp",
+              "options": "/.*SUCCESS/"
             },
             "properties": [
               {
@@ -872,8 +871,8 @@
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "FAILURE"
+              "id": "byRegexp",
+              "options": "/.*ERROR/"
             },
             "properties": [
               {
@@ -1485,6 +1484,37 @@
         }
       ],
       "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "datasource",
+        "uid": "grafana"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 47
+      },
+      "id": 105,
+      "options": {
+        "backendUrl": "http://localhost:8008",
+        "systemPrompt": "Eres un asistente de observabilidad para dashboards de Grafana.",
+        "title": "DAFS AI Assistant"
+      },
+      "pluginVersion": "0.1.0",
+      "targets": [
+        {
+          "refId": "A"
+        }
+      ],
+      "title": "",
+      "transparent": true,
+      "type": "dafs-ai-assistant-panel"
     }
   ],
   "preload": true,

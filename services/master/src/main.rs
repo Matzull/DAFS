@@ -21,7 +21,7 @@ use std::{
     sync::Arc,
     time::{self},
 };
-
+use radix_trie::{Trie, TrieCommon};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use figment::{
@@ -343,8 +343,7 @@ impl Metadatanode {
         let file_path_pathbuf = PathBuf::from(file_path.clone());
         let full_path = file_path_pathbuf.to_string_lossy().to_string();
         let mut files_lock = state.files.write().await;
-
-        if files_lock.contains_key(&full_path) {
+        if files_lock.get(&full_path).is_some() {
             error!("File {} already exists", full_path);
             return Err(format!("File {full_path} already exists"));
         }
@@ -426,6 +425,7 @@ impl Metadatanode {
             self.audit_success(
                 "FILE_SET_STATUS",
                 Some(file_path.clone()),
+                "MASTER".to_string(),
                 json!({
                     "status": new_status,
                     "queued_for_replication": queued_for_replication,
@@ -437,6 +437,7 @@ impl Metadatanode {
                 "FILE_SET_STATUS",
                 Some(file_path.clone()),
                 "NOT_FOUND",
+                "MASTER".to_string(),
                 json!({
                     "status": new_status,
                 }),
@@ -453,6 +454,39 @@ impl Metadatanode {
 
         Ok(())
     }
+
+    async fn update_file_status_by_id(
+        &self,
+        file_id: &str,
+        new_status: String,
+    ) -> Result<(), Status> {
+        // Resolve the current path from the id, since the file may have been
+        // renamed while replication was in progress.
+        let current_path = {
+            let files_lock = self.state.files.read().await;
+            files_lock
+                .iter()
+                .find(|(_, v)| v.id == file_id)
+                .map(|(k, _)| k.clone())
+        };
+
+        match current_path {
+            Some(path) => {
+                self.update_file_status_internal(path, new_status).await
+            }
+            None => {
+                self.audit_failure(
+                    "FILE_SET_STATUS",
+                    Some(file_id.to_string()),
+                    "NOT_FOUND",
+                    "MASTER".to_string(),
+                    json!({ "status": new_status, "reason": "id not found" }),
+                )
+                .await;
+                Err(Status::not_found("File not found"))
+            }
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -467,7 +501,7 @@ impl MetadataService for Metadatanode {
             .register_user(&payload.username, &payload.password)
             .map_err(Status::invalid_argument)?;
 
-        self.audit_success("USER_REGISTER", Some(payload.username), json!({}))
+        self.audit_success("USER_REGISTER", Some(payload.username.clone()), payload.username, json!({}))
             .await;
 
         Ok(Response::new(RegisterUserResponse {
@@ -489,7 +523,8 @@ impl MetadataService for Metadatanode {
 
         self.audit_success(
             "USER_LOGIN",
-            Some(payload.username),
+            Some(payload.username.clone()),
+            payload.username,
             json!({ "expires_at": expires_at }),
         )
         .await;
@@ -525,6 +560,7 @@ impl MetadataService for Metadatanode {
                     "FILE_CREATE",
                     Some(file_request.path.clone()),
                     "CREATE_ERROR",
+                    claims.sub.clone(),
                     json!({
                         "size": file_request.size,
                         "error": err,
@@ -548,6 +584,7 @@ impl MetadataService for Metadatanode {
         self.audit_success(
             "FILE_CREATE",
             Some(file_request.path.clone()),
+            claims.sub.clone(),
             json!({
                 "size": file_request.size,
                 "file_id": file_metadata.id.clone(),
@@ -581,6 +618,7 @@ impl MetadataService for Metadatanode {
                     "FILE_GET_METADATA",
                     Some(file_path.clone()),
                     "NOT_FOUND",
+                    claims.sub.clone(),
                     json!({}),
                 )
                 .await;
@@ -592,6 +630,7 @@ impl MetadataService for Metadatanode {
                 "FILE_GET_METADATA",
                 Some(file_path.clone()),
                 "FORBIDDEN",
+                claims.sub.clone(),
                 json!({}),
             )
             .await;
@@ -608,7 +647,7 @@ impl MetadataService for Metadatanode {
                 order: block.index as i64, //TODO: check var size i64 vs i32
             })
             .collect();
-        self.audit_success("FILE_GET_METADATA", Some(file_path.to_string()), json!({}))
+        self.audit_success("FILE_GET_METADATA", Some(file_path.to_string()), claims.sub.clone(), json!({}))
             .await;
         Ok(Response::new(GetFileResponse {
             file_id: file_metadata.id.clone(),
@@ -638,6 +677,7 @@ impl MetadataService for Metadatanode {
                     "FILE_DELETE",
                     Some(file_path.clone()),
                     "FORBIDDEN",
+                    claims.sub.clone(),
                     json!({}),
                 )
                 .await;
@@ -656,6 +696,7 @@ impl MetadataService for Metadatanode {
             self.audit_success(
                 "FILE_DELETE",
                 Some(file_path.to_string()),
+                claims.sub.clone(),
                 json!({
                     "queued_blocks": block_count,
                 }),
@@ -675,6 +716,7 @@ impl MetadataService for Metadatanode {
                 "FILE_DELETE",
                 Some(file_path.to_string()),
                 "NOT_FOUND",
+                claims.sub.clone(),
                 json!({}),
             )
             .await;
@@ -689,25 +731,33 @@ impl MetadataService for Metadatanode {
     ) -> Result<Response<ListDirectoryResponse>, Status> {
         info!("Received list_directory request");
         let claims = self.authorize_user_or_master(request.metadata())?;
-        let dir_path = request.into_inner().path;
+        let mut dir_path = request.into_inner().path;
+        if !dir_path.ends_with('/') {
+            dir_path.push('/');
+        }
         let files_lock = self.state.files.read().await;
-        let files: Vec<FileInfo> = files_lock
-            .iter()
-            .filter(|(path, file)| {
-                path.starts_with(&dir_path)
-                    && (claims.role == common::ROLE_MASTER || file.owner == claims.sub)
-            })
-            .map(|(_, v)| FileInfo {
-                filename: v.name.clone(),
-                is_directory: false,
-                size: v.size,
-                owner: v.owner.clone(),
-                created_at: v.created_at,
-                last_modified_at: v.last_modified_at,
-                // checksum: v.checksum.clone(),
-                file_status: v.file_status.to_string(),
-            })
-            .collect();
+        let files = match files_lock.get_raw_descendant(&dir_path) {
+            Some(sub_trie) => 
+            {
+                sub_trie.iter()
+                .filter(|(path, file)| {
+                    path.starts_with(&dir_path)
+                        && (claims.role == common::ROLE_MASTER || file.owner == claims.sub)
+                })
+                .map(|(_, v)| FileInfo {
+                    filename: v.name.clone(),
+                    is_directory: false,
+                    size: v.size,
+                    owner: v.owner.clone(),
+                    created_at: v.created_at,
+                    last_modified_at: v.last_modified_at,
+                    // checksum: v.checksum.clone(),
+                    file_status: v.file_status.to_string(),
+                })
+                .collect()
+            }
+            None => Vec::new()
+        };
         info!(
             dir_path,
             file_count = files.len(),
@@ -716,6 +766,7 @@ impl MetadataService for Metadatanode {
         self.audit_success(
             "DIRECTORY_LIST",
             Some(dir_path.to_string()),
+            claims.sub.clone(),
             json!({
                 "file_count": files.len(),
             }),
@@ -731,9 +782,10 @@ impl MetadataService for Metadatanode {
     ) -> Result<Response<RenameFileResponse>, Status> {
         info!("Received rename_file request");
         let claims = self.authorize_user_or_master(request.metadata())?;
+        
         let rename_req = request.into_inner();
         let mut files_lock = self.state.files.write().await;
-        if files_lock.contains_key(&rename_req.new_path) {
+        if files_lock.get(&rename_req.new_path).is_some() {
             warn!(
                 new_path = rename_req.new_path,
                 "Rename target already exists"
@@ -742,6 +794,7 @@ impl MetadataService for Metadatanode {
                 "FILE_RENAME",
                 Some(rename_req.old_path.clone()),
                 "ALREADY_EXISTS",
+                claims.sub.clone(),
                 json!({
                     "new_path": rename_req.new_path,
                 }),
@@ -758,6 +811,7 @@ impl MetadataService for Metadatanode {
                     "FILE_RENAME",
                     Some(rename_req.old_path.clone()),
                     "FORBIDDEN",
+                    claims.sub.clone(),
                     json!({
                         "new_path": rename_req.new_path,
                     }),
@@ -781,6 +835,7 @@ impl MetadataService for Metadatanode {
                 "FILE_RENAME",
                 Some(rename_req.old_path.clone()),
                 "NOT_FOUND",
+                claims.sub.clone(),
                 json!({
                     "new_path": rename_req.new_path,
                 }),
@@ -791,6 +846,7 @@ impl MetadataService for Metadatanode {
         self.audit_success(
             "FILE_RENAME",
             Some(rename_req.old_path.to_string()),
+            claims.sub.clone(),
             json!({
                 "new_path": rename_req.new_path,
             }),
@@ -841,6 +897,7 @@ impl MetadataService for Metadatanode {
             self.audit_success(
                 "DATANODE_REGISTER",
                 Some(format!("node:{new_id}")),
+                claims.sub.clone(),
                 json!({
                     "assigned_node_id": new_id,
                     "datanode_addr": datanode_addr,
@@ -896,6 +953,7 @@ impl MetadataService for Metadatanode {
             self.audit_success(
                 "DATANODE_HEARTBEAT",
                 Some(format!("node:{}", node_request.node_id)),
+                claims.sub.clone(),
                 json!({
                     "cpu_usage": node_request.cpu_usage,
                     "free_space": node_request.free_space,
@@ -909,6 +967,7 @@ impl MetadataService for Metadatanode {
                 "DATANODE_HEARTBEAT",
                 Some(format!("node:{}", node_request.node_id)),
                 audit_status,
+                claims.sub.clone(),
                 json!({
                     "cpu_usage": node_request.cpu_usage,
                     "free_space": node_request.free_space,
@@ -959,6 +1018,7 @@ impl Metadatanode {
                     "BLOCK_DELETE",
                     Some(block_id.to_string()),
                     "CONNECTION_ERROR",
+                    "MASTER".to_string(),
                     json!({
                         "datanode": datanode,
                         "error": err.to_string(),
@@ -988,6 +1048,7 @@ impl Metadatanode {
                 self.audit_success(
                     "BLOCK_DELETE",
                     Some(block_id.to_string()),
+                    "MASTER".to_string(),
                     json!({
                         "datanode": datanode,
                     }),
@@ -1004,6 +1065,7 @@ impl Metadatanode {
                     "BLOCK_DELETE",
                     Some(block_id.to_string()),
                     "DELETE_ERROR",
+                    "MASTER".to_string(),
                     json!({
                         "datanode": datanode,
                         "error": err.to_string(),
@@ -1063,6 +1125,7 @@ impl Metadatanode {
                             "BLOCK_REPLICATE",
                             Some(format!("datanode:{datanode_src}")),
                             "CONNECTION_ERROR",
+                            "MASTER".to_string(),
                             json!({
                                 "datanode": datanode_src,
                                 "error": err.to_string(),
@@ -1089,6 +1152,7 @@ impl Metadatanode {
                         this.audit_success(
                             "BLOCK_REPLICATE",
                             Some(format!("datanode:{datanode_src}")),
+                            "MASTER".to_string(),
                             json!({
                                 "datanode_src": datanode_src,
                             }),
@@ -1104,6 +1168,7 @@ impl Metadatanode {
                             "BLOCK_REPLICATE",
                             Some(format!("datanode:{datanode_src}")),
                             "REPLICATION_ERROR",
+                            "MASTER".to_string(),
                             json!({
                                 "datanode_src": datanode_src,
                                 "error": err.to_string(),
@@ -1116,7 +1181,7 @@ impl Metadatanode {
         }
         while let Some(res) = set.join_next().await {
             match res {
-                Ok(()) => { /* optional: audit success */ }
+                Ok(()) => {}
                 Err(join_err) => {
                     error!("Task join error: {}", join_err);
                     return Err(join_err.to_string());
@@ -1126,8 +1191,8 @@ impl Metadatanode {
         Ok(true)
     }
 
-    async fn audit_success(&self, action: &'static str, resource: Option<String>, details: Value) {
-        self.audit(action, resource, true, "SUCCESS", details).await;
+    async fn audit_success(&self, action: &'static str, resource: Option<String>, user: String, details: Value) {
+        self.audit(action, resource, true, "SUCCESS", user, details).await;
     }
 
     async fn audit_failure(
@@ -1135,9 +1200,10 @@ impl Metadatanode {
         action: &'static str,
         resource: Option<String>,
         status: &'static str,
+        user: String,
         details: Value,
     ) {
-        self.audit(action, resource, false, status, details).await;
+        self.audit(action, resource, false, status, user, details).await;
     }
 
     async fn audit(
@@ -1146,6 +1212,7 @@ impl Metadatanode {
         resource: Option<String>,
         success: bool,
         status: impl Into<String>,
+        user: impl Into<String>,
         details: Value,
     ) {
         let now = Utc::now();
@@ -1157,7 +1224,7 @@ impl Metadatanode {
                 component: "MASTER".to_string(),
                 success,
                 status: status.into(),
-                user: self.settings.audit_default_user.clone(),
+                user: user.into(),
                 details,
             })
             .await
@@ -1217,6 +1284,9 @@ fn block_replicator(
         info!("Block replicator started");
         while let Some(file_metadata) = block_replicator_rx.recv().await {
             debug!("Got file to replicate");
+            // Capture the id now; the path may change if the file is renamed
+            // while replication is in progress.
+            let file_id = file_metadata.id.clone();
             let mut mapping = HashMap::<u16, HashMap<u16, Vec<String>>>::new(); //Datanode_src:[Datanode_dst: [Blocks]]
             for block in file_metadata.blocks {
                 let mut locations = block.locations.iter();
@@ -1237,13 +1307,12 @@ fn block_replicator(
                 }
             }
             let _ = master_ref.notify_datanodes_to_replicate(mapping).await;
-            master_ref
-                .update_file_status_internal(
-                    file_metadata.path.clone(),
-                    FileStatus::Replicated.to_string(),
-                )
+            if let Err(e) = master_ref
+                .update_file_status_by_id(&file_id, FileStatus::Replicated.to_string())
                 .await
-                .unwrap();
+            {
+                warn!("Could not set file {} status to Replicated: {}", file_id, e);
+            }
         }
     });
 }
@@ -1375,13 +1444,13 @@ fn replay_wal(
     wal_path: &str,
 ) -> Result<
     (
-        HashMap<String, FileMetadata>,
+        Trie<String, FileMetadata>,
         HashMap<u16, DatanodeInfo>,
         u16,
     ),
     std::io::Error,
 > {
-    let mut files = HashMap::<String, FileMetadata>::new();
+    let mut files = Trie::<String, FileMetadata>::new();
     let mut datanodes = HashMap::<u16, DatanodeInfo>::new();
     let mut max_node_id = 0u16;
 

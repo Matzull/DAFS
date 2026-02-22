@@ -81,11 +81,11 @@ cleanup() {
 		bash "$CLEAN_SCRIPT" >/dev/null 2>&1 || true
 	fi
 
-	rm -rf "$BASE_DIR" "$DOWNLOAD_DIR" "$TOKENS_DIR"
-	rm -f "$MASTER_LOG" "$DATANODE1_LOG" "$DATANODE2_LOG"
-	rmdir testing/audit_volume 2>/dev/null || true
-	rmdir testing/audit_downloads 2>/dev/null || true
-	rmdir testing/audit_tokens 2>/dev/null || true
+	# rm -rf "$BASE_DIR" "$DOWNLOAD_DIR" "$TOKENS_DIR"
+	# rm -f "$MASTER_LOG" "$DATANODE1_LOG" "$DATANODE2_LOG"
+	# rmdir testing/audit_volume 2>/dev/null || true
+	# rmdir testing/audit_downloads 2>/dev/null || true
+	# rmdir testing/audit_tokens 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -120,7 +120,7 @@ start_services() {
 	fi
 
 	echo "== Starting master =="
-	"$MASTER_BIN" --config-path services/master/config.toml >"$MASTER_LOG" 2>&1 &
+	"$MASTER_BIN" --config-path services/master/config.toml --log-level debug >"$MASTER_LOG" 2>&1 &
 	MASTER_PID=$!
 
 	echo "== Starting datanode1 =="

@@ -24,6 +24,7 @@ dotenvy = "0.15.7"
 raft = "0.7.0"
 argon2 = { workspace = true }
 rusqlite = { workspace = true }
+radix_trie = "0.3.0"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use radix_trie::{Trie};
 use std::fmt::Display;
 use tokio::sync::RwLock;
 
@@ -67,7 +68,7 @@ pub struct FileMetadata {
 
 #[derive(Debug)]
 pub struct MasterState {
-    pub files: RwLock<HashMap<String, FileMetadata>>,
+    pub files: RwLock<Trie<String, FileMetadata>>,
     pub available_datanodes: RwLock<HashMap<u16, DatanodeInfo>>,
 }
 
