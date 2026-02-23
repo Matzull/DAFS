@@ -216,7 +216,11 @@ async fn run(
             );
             println!("{}", "-".repeat(124));
             for file in response.files {
-                let file_type = if file.is_directory { "Directory" } else { "File" };
+                let file_type = if file.is_directory {
+                    "Directory"
+                } else {
+                    "File"
+                };
                 let size_str = if file.is_directory {
                     "-".to_string()
                 } else {
