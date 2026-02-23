@@ -5,7 +5,9 @@ use common::dfs::metadata_service_client::MetadataServiceClient;
 use common::dfs::read_block_response::ResponseData;
 use common::dfs::write_block_request::RequestData;
 use common::dfs::{
-    CreateFileRequest, CreateFileResponse, DeleteFileRequest, GetFileRequest, ListDirectoryRequest, LoginUserRequest, ReadBlockRequest, RegisterUserRequest, RenameFileRequest, SetFileStatusRequest, WriteBlockRequest, WriteBlockResponse
+    CreateFileRequest, CreateFileResponse, DeleteFileRequest, GetFileRequest, ListDirectoryRequest,
+    LoginUserRequest, ReadBlockRequest, RegisterUserRequest, RenameFileRequest,
+    SetFileStatusRequest, WriteBlockRequest, WriteBlockResponse,
 };
 use crc32fast::Hasher;
 use figment::{
@@ -727,13 +729,13 @@ async fn main() {
             rename_file(Arc::clone(&settings), resolved_old, resolved_new)
                 .await
                 .map(|_| info!("File renamed/moved successfully"))
-        },
+        }
         Some(Commands::Delete { file_path }) => {
             let file_path = file_path.unwrap_or_else(|| settings.default_rename_old_path.clone());
             delete_file(Arc::clone(&settings), file_path)
                 .await
                 .map(|_| info!("File deleted successfully"))
-        },
+        }
         None => {
             error!("No command provided. Use --help for usage information.");
             std::process::exit(1);
