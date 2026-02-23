@@ -5,9 +5,8 @@ edition = "2021"
 
 [dependencies]
 tokio.workspace = true
-tonic.workspace = true
 common = { path = "../../common" }
-tokio-stream.workspace = true
+fscore = { path = "../fscore" }
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
@@ -15,10 +14,6 @@ clap = { version = "4.5", features = ["derive"] }
 # Logs
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tokio-util = "0.7.18"
-config-rs = { workspace = true }
 serde.workspace = true
 figment = { workspace = true }
-bytes ={ workspace = true}
 chrono = { workspace = true }
-crc32fast = { workspace = true }
