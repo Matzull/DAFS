@@ -479,12 +479,20 @@ impl DataNodeService for Datanode {
         let mut file_path_pathbuf = PathBuf::from(&self.settings.data_folder);
         file_path_pathbuf.push(&block_id[..2]);
         file_path_pathbuf.push(&block_id[2..4]);
+        file_path_pathbuf.push(&block_id);
         let _ = fs::remove_file(&file_path_pathbuf)
-            .await
-            .map_err(|err| {
-                warn!(block_id = %block_id, path = ?file_path_pathbuf, "Could not delete block file: {}", err);
-                Status::not_found(format!("Could not delete file {err}"))
-            });
+        .await
+        .map_err(|err| {
+            warn!(block_id = %block_id, path = ?file_path_pathbuf, "Could not delete block file: {}", err);
+            Status::not_found(format!("Could not delete file {err}"))
+        });
+        if let Some(parent_dir) = file_path_pathbuf.parent() {
+            if let Ok(mut entries) = fs::read_dir(parent_dir).await {
+                if entries.next_entry().await.ok().flatten().is_none() {
+                    let _ = fs::remove_dir(parent_dir).await;
+                }
+            }
+        }
         debug!(block_id = %block_id, "Block deleted successfully");
         Ok(Response::new(DeleteBlockResponse {
             delete_result: Some(common::dfs::delete_block_response::DeleteResult::Success(

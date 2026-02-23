@@ -5,9 +5,7 @@ use common::dfs::metadata_service_client::MetadataServiceClient;
 use common::dfs::read_block_response::ResponseData;
 use common::dfs::write_block_request::RequestData;
 use common::dfs::{
-    CreateFileRequest, CreateFileResponse, GetFileRequest, ListDirectoryRequest, LoginUserRequest,
-    ReadBlockRequest, RegisterUserRequest, RenameFileRequest, SetFileStatusRequest,
-    WriteBlockRequest, WriteBlockResponse,
+    CreateFileRequest, CreateFileResponse, DeleteFileRequest, GetFileRequest, ListDirectoryRequest, LoginUserRequest, ReadBlockRequest, RegisterUserRequest, RenameFileRequest, SetFileStatusRequest, WriteBlockRequest, WriteBlockResponse
 };
 use crc32fast::Hasher;
 use figment::{
@@ -200,6 +198,11 @@ enum Commands {
         /// Local output file path
         #[arg(short, long)]
         output: String,
+    },
+
+    Delete {
+        #[arg(short, long)]
+        file_path: Option<String>,
     },
     /// List directory contents
     List {
@@ -611,6 +614,25 @@ async fn rename_file(
 }
 
 #[instrument(skip(settings))]
+async fn delete_file(
+    settings: Arc<InternalSettings>,
+    file_path: String,
+) -> Result<bool, Box<dyn Error>> {
+    info!(file_path, "Starting deleting file");
+    let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
+    let access_token = read_access_token(&settings.access_token_path)?;
+
+    let mut request = Request::new(DeleteFileRequest {
+        path: file_path.clone(),
+        user_id: settings.default_user_id.clone(),
+    });
+    common::attach_bearer_token(&mut request, &access_token)?;
+    client.delete_file(request).await?;
+    info!(file_path, "File rename completed successfully");
+    Ok(true)
+}
+
+#[instrument(skip(settings))]
 async fn register_user(
     settings: Arc<InternalSettings>,
     username: String,
@@ -705,7 +727,13 @@ async fn main() {
             rename_file(Arc::clone(&settings), resolved_old, resolved_new)
                 .await
                 .map(|_| info!("File renamed/moved successfully"))
-        }
+        },
+        Some(Commands::Delete { file_path }) => {
+            let file_path = file_path.unwrap_or_else(|| settings.default_rename_old_path.clone());
+            delete_file(Arc::clone(&settings), file_path)
+                .await
+                .map(|_| info!("File deleted successfully"))
+        },
         None => {
             error!("No command provided. Use --help for usage information.");
             std::process::exit(1);

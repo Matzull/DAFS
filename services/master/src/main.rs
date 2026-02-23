@@ -1013,7 +1013,7 @@ impl Metadatanode {
         block_id: &str,
         datanode: String,
     ) -> Result<bool, String> {
-        info!(block_id, datanode, "Requesting datanode to delete block");
+        debug!(block_id, datanode, "Requesting datanode to delete block");
         let mut client = match data_node_service_client::DataNodeServiceClient::connect(
             datanode.clone(),
         )
@@ -1052,7 +1052,7 @@ impl Metadatanode {
             .await
         {
             Ok(_) => {
-                info!(block_id, datanode, "Block deletion confirmed by datanode");
+                debug!(block_id, datanode, "Block deletion confirmed by datanode");
                 self.audit_success(
                     "BLOCK_DELETE",
                     Some(block_id.to_string()),
