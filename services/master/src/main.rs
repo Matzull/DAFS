@@ -637,6 +637,7 @@ impl MetadataService for Metadatanode {
                 json!({}),
             )
             .await;
+            error!("User {} is not allowed to access metadata for file {}", claims.sub, file_path);
             return Err(Status::permission_denied("Not allowed to access this file"));
         }
         let datanodes = self.state.available_datanodes.read().await;

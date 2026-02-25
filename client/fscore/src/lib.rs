@@ -62,7 +62,7 @@ impl Default for DafsSettings {
             default_list_path: "/".to_string(),
             default_rename_old_path: "/".to_string(),
             default_rename_new_path: "/".to_string(),
-            access_token_path: "client/cli/.token".to_string(),
+            access_token_path: "client/.token".to_string(),
         }
     }
 }

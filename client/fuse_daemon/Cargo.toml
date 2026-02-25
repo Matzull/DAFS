@@ -4,3 +4,19 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+tokio.workspace = true
+common = { path = "../../common" }
+fscore = { path = "../fscore" }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Logs
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde.workspace = true
+figment = { workspace = true }
+chrono = { workspace = true }
+bimap = "0.6.3"
+fuser = "0.17.0"
+libc = "0.2.182"
