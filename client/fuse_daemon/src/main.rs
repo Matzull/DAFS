@@ -1,5 +1,6 @@
 use bimap::BiMap;
 use clap::{Parser, Subcommand};
+use core::error;
 use figment::{
     providers::{Format, Serialized, Toml},
     Figment,
@@ -10,8 +11,7 @@ use fuser::{
     ReplyAttr, ReplyDirectory, ReplyEntry, Request,
 };
 use libc::{EIO, ENOENT, ENOTDIR};
-use serde::{Deserialize, Serialize, de};
-use core::error;
+use serde::{de, Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -220,7 +220,11 @@ impl Filesystem for DAFSfs {
 
     // 2. Permitir que el OS encuentre "hola.txt" dentro de la raíz
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        info!(parent = parent.0, name = name.to_string_lossy().to_string(), "Looking up entry");
+        info!(
+            parent = parent.0,
+            name = name.to_string_lossy().to_string(),
+            "Looking up entry"
+        );
         let parent_path = {
             let map = self.inode_map.blocking_read();
             match map.get_by_left(&parent.0) {
@@ -231,7 +235,11 @@ impl Filesystem for DAFSfs {
                 }
             }
         };
-        info!(parent_path = parent_path, name = name.to_string_lossy().to_string(), "Resolved parent path");
+        info!(
+            parent_path = parent_path,
+            name = name.to_string_lossy().to_string(),
+            "Resolved parent path"
+        );
         let full_path = self.join_path(&parent_path, name);
         let token = self.token.blocking_read().clone();
         let file_metadata = self.runtime.block_on(fscore::get_file_metadata(
@@ -251,7 +259,11 @@ impl Filesystem for DAFSfs {
                 return;
             }
         };
-        info!(full_path = full_path, size = file_metadata.size, "File metadata retrieved successfully");
+        info!(
+            full_path = full_path,
+            size = file_metadata.size,
+            "File metadata retrieved successfully"
+        );
         let ino = {
             let mut map = self.inode_map.blocking_write();
             match map.get_by_right(&full_path) {
@@ -319,7 +331,11 @@ impl Filesystem for DAFSfs {
                 return;
             }
         };
-        info!(path = path, file_count = list_directory_response.files.len(), "Directory listed successfully");
+        info!(
+            path = path,
+            file_count = list_directory_response.files.len(),
+            "Directory listed successfully"
+        );
         let parent_path = self.parent_path(&path);
         let parent_ino = {
             let map = self.inode_map.blocking_read();
@@ -328,7 +344,11 @@ impl Filesystem for DAFSfs {
 
         let mut files = list_directory_response.files;
         files.sort_by(|a, b| a.filename.cmp(&b.filename));
-        info!(path = path, file_count = files.len(), "Sorted directory entries");
+        info!(
+            path = path,
+            file_count = files.len(),
+            "Sorted directory entries"
+        );
         let mut entries = vec![
             (ino, FileType::Directory, ".".to_string()),
             (
@@ -359,7 +379,11 @@ impl Filesystem for DAFSfs {
                 file.filename,
             ));
         }
-        info!(path = path, entry_count = entries.len(), "Prepared directory entries for reply");
+        info!(
+            path = path,
+            entry_count = entries.len(),
+            "Prepared directory entries for reply"
+        );
 
         for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
             // El offset ayuda al kernel a saber por dónde va la lectura
