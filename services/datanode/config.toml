@@ -19,6 +19,7 @@ read_buffer_size = 65536
 write_buffer_size = 131072
 
 metadata_node_address = "http://[::1]:9090"
+metadata_node_endpoints = ["http://[::1]:9090"]
 
 # Replication worker settings
 replication_max_parallel_blocks = 16

@@ -1,5 +1,10 @@
 mod auth;
 mod models;
+mod raft {
+    pub mod runtime;
+    pub mod state_machine;
+    pub mod types;
+}
 use crate::auth::AuthManager;
 use crate::models::{BlockMetadata, DatanodeInfo, FileMetadata, FileStatus, MasterState};
 use common::dfs::metadata_service_server::{MetadataService, MetadataServiceServer};
@@ -11,6 +16,13 @@ use common::dfs::{
     RegisterUserResponse, RenameFileRequest, RenameFileResponse, ReplicateBlocksRequest,
     SetFileStatusRequest, SetFileStatusResponse,
 };
+use common::raft::raft_service_server::{RaftService, RaftServiceServer};
+use common::raft::{
+    AppendEntriesRequest, AppendEntriesResponse, ChangeMembershipRequest, ChangeMembershipResponse,
+    GetLeaderRequest, GetLeaderResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
+};
+use openraft::error::InstallSnapshotError;
 use tokio::task::JoinSet;
 // use tokio::net::unix::pipe::Receiver;
 use chrono::{DateTime, Utc};
@@ -34,11 +46,13 @@ use std::{
     time::{self},
 };
 use tokio::sync::{mpsc, RwLock, Semaphore};
-use tokio::time::{self as tokio_time, Duration};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
+
+use crate::raft::runtime::MasterRaftContext;
+use crate::raft::types::{MetadataCommand, MetadataResponse, NodeId};
 
 const DEFAULT_BLOCK_SIZE: i64 = 64 * 1024;
 const DEFAULT_REPLICATION: i32 = 2;
@@ -61,6 +75,9 @@ const DEFAULT_AUTH_DB_PATH: &str = "services/master/users.db";
 const DEFAULT_JWT_SECRET: &str = "change-me-master-secret";
 const DEFAULT_JWT_EXP_SECONDS: i64 = 3600;
 const DEFAULT_SERVICE_TOKEN_EXP_SECONDS: i64 = 300;
+const DEFAULT_RAFT_NODE_ID: u64 = 1;
+const DEFAULT_RAFT_CLUSTER_NAME: &str = "dafs-metadata";
+const DEFAULT_RAFT_BOOTSTRAP: bool = false;
 
 #[derive(Parser, Debug, Serialize, Deserialize)]
 pub struct InternalSettings {
@@ -85,6 +102,10 @@ pub struct InternalSettings {
     pub jwt_secret: String,
     pub jwt_exp_seconds: i64,
     pub service_token_exp_seconds: i64,
+    pub raft_node_id: u64,
+    pub raft_cluster_name: String,
+    pub raft_bootstrap: bool,
+    pub raft_initial_members: Vec<String>,
 }
 
 pub fn load_config() -> InternalSettings {
@@ -113,6 +134,10 @@ pub fn load_config() -> InternalSettings {
             jwt_secret: DEFAULT_JWT_SECRET.to_string(),
             jwt_exp_seconds: DEFAULT_JWT_EXP_SECONDS,
             service_token_exp_seconds: DEFAULT_SERVICE_TOKEN_EXP_SECONDS,
+            raft_node_id: DEFAULT_RAFT_NODE_ID,
+            raft_cluster_name: DEFAULT_RAFT_CLUSTER_NAME.to_string(),
+            raft_bootstrap: DEFAULT_RAFT_BOOTSTRAP,
+            raft_initial_members: Vec::new(),
         }))
         .merge(Toml::file(&cli.config_path))
         .merge(Serialized::globals(cli));
@@ -230,6 +255,26 @@ struct Cli {
     #[serde(skip_serializing_if = "Option::is_none")]
     service_token_exp_seconds: Option<i64>,
 
+    /// Raft node id for this master
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raft_node_id: Option<u64>,
+
+    /// Logical raft cluster name
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raft_cluster_name: Option<String>,
+
+    /// Bootstrap cluster membership on startup if node is pristine
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raft_bootstrap: Option<bool>,
+
+    /// Initial raft members in format <id>=<addr>; can be specified multiple times
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raft_initial_members: Option<Vec<String>>,
+
     #[arg(short, long, default_value = "config.toml")]
     #[serde(skip)]
     pub config_path: String,
@@ -265,16 +310,132 @@ enum WalOperation {
     RegisterDatanode { datanode: DatanodeInfo },
 }
 
-#[derive(Debug)]
 pub struct Metadatanode {
     pub state: Arc<MasterState>,
     pub garbage_collector_tx: mpsc::Sender<Vec<BlockMetadata>>,
     pub block_replicator_tx: mpsc::Sender<FileMetadata>,
     pub audit_tx: mpsc::Sender<AuditLog>,
-    wal_tx: mpsc::Sender<WalRecord>,
     pub settings: Arc<InternalSettings>,
     pub auth: Arc<AuthManager>,
     pub next_node_id: AtomicU16,
+    pub raft_ctx: Arc<MasterRaftContext>,
+}
+
+impl std::fmt::Debug for Metadatanode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Metadatanode")
+            .field("settings", &self.settings)
+            .field(
+                "next_node_id",
+                &self.next_node_id.load(std::sync::atomic::Ordering::SeqCst),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+struct RaftRpcNode {
+    raft_ctx: Arc<MasterRaftContext>,
+}
+
+impl RaftRpcNode {
+    fn new(raft_ctx: Arc<MasterRaftContext>) -> Self {
+        Self { raft_ctx }
+    }
+}
+
+#[tonic::async_trait]
+impl RaftService for RaftRpcNode {
+    async fn append_entries(
+        &self,
+        request: Request<AppendEntriesRequest>,
+    ) -> Result<Response<AppendEntriesResponse>, Status> {
+        let rpc: openraft::raft::AppendEntriesRequest<crate::raft::types::TypeConfig> =
+            serde_json::from_slice(&request.into_inner().payload).map_err(|err| {
+                Status::invalid_argument(format!("Invalid append_entries payload: {err}"))
+            })?;
+
+        let result = self.raft_ctx.raft.append_entries(rpc).await;
+        let payload = serde_json::to_vec(&result).map_err(|err| {
+            Status::internal(format!("Could not encode append_entries response: {err}"))
+        })?;
+
+        Ok(Response::new(AppendEntriesResponse { payload }))
+    }
+
+    async fn vote(&self, request: Request<VoteRequest>) -> Result<Response<VoteResponse>, Status> {
+        let rpc: openraft::raft::VoteRequest<NodeId> =
+            serde_json::from_slice(&request.into_inner().payload)
+                .map_err(|err| Status::invalid_argument(format!("Invalid vote payload: {err}")))?;
+
+        let result = self.raft_ctx.raft.vote(rpc).await;
+        let payload = serde_json::to_vec(&result)
+            .map_err(|err| Status::internal(format!("Could not encode vote response: {err}")))?;
+
+        Ok(Response::new(VoteResponse { payload }))
+    }
+
+    async fn install_snapshot(
+        &self,
+        request: Request<InstallSnapshotRequest>,
+    ) -> Result<Response<InstallSnapshotResponse>, Status> {
+        let rpc: openraft::raft::InstallSnapshotRequest<crate::raft::types::TypeConfig> =
+            serde_json::from_slice(&request.into_inner().payload).map_err(|err| {
+                Status::invalid_argument(format!("Invalid install_snapshot payload: {err}"))
+            })?;
+
+        let result: Result<
+            openraft::raft::InstallSnapshotResponse<NodeId>,
+            openraft::error::RaftError<NodeId, InstallSnapshotError>,
+        > = self.raft_ctx.raft.install_snapshot(rpc).await;
+        let payload = serde_json::to_vec(&result).map_err(|err| {
+            Status::internal(format!("Could not encode install_snapshot response: {err}"))
+        })?;
+
+        Ok(Response::new(InstallSnapshotResponse { payload }))
+    }
+
+    async fn get_leader(
+        &self,
+        _request: Request<GetLeaderRequest>,
+    ) -> Result<Response<GetLeaderResponse>, Status> {
+        if let Some((leader_id, leader_address)) = self.raft_ctx.leader_hint().await {
+            return Ok(Response::new(GetLeaderResponse {
+                known: true,
+                leader_id,
+                leader_address,
+            }));
+        }
+
+        Ok(Response::new(GetLeaderResponse {
+            known: false,
+            leader_id: 0,
+            leader_address: String::new(),
+        }))
+    }
+
+    async fn change_membership(
+        &self,
+        request: Request<ChangeMembershipRequest>,
+    ) -> Result<Response<ChangeMembershipResponse>, Status> {
+        let req = request.into_inner();
+        let result = self
+            .raft_ctx
+            .raft
+            .change_membership(req.voter_ids, req.retain_removed_as_learners)
+            .await;
+
+        match result {
+            Ok(_) => Ok(Response::new(ChangeMembershipResponse {
+                accepted: true,
+                message: String::new(),
+            })),
+            Err(err) => Ok(Response::new(ChangeMembershipResponse {
+                accepted: false,
+                message: err.to_string(),
+            })),
+        }
+    }
 }
 
 impl Clone for Metadatanode {
@@ -284,10 +445,10 @@ impl Clone for Metadatanode {
             garbage_collector_tx: self.garbage_collector_tx.clone(),
             block_replicator_tx: self.block_replicator_tx.clone(),
             audit_tx: self.audit_tx.clone(),
-            wal_tx: self.wal_tx.clone(),
             settings: Arc::clone(&self.settings),
             auth: Arc::clone(&self.auth),
             next_node_id: AtomicU16::new(self.next_node_id.load(Ordering::SeqCst)),
+            raft_ctx: Arc::clone(&self.raft_ctx),
         }
     }
 }
@@ -327,6 +488,36 @@ impl Metadatanode {
         claims.role == common::ROLE_MASTER || owner == claims.sub
     }
 
+    async fn leader_hint_message(&self) -> String {
+        if let Some((leader_id, leader_addr)) = self.raft_ctx.leader_hint().await {
+            return format!("not leader; leader_id={leader_id}; leader_addr={leader_addr}");
+        }
+        "not leader; leader unknown".to_string()
+    }
+
+    async fn ensure_leader_for_write(&self) -> Result<(), Status> {
+        if self.raft_ctx.is_local_leader().await {
+            return Ok(());
+        }
+
+        Err(Status::failed_precondition(
+            self.leader_hint_message().await,
+        ))
+    }
+
+    async fn raft_write(&self, command: MetadataCommand) -> Result<MetadataResponse, Status> {
+        let resp = match self.raft_ctx.raft.client_write(command).await {
+            Ok(response) => response,
+            Err(_) => {
+                return Err(Status::failed_precondition(
+                    self.leader_hint_message().await,
+                ));
+            }
+        };
+
+        Ok(resp.data)
+    }
+
     #[instrument(skip(state, settings))]
     async fn _create_file(
         &self,
@@ -342,7 +533,7 @@ impl Metadatanode {
         }
         let file_path_pathbuf = PathBuf::from(file_path.clone());
         let full_path = file_path_pathbuf.to_string_lossy().to_string();
-        let mut files_lock = state.files.write().await;
+        let files_lock = state.files.read().await;
         if files_lock.get(&full_path).is_some() {
             error!("File {} already exists", full_path);
             return Err(format!("File {full_path} already exists"));
@@ -402,8 +593,7 @@ impl Metadatanode {
             blocks,
         };
 
-        files_lock.insert(full_path, file.clone());
-        info!("File metadata created successfully for {}", file.id);
+        info!("File metadata planned for {}", file.id);
         return Ok(file);
     }
 
@@ -412,27 +602,7 @@ impl Metadatanode {
         file_path: String,
         new_status: String,
     ) -> Result<(), Status> {
-        let mut files_lock = self.state.files.write().await;
-        if let Some(file_metadata) = files_lock.get_mut(&file_path) {
-            file_metadata.file_status = FileStatus::str_to_tok(&new_status);
-            let queued_for_replication = FileStatus::str_to_tok(&new_status) == FileStatus::Ready;
-            if queued_for_replication {
-                self.block_replicator_tx
-                    .send(file_metadata.clone())
-                    .await
-                    .ok();
-            }
-            self.audit_success(
-                "FILE_SET_STATUS",
-                Some(file_path.clone()),
-                "MASTER".to_string(),
-                json!({
-                    "status": new_status,
-                    "queued_for_replication": queued_for_replication,
-                }),
-            )
-            .await;
-        } else {
+        if self.state.files.read().await.get(&file_path).is_none() {
             self.audit_failure(
                 "FILE_SET_STATUS",
                 Some(file_path.clone()),
@@ -446,10 +616,28 @@ impl Metadatanode {
             return Err(Status::not_found("File not found"));
         }
 
-        self.wal(WalOperation::SetFileStatus {
-            path: file_path,
-            status: new_status,
+        self.raft_write(MetadataCommand::SetFileStatus {
+            path: file_path.clone(),
+            status: new_status.clone(),
         })
+        .await?;
+
+        let queued_for_replication = FileStatus::str_to_tok(&new_status) == FileStatus::Ready;
+        if queued_for_replication {
+            if let Some(file_metadata) = self.state.files.read().await.get(&file_path).cloned() {
+                self.block_replicator_tx.send(file_metadata).await.ok();
+            }
+        }
+
+        self.audit_success(
+            "FILE_SET_STATUS",
+            Some(file_path),
+            "MASTER".to_string(),
+            json!({
+                "status": new_status,
+                "queued_for_replication": queued_for_replication,
+            }),
+        )
         .await;
 
         Ok(())
@@ -544,6 +732,7 @@ impl MetadataService for Metadatanode {
         &self,
         request: Request<CreateFileRequest>,
     ) -> Result<Response<CreateFileResponse>, Status> {
+        self.ensure_leader_for_write().await?;
         info!("Received create_file request");
         let claims = self.authorize_user_or_master(request.metadata())?;
         let file_request = request.into_inner();
@@ -573,6 +762,12 @@ impl MetadataService for Metadatanode {
                 return Err(Status::internal("Could not create file metadata"));
             }
         };
+
+        self.raft_write(MetadataCommand::CreateFile {
+            file: file_metadata.clone(),
+        })
+        .await?;
+
         let datanodes = self.state.available_datanodes.read().await;
         let block_assignments: Vec<BlockAssignment> = file_metadata
             .blocks
@@ -595,10 +790,7 @@ impl MetadataService for Metadatanode {
             }),
         )
         .await;
-        self.wal(WalOperation::CreateFile {
-            file: file_metadata.clone(),
-        })
-        .await;
+
         Ok(Response::new(CreateFileResponse {
             file_id: file_metadata.id,
             blocks: block_assignments,
@@ -679,11 +871,16 @@ impl MetadataService for Metadatanode {
         &self,
         request: Request<DeleteFileRequest>,
     ) -> Result<Response<DeleteFileResponse>, Status> {
+        self.ensure_leader_for_write().await?;
         info!("Received delete_file request");
         let claims = self.authorize_user_or_master(request.metadata())?;
         let file_path = request.into_inner().path;
-        let mut files = self.state.files.write().await;
-        if let Some(existing) = files.get(&file_path) {
+        let existing_file = {
+            let files = self.state.files.read().await;
+            files.get(&file_path).cloned()
+        };
+
+        if let Some(existing) = existing_file.as_ref() {
             if !self.can_access_path(&existing.owner, &claims) {
                 self.audit_failure(
                     "FILE_DELETE",
@@ -697,9 +894,14 @@ impl MetadataService for Metadatanode {
             }
         }
 
-        if let Some(filemetadata) = files.remove(&file_path) {
+        if let Some(filemetadata) = existing_file {
+            self.raft_write(MetadataCommand::DeleteFile {
+                path: file_path.clone(),
+            })
+            .await?;
+
             let block_count = filemetadata.blocks.len();
-            let to_delete = filemetadata.blocks;
+            let to_delete = filemetadata.blocks.clone();
             self.garbage_collector_tx.send(to_delete).await.ok();
             info!(
                 file_path,
@@ -714,10 +916,7 @@ impl MetadataService for Metadatanode {
                 }),
             )
             .await;
-            self.wal(WalOperation::DeleteFile {
-                path: file_path.to_string(),
-            })
-            .await;
+
             Ok(Response::new(DeleteFileResponse {
                 success: true,
                 error_message: "".to_string(),
@@ -792,11 +991,12 @@ impl MetadataService for Metadatanode {
         &self,
         request: Request<RenameFileRequest>,
     ) -> Result<Response<RenameFileResponse>, Status> {
+        self.ensure_leader_for_write().await?;
         info!("Received rename_file request");
         let claims = self.authorize_user_or_master(request.metadata())?;
 
         let rename_req = request.into_inner();
-        let mut files_lock = self.state.files.write().await;
+        let files_lock = self.state.files.read().await;
         if files_lock.get(&rename_req.new_path).is_some() {
             warn!(
                 new_path = rename_req.new_path,
@@ -817,6 +1017,7 @@ impl MetadataService for Metadatanode {
                 rename_req.new_path
             )));
         }
+
         if let Some(existing) = files_lock.get(&rename_req.old_path) {
             if !self.can_access_path(&existing.owner, &claims) {
                 self.audit_failure(
@@ -831,16 +1032,6 @@ impl MetadataService for Metadatanode {
                 .await;
                 return Err(Status::permission_denied("Not allowed to rename this file"));
             }
-        }
-
-        if let Some(mut file_metadata) = files_lock.remove(&rename_req.old_path) {
-            file_metadata.name = rename_req.new_path.clone();
-            info!(
-                old_path = rename_req.old_path,
-                new_path = rename_req.new_path,
-                "File renamed successfully"
-            );
-            files_lock.insert(rename_req.new_path.clone(), file_metadata);
         } else {
             warn!(old_path = rename_req.old_path, "File not found for rename");
             self.audit_failure(
@@ -855,6 +1046,20 @@ impl MetadataService for Metadatanode {
             .await;
             return Err(Status::not_found("Couldnt rename file"));
         }
+        drop(files_lock);
+
+        self.raft_write(MetadataCommand::RenameFile {
+            old_path: rename_req.old_path.clone(),
+            new_path: rename_req.new_path.clone(),
+        })
+        .await?;
+
+        info!(
+            old_path = rename_req.old_path,
+            new_path = rename_req.new_path,
+            "File renamed successfully"
+        );
+
         self.audit_success(
             "FILE_RENAME",
             Some(rename_req.old_path.to_string()),
@@ -863,11 +1068,6 @@ impl MetadataService for Metadatanode {
                 "new_path": rename_req.new_path,
             }),
         )
-        .await;
-        self.wal(WalOperation::RenameFile {
-            old_path: rename_req.old_path.to_string(),
-            new_path: rename_req.new_path.to_string(),
-        })
         .await;
 
         Ok(Response::new(RenameFileResponse {
@@ -881,11 +1081,11 @@ impl MetadataService for Metadatanode {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
+        self.ensure_leader_for_write().await?;
         let claims = self.authorize_datanode(request.metadata())?;
         debug!(subject = %claims.sub, "Authenticated datanode heartbeat");
         let node_request = request.into_inner();
         let remote_addr = node_request.addr.clone();
-        let mut datanodes_lock = self.state.available_datanodes.write().await;
 
         // If node_id is 0, this is a new datanode registering
         if node_request.node_id == 0 {
@@ -894,18 +1094,18 @@ impl MetadataService for Metadatanode {
 
             // Extract IP from remote_addr and use standard datanode port
             let datanode_addr = format!("http://{remote_addr}");
+            let last_beat = time::SystemTime::now()
+                .duration_since(time::UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_millis() as i64;
 
-            datanodes_lock.insert(
-                new_id,
-                DatanodeInfo {
-                    id: new_id,
-                    addr: datanode_addr.clone(),
-                    last_heartbeat: time::SystemTime::now()
-                        .duration_since(time::UNIX_EPOCH)
-                        .expect("Time went backwards")
-                        .as_millis() as i64,
-                },
-            );
+            self.raft_write(MetadataCommand::DatanodeRegister {
+                id: new_id,
+                addr: datanode_addr.clone(),
+                last_beat,
+            })
+            .await?;
+
             self.audit_success(
                 "DATANODE_REGISTER",
                 Some(format!("node:{new_id}")),
@@ -918,17 +1118,6 @@ impl MetadataService for Metadatanode {
                     "used_space": node_request.used_space,
                 }),
             )
-            .await;
-            self.wal(WalOperation::RegisterDatanode {
-                datanode: DatanodeInfo {
-                    id: new_id,
-                    addr: datanode_addr,
-                    last_heartbeat: time::SystemTime::now()
-                        .duration_since(time::UNIX_EPOCH)
-                        .expect("Time went backwards")
-                        .as_millis() as i64,
-                },
-            })
             .await;
 
             return Ok(Response::new(HeartbeatResponse {
@@ -948,11 +1137,26 @@ impl MetadataService for Metadatanode {
 
         let mut audit_success = true;
         let mut audit_status = "SUCCESS";
-        if let Some(datanode) = datanodes_lock.get_mut(&(node_request.node_id as u16)) {
-            datanode.last_heartbeat = time::SystemTime::now()
+        let node_id = node_request.node_id as u16;
+
+        if self
+            .state
+            .available_datanodes
+            .read()
+            .await
+            .get(&node_id)
+            .is_some()
+        {
+            let last_beat = time::SystemTime::now()
                 .duration_since(time::UNIX_EPOCH)
                 .expect("Time went backwards")
                 .as_millis() as i64;
+
+            self.raft_write(MetadataCommand::DatanodeHeartbeat {
+                id: node_id,
+                last_beat,
+            })
+            .await?;
         } else {
             audit_success = false;
             audit_status = "UNKNOWN_NODE";
@@ -999,6 +1203,7 @@ impl MetadataService for Metadatanode {
         &self,
         request: Request<SetFileStatusRequest>,
     ) -> Result<Response<SetFileStatusResponse>, Status> {
+        self.ensure_leader_for_write().await?;
         self.authorize_user_or_master(request.metadata())?;
         let set_file_request = request.into_inner();
         self.update_file_status_internal(set_file_request.path, set_file_request.status)
@@ -1250,19 +1455,6 @@ impl Metadatanode {
             .await
             .ok();
     }
-
-    async fn wal(&self, operation: WalOperation) {
-        let record = WalRecord {
-            schema_version: 1,
-            op_id: Uuid::new_v4().to_string(),
-            timestamp_ms: Utc::now().timestamp_millis(),
-            operation,
-        };
-
-        if let Err(err) = self.wal_tx.send(record).await {
-            error!("Could not enqueue WAL record: {}", err);
-        }
-    }
 }
 
 fn garbage_collector(
@@ -1369,96 +1561,6 @@ fn log_sender(mut audit_rx: mpsc::Receiver<AuditLog>, allow_invalid_certs: bool)
     });
 }
 
-async fn flush_wal_buffer(
-    file: &mut tokio::fs::File,
-    buffer: &mut Vec<WalRecord>,
-) -> Result<(), std::io::Error> {
-    if buffer.is_empty() {
-        return Ok(());
-    }
-
-    let mut payload = String::new();
-    for record in buffer.iter() {
-        payload.push_str(&serde_json::to_string(record).unwrap_or_else(|_| "{}".to_string()));
-        payload.push('\n');
-    }
-
-    tokio::io::AsyncWriteExt::write_all(file, payload.as_bytes()).await?;
-    tokio::io::AsyncWriteExt::flush(file).await?;
-    buffer.clear();
-    Ok(())
-}
-
-fn wal_writer(
-    mut wal_rx: mpsc::Receiver<WalRecord>,
-    wal_path: String,
-    batch_size: usize,
-    flush_interval_ms: u64,
-) {
-    tokio::spawn(async move {
-        if let Some(parent) = Path::new(&wal_path).parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Err(err) = tokio::fs::create_dir_all(parent).await {
-                    error!(
-                        "Could not create WAL directory {}: {}",
-                        parent.display(),
-                        err
-                    );
-                    return;
-                }
-            }
-        }
-
-        let mut file = match tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&wal_path)
-            .await
-        {
-            Ok(f) => f,
-            Err(err) => {
-                error!("Could not open WAL file {}: {}", wal_path, err);
-                return;
-            }
-        };
-
-        let mut buffer: Vec<WalRecord> = Vec::with_capacity(batch_size.max(1));
-        let mut ticker = tokio_time::interval(Duration::from_millis(flush_interval_ms.max(1)));
-        info!(
-            "WAL writer started at {} (batch_size={}, flush_interval_ms={})",
-            wal_path, batch_size, flush_interval_ms
-        );
-
-        loop {
-            tokio::select! {
-                maybe_record = wal_rx.recv() => {
-                    match maybe_record {
-                        Some(record) => {
-                            buffer.push(record);
-                            if buffer.len() >= batch_size.max(1) {
-                                if let Err(err) = flush_wal_buffer(&mut file, &mut buffer).await {
-                                    error!("Could not flush WAL buffer: {}", err);
-                                }
-                            }
-                        }
-                        None => {
-                            if let Err(err) = flush_wal_buffer(&mut file, &mut buffer).await {
-                                error!("Could not flush WAL on shutdown: {}", err);
-                            }
-                            break;
-                        }
-                    }
-                }
-                _ = ticker.tick() => {
-                    if let Err(err) = flush_wal_buffer(&mut file, &mut buffer).await {
-                        error!("Could not flush WAL by interval: {}", err);
-                    }
-                }
-            }
-        }
-    });
-}
-
 #[allow(clippy::type_complexity)]
 fn replay_wal(
     wal_path: &str,
@@ -1555,46 +1657,46 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_node_id
     );
 
+    let shared_state = Arc::new(MasterState {
+        files: RwLock::new(files),
+        available_datanodes: RwLock::new(available_data_nodes),
+    });
+
+    let raft_ctx =
+        Arc::new(MasterRaftContext::bootstrap(&settings, Arc::clone(&shared_state)).await?);
+
     let (garbage_collector_tx, garbage_collector_rx) =
         mpsc::channel::<Vec<BlockMetadata>>(settings.garbage_collector_channel_size.max(1));
     let (block_replicator_tx, block_replicator_rx) =
         mpsc::channel::<FileMetadata>(settings.block_replicator_channel_size.max(1));
     let (audit_tx, audit_rx) = mpsc::channel::<AuditLog>(settings.audit_channel_size.max(1)); // Buffer grande
-    let (wal_tx, wal_rx) = mpsc::channel::<WalRecord>(settings.wal_channel_size.max(1));
 
     let metadatanode = Arc::new(Metadatanode {
-        state: Arc::new(MasterState {
-            files: RwLock::new(files),
-            available_datanodes: RwLock::new(available_data_nodes),
-        }),
+        state: shared_state,
         settings: Arc::clone(&settings),
         garbage_collector_tx,
         block_replicator_tx,
         audit_tx,
-        wal_tx,
         auth: auth_manager,
         next_node_id: AtomicU16::new(next_node_id),
+        raft_ctx: Arc::clone(&raft_ctx),
     });
 
     let address = settings.listen_address.parse()?;
     let service = MetadataServiceServer::new(metadatanode.as_ref().clone());
+    let raft_service = RaftServiceServer::new(RaftRpcNode::new(raft_ctx));
 
     info!("Starting MetadataNode server on {}", address);
     info!("Datanodes will self-register via heartbeat");
     let master_ref_gc = Arc::clone(&metadatanode);
     garbage_collector(garbage_collector_rx, master_ref_gc);
     log_sender(audit_rx, settings.elastic_allow_invalid_certs);
-    wal_writer(
-        wal_rx,
-        settings.wal_path.clone(),
-        settings.wal_batch_size,
-        settings.wal_flush_interval_ms,
-    );
     let master_ref_br = Arc::clone(&metadatanode);
     block_replicator(block_replicator_rx, master_ref_br);
 
     Server::builder()
         .add_service(service)
+        .add_service(raft_service)
         .serve(address)
         .await?;
     Ok(())

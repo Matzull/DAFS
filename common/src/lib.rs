@@ -29,6 +29,10 @@ pub mod dfs {
     tonic::include_proto!("dfs");
 }
 
+pub mod raft {
+    tonic::include_proto!("raft");
+}
+
 pub const AUTHORIZATION_HEADER: &str = "authorization";
 pub const ROLE_USER: &str = "user";
 pub const ROLE_MASTER: &str = "master";

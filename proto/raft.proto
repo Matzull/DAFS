@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package raft;
+
+service RaftService {
+	rpc AppendEntries (AppendEntriesRequest) returns (AppendEntriesResponse);
+	rpc Vote (VoteRequest) returns (VoteResponse);
+	rpc InstallSnapshot (InstallSnapshotRequest) returns (InstallSnapshotResponse);
+	rpc GetLeader (GetLeaderRequest) returns (GetLeaderResponse);
+	rpc ChangeMembership (ChangeMembershipRequest) returns (ChangeMembershipResponse);
+}
+
+message NodeInfo {
+	uint64 node_id = 1;
+	string address = 2;
+}
+
+message AppendEntriesRequest {
+	bytes payload = 1;
+}
+
+message AppendEntriesResponse {
+	bytes payload = 1;
+}
+
+message VoteRequest {
+	bytes payload = 1;
+}
+
+message VoteResponse {
+	bytes payload = 1;
+}
+
+message InstallSnapshotRequest {
+	bytes payload = 1;
+}
+
+message InstallSnapshotResponse {
+	bytes payload = 1;
+}
+
+message GetLeaderRequest {}
+
+message GetLeaderResponse {
+	bool known = 1;
+	uint64 leader_id = 2;
+	string leader_address = 3;
+}
+
+message ChangeMembershipRequest {
+	repeated uint64 voter_ids = 1;
+	bool retain_removed_as_learners = 2;
+}
+
+message ChangeMembershipResponse {
+	bool accepted = 1;
+	string message = 2;
+}

@@ -21,10 +21,10 @@ clap = { version = "4.5", features = ["derive"] }
 reqwest = { version = "0.13.1", features = ["json"] } 
 chrono = { workspace = true}
 dotenvy = "0.15.7"
-raft = "0.7.0"
 argon2 = { workspace = true }
 rusqlite = { workspace = true }
 radix_trie = "0.3.0"
+openraft = { version = "0.9.21", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

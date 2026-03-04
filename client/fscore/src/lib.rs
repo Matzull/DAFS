@@ -9,6 +9,8 @@ use common::dfs::{
     RegisterUserRequest, RenameFileRequest, SetFileStatusRequest, WriteBlockRequest,
     WriteBlockResponse,
 };
+use common::raft::raft_service_client::RaftServiceClient;
+use common::raft::GetLeaderRequest;
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -23,6 +25,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tonic::transport::Channel;
 use tonic::Request;
 use tracing::{debug, error, info, instrument};
 
@@ -67,6 +70,65 @@ impl Default for DafsSettings {
     }
 }
 
+fn parse_leader_addr_from_message(message: &str) -> Option<String> {
+    let marker = "leader_addr=";
+    let start = message.find(marker)? + marker.len();
+    let rest = &message[start..];
+    let addr = rest.split(';').next().unwrap_or(rest).trim();
+    if addr.is_empty() || addr == "unknown" {
+        None
+    } else {
+        Some(addr.to_string())
+    }
+}
+
+fn prioritized_endpoints(settings: &DafsSettings, preferred: Option<String>) -> Vec<String> {
+    let mut endpoints = Vec::new();
+    if let Some(ep) = preferred {
+        endpoints.push(ep);
+    }
+    for ep in &settings.master_endpoints {
+        if !endpoints.iter().any(|existing| existing == ep) {
+            endpoints.push(ep.clone());
+        }
+    }
+    endpoints
+}
+
+async fn discover_leader_endpoint(settings: &DafsSettings) -> Option<String> {
+    for endpoint in &settings.master_endpoints {
+        let mut client = match RaftServiceClient::connect(endpoint.clone()).await {
+            Ok(client) => client,
+            Err(_) => continue,
+        };
+
+        let response = match client.get_leader(Request::new(GetLeaderRequest {})).await {
+            Ok(resp) => resp.into_inner(),
+            Err(_) => continue,
+        };
+
+        if response.known && !response.leader_address.is_empty() {
+            return Some(response.leader_address);
+        }
+    }
+    None
+}
+
+async fn connect_metadata_client(
+    settings: &DafsSettings,
+    preferred: Option<String>,
+) -> Result<MetadataServiceClient<Channel>, Box<dyn Error + Send + Sync>> {
+    let mut last_error: Option<Box<dyn Error + Send + Sync>> = None;
+    for endpoint in prioritized_endpoints(settings, preferred) {
+        match MetadataServiceClient::connect(endpoint).await {
+            Ok(client) => return Ok(client),
+            Err(err) => last_error = Some(Box::new(err)),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "No reachable master endpoint".into()))
+}
+
 // ─── Token helpers ────────────────────────────────────────────────────────────
 
 pub fn read_access_token(path: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
@@ -105,13 +167,31 @@ pub async fn register_user(
     username: String,
     password: String,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
-    client
-        .register_user(Request::new(RegisterUserRequest {
-            username: username.clone(),
-            password: password.clone(),
-        }))
-        .await?;
+    let preferred = discover_leader_endpoint(settings.as_ref()).await;
+    let mut client = connect_metadata_client(settings.as_ref(), preferred).await?;
+    let req = Request::new(RegisterUserRequest {
+        username: username.clone(),
+        password: password.clone(),
+    });
+
+    match client.register_user(req).await {
+        Ok(_) => {}
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            let Some(leader_addr) = parse_leader_addr_from_message(status.message()) else {
+                return Err(Box::new(status));
+            };
+            let mut retry_client =
+                connect_metadata_client(settings.as_ref(), Some(leader_addr)).await?;
+            retry_client
+                .register_user(Request::new(RegisterUserRequest {
+                    username: username.clone(),
+                    password: password.clone(),
+                }))
+                .await?;
+        }
+        Err(status) => return Err(Box::new(status)),
+    }
+
     login_user(settings, username, password).await?;
     Ok(())
 }
@@ -123,11 +203,30 @@ pub async fn login_user(
     username: String,
     password: String,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
-    let response = client
-        .login_user(Request::new(LoginUserRequest { username, password }))
-        .await?
-        .into_inner();
+    let preferred = discover_leader_endpoint(settings.as_ref()).await;
+    let mut client = connect_metadata_client(settings.as_ref(), preferred).await?;
+    let response = match client
+        .login_user(Request::new(LoginUserRequest {
+            username: username.clone(),
+            password: password.clone(),
+        }))
+        .await
+    {
+        Ok(resp) => resp.into_inner(),
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            let Some(leader_addr) = parse_leader_addr_from_message(status.message()) else {
+                return Err(Box::new(status));
+            };
+            let mut retry_client =
+                connect_metadata_client(settings.as_ref(), Some(leader_addr)).await?;
+            retry_client
+                .login_user(Request::new(LoginUserRequest { username, password }))
+                .await?
+                .into_inner()
+        }
+        Err(status) => return Err(Box::new(status)),
+    };
+
     save_access_token(&settings.access_token_path, &response.access_token)?;
     info!(
         expires_at = response.expires_at,
@@ -146,13 +245,34 @@ pub async fn get_file_metadata(
     remote_path: String,
     access_token: &str,
 ) -> Result<GetFileResponse, Box<dyn Error + Send + Sync>> {
-    let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
+    let preferred = discover_leader_endpoint(settings.as_ref()).await;
+    let mut client = connect_metadata_client(settings.as_ref(), preferred).await?;
     let mut request = Request::new(GetFileRequest {
-        path: remote_path,
+        path: remote_path.clone(),
         user_id: settings.default_user_id.clone(),
     });
     common::attach_bearer_token(&mut request, access_token)?;
-    Ok(client.get_file_metadata(request).await?.into_inner())
+
+    match client.get_file_metadata(request).await {
+        Ok(resp) => Ok(resp.into_inner()),
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            let Some(leader_addr) = parse_leader_addr_from_message(status.message()) else {
+                return Err(Box::new(status));
+            };
+            let mut retry_client =
+                connect_metadata_client(settings.as_ref(), Some(leader_addr)).await?;
+            let mut retry_request = Request::new(GetFileRequest {
+                path: remote_path,
+                user_id: settings.default_user_id.clone(),
+            });
+            common::attach_bearer_token(&mut retry_request, access_token)?;
+            Ok(retry_client
+                .get_file_metadata(retry_request)
+                .await?
+                .into_inner())
+        }
+        Err(status) => Err(Box::new(status)),
+    }
 }
 
 /// List the contents of a remote directory.
@@ -162,10 +282,30 @@ pub async fn list_directory(
     directory: String,
     access_token: &str,
 ) -> Result<ListDirectoryResponse, Box<dyn Error + Send + Sync>> {
-    let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
-    let mut request = Request::new(ListDirectoryRequest { path: directory });
+    let preferred = discover_leader_endpoint(settings.as_ref()).await;
+    let mut client = connect_metadata_client(settings.as_ref(), preferred).await?;
+    let mut request = Request::new(ListDirectoryRequest {
+        path: directory.clone(),
+    });
     common::attach_bearer_token(&mut request, access_token)?;
-    Ok(client.list_directory(request).await?.into_inner())
+
+    match client.list_directory(request).await {
+        Ok(resp) => Ok(resp.into_inner()),
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            let Some(leader_addr) = parse_leader_addr_from_message(status.message()) else {
+                return Err(Box::new(status));
+            };
+            let mut retry_client =
+                connect_metadata_client(settings.as_ref(), Some(leader_addr)).await?;
+            let mut retry_request = Request::new(ListDirectoryRequest { path: directory });
+            common::attach_bearer_token(&mut retry_request, access_token)?;
+            Ok(retry_client
+                .list_directory(retry_request)
+                .await?
+                .into_inner())
+        }
+        Err(status) => Err(Box::new(status)),
+    }
 }
 
 /// Rename or move a remote file.
@@ -177,14 +317,34 @@ pub async fn rename_file(
     access_token: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     info!(old_path, new_path, "Renaming file");
-    let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
+    let preferred = discover_leader_endpoint(settings.as_ref()).await;
+    let mut client = connect_metadata_client(settings.as_ref(), preferred).await?;
     let mut request = Request::new(RenameFileRequest {
         old_path: old_path.clone(),
         new_path: new_path.clone(),
         user_id: settings.default_user_id.clone(),
     });
     common::attach_bearer_token(&mut request, access_token)?;
-    client.rename_file(request).await?;
+
+    match client.rename_file(request).await {
+        Ok(_) => {}
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            let Some(leader_addr) = parse_leader_addr_from_message(status.message()) else {
+                return Err(Box::new(status));
+            };
+            let mut retry_client =
+                connect_metadata_client(settings.as_ref(), Some(leader_addr)).await?;
+            let mut retry_request = Request::new(RenameFileRequest {
+                old_path: old_path.clone(),
+                new_path: new_path.clone(),
+                user_id: settings.default_user_id.clone(),
+            });
+            common::attach_bearer_token(&mut retry_request, access_token)?;
+            retry_client.rename_file(retry_request).await?;
+        }
+        Err(status) => return Err(Box::new(status)),
+    }
+
     info!(old_path, new_path, "File rename completed");
     Ok(())
 }
@@ -197,13 +357,32 @@ pub async fn delete_file(
     access_token: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     info!(remote_path, "Deleting file");
-    let mut client = MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
+    let preferred = discover_leader_endpoint(settings.as_ref()).await;
+    let mut client = connect_metadata_client(settings.as_ref(), preferred).await?;
     let mut request = Request::new(DeleteFileRequest {
         path: remote_path.clone(),
         user_id: settings.default_user_id.clone(),
     });
     common::attach_bearer_token(&mut request, access_token)?;
-    client.delete_file(request).await?;
+
+    match client.delete_file(request).await {
+        Ok(_) => {}
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            let Some(leader_addr) = parse_leader_addr_from_message(status.message()) else {
+                return Err(Box::new(status));
+            };
+            let mut retry_client =
+                connect_metadata_client(settings.as_ref(), Some(leader_addr)).await?;
+            let mut retry_request = Request::new(DeleteFileRequest {
+                path: remote_path.clone(),
+                user_id: settings.default_user_id.clone(),
+            });
+            common::attach_bearer_token(&mut retry_request, access_token)?;
+            retry_client.delete_file(retry_request).await?;
+        }
+        Err(status) => return Err(Box::new(status)),
+    }
+
     info!(remote_path, "File deleted");
     Ok(())
 }
@@ -375,20 +554,33 @@ pub async fn upload_file(
 ) -> Result<CreateFileResponse, Box<dyn Error + Send + Sync>> {
     info!(local_path, remote_path, "Starting file upload");
     let access_token = Arc::new(access_token.to_owned());
-    let mut meta_client =
-        MetadataServiceClient::connect(settings.master_endpoints[0].clone()).await?;
-
     let file_handle = std::fs::File::open(&local_path)?;
+    let file_size = file_handle.metadata()?.size() as i64;
+    let preferred = discover_leader_endpoint(settings.as_ref()).await;
+    let mut meta_client = connect_metadata_client(settings.as_ref(), preferred).await?;
     let mut create_file_request = Request::new(CreateFileRequest {
         path: remote_path.clone(),
-        size: file_handle.metadata()?.size() as i64, // TODO: files > 4 GB
+        size: file_size,
         user_id: settings.default_user_id.clone(),
     });
     common::attach_bearer_token(&mut create_file_request, access_token.as_str())?;
-    let create_file_response = meta_client
-        .create_file(create_file_request)
-        .await?
-        .into_inner();
+    let create_file_response = match meta_client.create_file(create_file_request).await {
+        Ok(resp) => resp.into_inner(),
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            let Some(leader_addr) = parse_leader_addr_from_message(status.message()) else {
+                return Err(Box::new(status));
+            };
+            meta_client = connect_metadata_client(settings.as_ref(), Some(leader_addr)).await?;
+            let mut retry_request = Request::new(CreateFileRequest {
+                path: remote_path.clone(),
+                size: file_size,
+                user_id: settings.default_user_id.clone(),
+            });
+            common::attach_bearer_token(&mut retry_request, access_token.as_str())?;
+            meta_client.create_file(retry_request).await?.into_inner()
+        }
+        Err(status) => return Err(Box::new(status)),
+    };
 
     let shared_file_handle = Arc::new(file_handle);
     let semaphore = Arc::new(Semaphore::new(settings.upload_concurrency));
@@ -445,11 +637,27 @@ pub async fn upload_file(
     );
 
     let mut set_status_request = Request::new(SetFileStatusRequest {
-        path: remote_path,
+        path: remote_path.clone(),
         status: settings.upload_ready_status.clone(),
     });
     common::attach_bearer_token(&mut set_status_request, access_token.as_str())?;
-    meta_client.set_file_status(set_status_request).await?;
+    match meta_client.set_file_status(set_status_request).await {
+        Ok(_) => {}
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            let Some(leader_addr) = parse_leader_addr_from_message(status.message()) else {
+                return Err(Box::new(status));
+            };
+            let mut retry_client =
+                connect_metadata_client(settings.as_ref(), Some(leader_addr)).await?;
+            let mut retry_request = Request::new(SetFileStatusRequest {
+                path: remote_path,
+                status: settings.upload_ready_status.clone(),
+            });
+            common::attach_bearer_token(&mut retry_request, access_token.as_str())?;
+            retry_client.set_file_status(retry_request).await?;
+        }
+        Err(status) => return Err(Box::new(status)),
+    }
     Ok(create_file_response)
 }
 

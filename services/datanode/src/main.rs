@@ -9,6 +9,8 @@ use common::dfs::{
     HeartbeatRequest, ReadBlockRequest, ReadBlockResponse, ReplicateBlocksRequest,
     ReplicateBlocksResponse, WriteBlockRequest, WriteBlockResponse,
 };
+use common::raft::raft_service_client::RaftServiceClient;
+use common::raft::GetLeaderRequest;
 use crc32fast::Hasher;
 use figment::{
     providers::{Format, Serialized, Toml},
@@ -22,7 +24,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::{Server, Uri};
+use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, instrument, warn};
 const DEFAULT_DATA_FOLDER: &str = "./testing/datanode";
@@ -41,6 +43,7 @@ pub struct InternalSettings {
     pub read_buffer_size: usize,
     pub write_buffer_size: usize,
     pub metadata_node_address: String,
+    pub metadata_node_endpoints: Vec<String>,
     pub replication_max_parallel_blocks: usize,
     pub heartbeat_retry_initial_ms: u64,
     pub heartbeat_retry_max_ms: u64,
@@ -65,6 +68,7 @@ pub fn load_config() -> InternalSettings {
             read_buffer_size: 64 * 1024,
             write_buffer_size: 128 * 1024,
             metadata_node_address: DEFAULT_METADATA_NODE_ADDRESS.to_string(),
+            metadata_node_endpoints: vec![DEFAULT_METADATA_NODE_ADDRESS.to_string()],
             replication_max_parallel_blocks: 16,
             heartbeat_retry_initial_ms: 500,
             heartbeat_retry_max_ms: 30_000,
@@ -121,6 +125,11 @@ struct Cli {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata_node_address: Option<String>,
+
+    /// Metadata node endpoints (comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata_node_endpoints: Option<Vec<String>>,
 
     /// Maximum parallel replication block tasks
     #[arg(long)]
@@ -181,6 +190,84 @@ struct Cli {
 pub struct Datanode {
     pub node_id: Arc<Mutex<u16>>,
     pub settings: Arc<InternalSettings>,
+}
+
+fn parse_leader_addr_from_message(message: &str) -> Option<String> {
+    let marker = "leader_addr=";
+    let start = message.find(marker)? + marker.len();
+    let rest = &message[start..];
+    let addr = rest.split(';').next().unwrap_or(rest).trim();
+    if addr.is_empty() || addr == "unknown" {
+        None
+    } else {
+        Some(addr.to_string())
+    }
+}
+
+fn metadata_endpoints(settings: &InternalSettings, preferred: Option<String>) -> Vec<String> {
+    let mut endpoints = Vec::new();
+
+    if let Some(ep) = preferred {
+        endpoints.push(ep);
+    }
+
+    for ep in &settings.metadata_node_endpoints {
+        if !endpoints.iter().any(|existing| existing == ep) {
+            endpoints.push(ep.clone());
+        }
+    }
+
+    if !settings.metadata_node_address.is_empty()
+        && !endpoints
+            .iter()
+            .any(|existing| existing == &settings.metadata_node_address)
+    {
+        endpoints.push(settings.metadata_node_address.clone());
+    }
+
+    endpoints
+}
+
+async fn discover_leader_endpoint(settings: &InternalSettings) -> Option<String> {
+    for endpoint in metadata_endpoints(settings, None) {
+        let mut raft_client = match RaftServiceClient::connect(endpoint).await {
+            Ok(client) => client,
+            Err(_) => continue,
+        };
+
+        let response = match raft_client
+            .get_leader(Request::new(GetLeaderRequest {}))
+            .await
+        {
+            Ok(resp) => resp.into_inner(),
+            Err(_) => continue,
+        };
+
+        if response.known && !response.leader_address.is_empty() {
+            return Some(response.leader_address);
+        }
+    }
+
+    None
+}
+
+async fn connect_metadata_client(
+    settings: &InternalSettings,
+    preferred: Option<String>,
+) -> Result<
+    MetadataServiceClient<tonic::transport::Channel>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+
+    for endpoint in metadata_endpoints(settings, preferred) {
+        match MetadataServiceClient::connect(endpoint).await {
+            Ok(client) => return Ok(client),
+            Err(err) => last_err = Some(Box::new(err)),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| "No metadata endpoints configured".into()))
 }
 
 impl Datanode {
@@ -587,11 +674,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::Duration::from_millis(settings.heartbeat_retry_max_ms.max(1));
 
         let mut client = loop {
-            match MetadataServiceClient::connect(
-                settings.metadata_node_address.parse::<Uri>().unwrap(),
-            )
-            .await
-            {
+            let preferred = discover_leader_endpoint(&settings).await;
+            match connect_metadata_client(&settings, preferred).await {
                 Ok(c) => {
                     info!("Connected to master server");
                     break c;
@@ -672,16 +756,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(e) => {
                     error!("Heartbeat failed: {}. Attempting to reconnect...", e);
+                    let mut preferred = if e.code() == tonic::Code::FailedPrecondition {
+                        parse_leader_addr_from_message(e.message())
+                    } else {
+                        None
+                    };
                     // Try to reconnect
                     retry_delay = tokio::time::Duration::from_millis(
                         settings.heartbeat_retry_initial_ms.max(1),
                     );
                     loop {
-                        match MetadataServiceClient::connect(
-                            settings.metadata_node_address.parse::<Uri>().unwrap(),
-                        )
-                        .await
-                        {
+                        if preferred.is_none() {
+                            preferred = discover_leader_endpoint(&settings).await;
+                        }
+                        match connect_metadata_client(&settings, preferred.clone()).await {
                             Ok(c) => {
                                 info!("Reconnected to master server");
                                 client = c;
