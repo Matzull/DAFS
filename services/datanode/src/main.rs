@@ -230,22 +230,34 @@ fn metadata_endpoints(settings: &InternalSettings, preferred: Option<String>) ->
 
 async fn discover_leader_endpoint(settings: &InternalSettings) -> Option<String> {
     for endpoint in metadata_endpoints(settings, None) {
-        let mut raft_client = match RaftServiceClient::connect(endpoint).await {
+        let mut raft_client = match RaftServiceClient::connect(endpoint.clone()).await {
             Ok(client) => client,
-            Err(_) => continue,
+            Err(err) => {
+                debug!(%err, %endpoint, "Failed to connect to raft service");
+                continue;
+            }
         };
 
         let response = match raft_client
             .get_leader(Request::new(GetLeaderRequest {}))
             .await
         {
-            Ok(resp) => resp.into_inner(),
-            Err(_) => continue,
+            Ok(resp) => {
+                let response = resp.into_inner();
+                debug!(%endpoint, "Successfully got response from raft service {response:?}");
+                response
+            }
+            Err(err) => {
+                debug!(%err, %endpoint, "Failed to get leader from raft service");
+                continue;
+            }
         };
 
         if response.known && !response.leader_address.is_empty() {
+            info!(%endpoint, leader_address = %response.leader_address, "Discovered leader endpoint");
             return Some(response.leader_address);
         }
+        debug!(%endpoint, "Leader address unknown from this endpoint");
     }
 
     None
@@ -675,15 +687,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut client = loop {
             let preferred = discover_leader_endpoint(&settings).await;
-            match connect_metadata_client(&settings, preferred).await {
+            
+            if preferred.is_none() {
+                warn!(
+                    "No leader found in cluster. \
+                     Master may be in election or not started yet. Retrying in {:?}...",
+                    retry_delay
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
+                continue;
+            }
+            
+            match connect_metadata_client(&settings, preferred.clone()).await {
                 Ok(c) => {
-                    info!("Connected to master server");
+                    info!("Connected to master server at {:?}", preferred);
                     break c;
                 }
                 Err(e) => {
                     warn!(
-                        "Failed to connect to master: {}. Retrying in {:?}...",
-                        e, retry_delay
+                        "Failed to connect to master at {:?}: {}. Retrying in {:?}...",
+                        preferred, e, retry_delay
                     );
                     tokio::time::sleep(retry_delay).await;
                     retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
@@ -756,32 +780,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(e) => {
                     error!("Heartbeat failed: {}. Attempting to reconnect...", e);
-                    let mut preferred = if e.code() == tonic::Code::FailedPrecondition {
-                        parse_leader_addr_from_message(e.message())
-                    } else {
-                        None
-                    };
+                    
                     // Try to reconnect
                     retry_delay = tokio::time::Duration::from_millis(
                         settings.heartbeat_retry_initial_ms.max(1),
                     );
                     loop {
+                        // Always try to discover the current leader first
+                        let mut preferred = if e.code() == tonic::Code::FailedPrecondition {
+                            parse_leader_addr_from_message(e.message())
+                        } else {
+                            None
+                        };
+                        
+                        // If we couldn't get leader from error message, discover it
                         if preferred.is_none() {
+                            info!(
+                                "No leader hint in error, discovering leader from cluster..."
+                            );
                             preferred = discover_leader_endpoint(&settings).await;
                         }
+                        
+                        // If still no leader found, wait before retrying discovery
+                        if preferred.is_none() {
+                            warn!(
+                                "No leader found in cluster. \
+                                 Master may be in election. Retrying in {:?}...",
+                                retry_delay
+                            );
+                            tokio::time::sleep(retry_delay).await;
+                            retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
+                            continue;
+                        }
+                        
+                        // Try to connect to the discovered leader
                         match connect_metadata_client(&settings, preferred.clone()).await {
                             Ok(c) => {
-                                info!("Reconnected to master server");
+                                info!(
+                                    "Reconnected to master server at {:?}",
+                                    preferred
+                                );
                                 client = c;
                                 break;
                             }
                             Err(e) => {
                                 warn!(
-                                    "Failed to reconnect to master: {}. Retrying in {:?}...",
-                                    e, retry_delay
+                                    "Failed to reconnect to master at {:?}: {}. Retrying in {:?}...",
+                                    preferred, e, retry_delay
                                 );
                                 tokio::time::sleep(retry_delay).await;
                                 retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
+                                // Clear preferred to force rediscovery on next iteration
+                                preferred = None;
                             }
                         }
                     }

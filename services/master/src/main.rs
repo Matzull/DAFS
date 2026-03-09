@@ -1,6 +1,7 @@
 mod auth;
 mod models;
 mod raft {
+    pub mod membership_manager;
     pub mod runtime;
     pub mod state_machine;
     pub mod types;
@@ -51,6 +52,7 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
+use crate::raft::membership_manager::MembershipManager;
 use crate::raft::runtime::MasterRaftContext;
 use crate::raft::types::{MetadataCommand, MetadataResponse, NodeId};
 
@@ -419,6 +421,19 @@ impl RaftService for RaftRpcNode {
         request: Request<ChangeMembershipRequest>,
     ) -> Result<Response<ChangeMembershipResponse>, Status> {
         let req = request.into_inner();
+
+        if req.voter_ids.len() == 2 {
+            warn!(
+                voters = ?req.voter_ids,
+                "Requested 2-voter membership: if one node disconnects, cluster loses quorum"
+            );
+        } else if req.voter_ids.len() > 2 && req.voter_ids.len() % 2 == 0 {
+            warn!(
+                voters = ?req.voter_ids,
+                "Requested even number of voters; odd voter counts (3,5,...) are recommended for Raft availability"
+            );
+        }
+
         let result = self
             .raft_ctx
             .raft
@@ -1684,15 +1699,23 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let address = settings.listen_address.parse()?;
     let service = MetadataServiceServer::new(metadatanode.as_ref().clone());
-    let raft_service = RaftServiceServer::new(RaftRpcNode::new(raft_ctx));
+    let raft_service = RaftServiceServer::new(RaftRpcNode::new(Arc::clone(&raft_ctx)));
 
     info!("Starting MetadataNode server on {}", address);
     info!("Datanodes will self-register via heartbeat");
+    
     let master_ref_gc = Arc::clone(&metadatanode);
     garbage_collector(garbage_collector_rx, master_ref_gc);
     log_sender(audit_rx, settings.elastic_allow_invalid_certs);
     let master_ref_br = Arc::clone(&metadatanode);
     block_replicator(block_replicator_rx, master_ref_br);
+
+    // Spawn membership manager to automatically manage cluster membership
+    let membership_manager = MembershipManager::new(
+        Arc::clone(&raft_ctx),
+        Arc::clone(&settings),
+    );
+    membership_manager.spawn();
 
     Server::builder()
         .add_service(service)

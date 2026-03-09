@@ -16,6 +16,7 @@ use openraft::BasicNode;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
 
 use crate::models::MasterState;
 use crate::raft::state_machine::MasterStateMachine;
@@ -66,16 +67,34 @@ impl MasterRaftContext {
 
         let mut nodes = parse_member_nodes(&settings.raft_initial_members)?;
         let self_addr = normalize_http_addr(&settings.listen_address);
+        if let Some(existing) = nodes.get(&settings.raft_node_id) {
+            if existing.addr != self_addr {
+                warn!(
+                    node_id = settings.raft_node_id,
+                    configured = %existing.addr,
+                    effective = %self_addr,
+                    "raft_initial_members contains local node id with a different address; overriding with local listen address"
+                );
+            }
+        }
         nodes.insert(settings.raft_node_id, BasicNode::new(self_addr));
 
         if settings.raft_bootstrap {
             let initialized = raft.is_initialized().await?;
             if !initialized {
-                let members: BTreeMap<NodeId, BasicNode> = nodes
-                    .iter()
-                    .map(|(node_id, node)| (*node_id, node.clone()))
-                    .collect();
-                let _ = raft.initialize(members).await;
+                // Bootstrap ONLY with the current node to avoid blocking on unreachable peers
+                let mut bootstrap_members = BTreeMap::new();
+                bootstrap_members.insert(
+                    settings.raft_node_id,
+                    nodes.get(&settings.raft_node_id).unwrap().clone(),
+                );
+
+                info!(
+                    node_id = settings.raft_node_id,
+                    "Bootstrapping Raft cluster with single node. \
+                     Other known members will need to join via change_membership"
+                );
+                let _ = raft.initialize(bootstrap_members).await;
             }
         }
 
@@ -91,15 +110,43 @@ fn parse_member_nodes(items: &[String]) -> Result<HashMap<NodeId, BasicNode>, Bo
     let mut nodes = HashMap::new();
 
     for item in items {
-        let (id_part, addr_part) = item.split_once('=').ok_or_else(|| {
-            format!("Invalid raft member format '{item}', expected '<id>=<addr>'")
-        })?;
+        // Support both repeated CLI flags:
+        // --raft-initial-members 1=addr --raft-initial-members 2=addr
+        // and a single quoted argument with spaces:
+        // --raft-initial-members '1=addr 2=addr'
+        for token in item.split_whitespace() {
+            let (id_part, addr_part) = token.split_once('=').ok_or_else(|| {
+                format!("Invalid raft member format '{token}', expected '<id>=<addr>'")
+            })?;
 
-        let node_id: NodeId = id_part.parse()?;
-        nodes.insert(node_id, BasicNode::new(normalize_http_addr(addr_part)));
+            let node_id: NodeId = id_part.parse()?;
+            nodes.insert(node_id, BasicNode::new(normalize_http_addr(addr_part)));
+        }
     }
+    debug!(?nodes, "Parsed initial raft members");
 
     Ok(nodes)
+}
+
+fn warn_membership_fault_tolerance(voter_count: usize) {
+    if voter_count <= 1 {
+        return;
+    }
+
+    if voter_count == 2 {
+        warn!(
+            voter_count,
+            "Raft cluster configured with 2 voters: if one node disconnects, there is no quorum for writes or leader election"
+        );
+        return;
+    }
+
+    if voter_count % 2 == 0 {
+        warn!(
+            voter_count,
+            "Raft cluster configured with an even number of voters; use an odd number (3,5,...) for better fault tolerance"
+        );
+    }
 }
 
 fn normalize_http_addr(addr: &str) -> String {

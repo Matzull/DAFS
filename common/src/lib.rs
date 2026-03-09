@@ -147,7 +147,10 @@ pub fn init_tracing(component: &str, default_level: &str) {
     let filter = match directive {
         Ok(directive) => base_filter.add_directive(directive),
         Err(_) => base_filter,
-    };
+    }
+    // OpenRaft internals can generate high-frequency transport/election logs during
+    // outages; keep app-level quorum and membership logs as the primary signal.
+    .add_directive("openraft=off".parse().expect("valid tracing directive"));
 
     if let Err(err) = tracing_subscriber::fmt()
         .compact()
