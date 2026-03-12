@@ -541,17 +541,17 @@ impl Metadatanode {
         file_path: String,
         file_size: i64,
         owner: String,
-    ) -> Result<FileMetadata, String> {
+    ) -> Result<FileMetadata, (i8, String)> {
         if file_size < 0 {
             error!("File size cannot be negative");
-            return Err("File size cannot be negative".to_string());
+            return Err((0, "File size cannot be negative".to_string()));
         }
         let file_path_pathbuf = PathBuf::from(file_path.clone());
         let full_path = file_path_pathbuf.to_string_lossy().to_string();
         let files_lock = state.files.read().await;
         if files_lock.get(&full_path).is_some() {
             error!("File {} already exists", full_path);
-            return Err(format!("File {full_path} already exists"));
+            return Err((1, format!("File {full_path} already exists")));
         }
         let num_blocks = ((file_size + settings.block_size - 1) / settings.block_size)
             .try_into()
@@ -562,7 +562,7 @@ impl Metadatanode {
         drop(datanodes_lock);
         if datanodes.is_empty() {
             error!("No datanodes found");
-            return Err("No datanodes found".to_string());
+            return Err((2, "No datanodes found".to_string()));
         }
 
         info!(
@@ -770,11 +770,16 @@ impl MetadataService for Metadatanode {
                     claims.sub.clone(),
                     json!({
                         "size": file_request.size,
-                        "error": err,
+                        "error": err.1,
                     }),
                 )
                 .await;
-                return Err(Status::internal("Could not create file metadata"));
+                match err.0 {
+                    0 => return Err(Status::invalid_argument(err.1)),
+                    1 => return Err(Status::already_exists(err.1)),
+                    2 => return Err(Status::failed_precondition(err.1)),
+                    _ => return Err(Status::internal("Could not create file metadata")),
+                }
             }
         };
 

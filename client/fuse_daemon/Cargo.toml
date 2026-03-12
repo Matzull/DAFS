@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 tokio.workspace = true
+tonic = { workspace = true, features = ["transport"] }
 common = { path = "../../common" }
 fscore = { path = "../fscore" }
 

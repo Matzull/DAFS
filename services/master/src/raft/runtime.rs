@@ -53,6 +53,11 @@ impl MasterRaftContext {
         let config = Arc::new(config.validate()?);
 
         let store = MasterStateMachine::new_with_state(initial_state);
+        
+        // Auto-detect if cluster was already initialized in persistent storage
+        // If there are prior logs or membership, don't bootstrap even if flag is set
+        let was_previously_initialized = store.has_prior_initialization().await;
+
         let (log_store, state_machine_store) = Adaptor::new(store);
 
         let network = GrpcRaftNetworkFactory;
@@ -79,7 +84,11 @@ impl MasterRaftContext {
         }
         nodes.insert(settings.raft_node_id, BasicNode::new(self_addr));
 
-        if settings.raft_bootstrap {
+        // Only bootstrap if:
+        // 1. bootstrap flag is set AND
+        // 2. cluster is not yet initialized (checked via is_initialized())
+        // 3. AND no prior persistent logs/membership found
+        if settings.raft_bootstrap && !was_previously_initialized {
             let initialized = raft.is_initialized().await?;
             if !initialized {
                 // Bootstrap ONLY with the current node to avoid blocking on unreachable peers
@@ -91,11 +100,25 @@ impl MasterRaftContext {
 
                 info!(
                     node_id = settings.raft_node_id,
+                    bootstrap_flag = settings.raft_bootstrap,
+                    previous_init_detected = false,
                     "Bootstrapping Raft cluster with single node. \
                      Other known members will need to join via change_membership"
                 );
                 let _ = raft.initialize(bootstrap_members).await;
+            } else {
+                info!(
+                    node_id = settings.raft_node_id,
+                    "Bootstrap flag set but cluster already initialized in memory, skipping"
+                );
             }
+        } else if settings.raft_bootstrap && was_previously_initialized {
+            warn!(
+                node_id = settings.raft_node_id,
+                bootstrap_flag = settings.raft_bootstrap,
+                "Bootstrap flag set but detected prior initialization in persistent storage; \
+                 skipping bootstrap to protect existing cluster"
+            );
         }
 
         Ok(Self {

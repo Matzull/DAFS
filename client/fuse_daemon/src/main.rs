@@ -7,16 +7,19 @@ use figment::{
 };
 use fscore::DafsSettings;
 use fuser::{
-    mount2, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, INodeNo, MountOption,
-    ReplyAttr, ReplyDirectory, ReplyEntry, Request,
+    mount2, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, INodeNo,
+    MountOption, ReplyAttr, ReplyDirectory, ReplyEntry, Request,
 };
-use libc::{EIO, ENOENT, ENOTDIR};
+use libc::{EEXIST, EIO, ENOENT, ENOTDIR};
 use serde::{de, Deserialize, Serialize};
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
 use std::time::{Duration, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 use std::{ffi::OsStr, time::SystemTime};
 use tokio::{runtime::Runtime, sync::RwLock};
 use tracing::{debug, error, info};
@@ -162,6 +165,15 @@ enum Commands {
     },
 }
 
+struct DAFSEntry {
+    dirty: bool,
+    remote_path: String,
+    size: u64,
+}
+struct DAFSState {
+    files: HashMap<FileHandle, DAFSEntry>,
+}
+
 struct DAFSfs {
     runtime: Arc<tokio::runtime::Runtime>,
     settings: Arc<fscore::DafsSettings>,
@@ -169,6 +181,7 @@ struct DAFSfs {
     inode_map: RwLock<BiMap<u64, String>>,
     next_inode: AtomicU64,
     ttl: Duration,
+    state: Arc<RwLock<DAFSState>>,
 }
 
 impl Filesystem for DAFSfs {
@@ -180,14 +193,12 @@ impl Filesystem for DAFSfs {
             return;
         }
 
-        let path = {
-            let map = self.inode_map.blocking_read();
-            match map.get_by_left(&ino.0) {
-                Some(p) => p.to_string(),
-                None => {
-                    reply.error(Errno::from_i32(ENOENT));
-                    return;
-                }
+        let path = match self.get_path_by_inode(ino) {
+            Some(p) => p,
+            None => {
+                error!(ino = ino.0, "Inode not found in map");
+                reply.error(Errno::from_i32(ENOENT));
+                return;
             }
         };
         let token = self.token.blocking_read().clone();
@@ -209,11 +220,7 @@ impl Filesystem for DAFSfs {
                 );
             }
             Err(err) => {
-                if self.is_not_found_error(&err.to_string()) {
-                    reply.error(Errno::from_i32(ENOENT));
-                } else {
-                    reply.error(Errno::from_i32(EIO));
-                }
+                reply.error(self.map_error(&err));
             }
         }
     }
@@ -225,14 +232,12 @@ impl Filesystem for DAFSfs {
             name = name.to_string_lossy().to_string(),
             "Looking up entry"
         );
-        let parent_path = {
-            let map = self.inode_map.blocking_read();
-            match map.get_by_left(&parent.0) {
-                Some(p) => p.to_string(),
-                None => {
-                    reply.error(Errno::from_i32(ENOENT));
-                    return;
-                }
+        let parent_path = match self.get_path_by_inode(parent) {
+            Some(p) => p,
+            None => {
+                error!(ino = parent.0, "Inode not found in map");
+                reply.error(Errno::from_i32(ENOENT));
+                return;
             }
         };
         info!(
@@ -251,11 +256,7 @@ impl Filesystem for DAFSfs {
         let file_metadata = match file_metadata {
             Ok(m) => m,
             Err(err) => {
-                if self.is_not_found_error(&err.to_string()) {
-                    reply.error(Errno::from_i32(ENOENT));
-                } else {
-                    reply.error(Errno::from_i32(EIO));
-                }
+                reply.error(self.map_error(&err));
                 return;
             }
         };
@@ -264,22 +265,16 @@ impl Filesystem for DAFSfs {
             size = file_metadata.size,
             "File metadata retrieved successfully"
         );
-        let ino = {
-            let mut map = self.inode_map.blocking_write();
-            match map.get_by_right(&full_path) {
-                Some(ino) => *ino,
-                None => {
-                    let new_ino = self.next_inode.fetch_add(1, Ordering::SeqCst);
-                    map.insert(new_ino, full_path.clone());
-                    new_ino
-                }
-            }
-        };
-        info!(full_path = full_path, ino = ino, "Assigned inode for entry");
+        let ino = self.get_new_inode(full_path.clone());
+        info!(
+            full_path = full_path,
+            ino = ino.0,
+            "Assigned inode for entry"
+        );
         reply.entry(
             &self.ttl,
             &self.file_attr(
-                fuser::INodeNo(ino),
+                ino,
                 file_metadata.size,
                 file_metadata.created_at,
                 FileType::RegularFile,
@@ -297,14 +292,12 @@ impl Filesystem for DAFSfs {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let path = {
-            let map = self.inode_map.blocking_read();
-            match map.get_by_left(&ino.0) {
-                Some(path) => path.to_string(),
-                None => {
-                    reply.error(Errno::from_i32(ENOENT));
-                    return;
-                }
+        let path = match self.get_path_by_inode(ino) {
+            Some(p) => p,
+            None => {
+                error!(ino = ino.0, "Inode not found in map");
+                reply.error(Errno::from_i32(ENOENT));
+                return;
             }
         };
         info!(ino = ino.0, path = path, "Reading directory");
@@ -318,16 +311,10 @@ impl Filesystem for DAFSfs {
         let list_directory_response = match list_directory_response {
             Ok(m) => m,
             Err(err) => {
-                if self.is_not_found_error(&err.to_string()) {
-                    error!(path = path, "Directory not found");
-                    reply.error(Errno::from_i32(ENOENT));
-                } else if self.is_not_directory_error(&err.to_string()) {
+                if self.is_not_directory_error(&err.to_string()) {
                     error!(path = path, "Not a directory");
-                    reply.error(Errno::from_i32(ENOTDIR));
-                } else {
-                    error!(path = path, "Error listing directory: {}", err);
-                    reply.error(Errno::from_i32(EIO));
                 }
+                reply.error(self.map_error(&err));
                 return;
             }
         };
@@ -394,9 +381,169 @@ impl Filesystem for DAFSfs {
         }
         reply.ok();
     }
+
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        reply: fuser::ReplyCreate,
+    ) {
+        info!(
+            parent = parent.0,
+            name = name.to_string_lossy().to_string(),
+            "Looking up entry"
+        );
+        let parent_path = match self.get_path_by_inode(parent) {
+            Some(p) => p,
+            None => {
+                error!(ino = parent.0, "Inode not found in map");
+                reply.error(Errno::from_i32(ENOENT));
+                return;
+            }
+        };
+        info!(
+            parent_path = parent_path,
+            name = name.to_string_lossy().to_string(),
+            "Resolved parent path"
+        );
+        let new_file_path = self.join_path(&parent_path, name);
+
+        //Check if inode already exists
+        if self.get_inode_by_path(&new_file_path).is_some() {
+            error!(path = new_file_path, "File already exists");
+            reply.error(Errno::from_i32(EEXIST));
+            return;
+        }
+
+        let token = self.token.blocking_read().clone();
+
+        match self.runtime.block_on(fscore::create_file(
+            self.settings.clone(),
+            new_file_path.clone(),
+            &token,
+            0,
+        )) {
+            Ok(_) => {
+                let ino = self.get_new_inode(new_file_path.clone());
+                let _ = self.runtime.block_on(fscore::set_file_status_ready(
+                    self.settings.clone(),
+                    new_file_path.clone(),
+                    &token,
+                ));
+                let fh = FileHandle(ino.0);
+                self.state.blocking_write().files.insert(
+                    fh,
+                    DAFSEntry {
+                        dirty: true,
+                        remote_path: new_file_path,
+                        size: 0,
+                    },
+                );
+                reply.created(
+                    &self.ttl,
+                    &self.file_attr(ino, 0, 0, FileType::RegularFile),
+                    fuser::Generation(0),
+                    fh,
+                    FopenFlags::empty(),
+                );
+            }
+            Err(err) => {
+                reply.error(self.map_error(&err));
+            }
+        }
+    }
+
+    fn open(&self, req: &Request, ino: INodeNo, flags: fuser::OpenFlags, reply: fuser::ReplyOpen) {
+        let path = match self.get_path_by_inode(ino) {
+            Some(p) => p,
+            None => {
+                error!(ino = ino.0, "Inode not found in map");
+                reply.error(Errno::from_i32(ENOENT));
+                return;
+            }
+        };
+        let token = self.token.blocking_read().clone();
+        let _ = match self.runtime.block_on(fscore::get_file_metadata(
+            self.settings.clone(),
+            path.clone(),
+            &token,
+        )) {
+            Ok(file_meta) => file_meta,
+            Err(err) => {
+                reply.error(self.map_error(&err));
+                return;
+            }
+        };
+
+        reply.opened(FileHandle(ino.0), FopenFlags::empty());
+    }
+
+    fn write(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        write_flags: fuser::WriteFlags,
+        flags: fuser::OpenFlags,
+        lock_owner: Option<fuser::LockOwner>,
+        reply: fuser::ReplyWrite,
+    ) {
+        let mut state_lock = self.state.blocking_write();
+        let entry = state_lock.files.get_mut(&fh);
+        if entry.is_none() {
+            error!("File doesnt have a valid fileHandle");
+            reply.error(Errno::from_i32(EIO));
+            return;
+        }
+        entry.unwrap();
+
+    }
+
+    fn read(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        size: u32,
+        flags: fuser::OpenFlags,
+        lock_owner: Option<fuser::LockOwner>,
+        reply: fuser::ReplyData,
+    ) {
+    }
+
+    fn flush(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: fuser::LockOwner,
+        reply: fuser::ReplyEmpty,
+    ) {
+    }
 }
 
 impl DAFSfs {
+    fn map_error(&self, err: &Box<dyn std::error::Error + Send + Sync>) -> Errno {
+        if let Some(status) = err.downcast_ref::<tonic::Status>() {
+            return match status.code() {
+                tonic::Code::NotFound => Errno::from_i32(ENOENT),
+                tonic::Code::AlreadyExists => Errno::from_i32(EEXIST),
+                tonic::Code::FailedPrecondition => Errno::from_i32(ENOTDIR),
+                tonic::Code::PermissionDenied => Errno::from_i32(libc::EACCES),
+                _ => Errno::from_i32(EIO),
+            };
+        } else {
+            Errno::from_i32(EIO)
+        }
+    }
+
     fn intitialize(&self) {
         self.inode_map.blocking_write().insert(1, "/".to_string());
         self.runtime
@@ -499,11 +646,35 @@ impl DAFSfs {
     fn current_gid(&self) -> u32 {
         unsafe { libc::getegid() as u32 }
     }
+
+    fn get_new_inode(&self, file_path: String) -> INodeNo {
+        let ino = {
+            let mut map = self.inode_map.blocking_write();
+            match map.get_by_right(&file_path) {
+                Some(ino) => *ino,
+                None => {
+                    let new_ino = self.next_inode.fetch_add(1, Ordering::SeqCst);
+                    map.insert(new_ino, file_path.clone());
+                    new_ino
+                }
+            }
+        };
+        fuser::INodeNo(ino)
+    }
+
+    fn get_inode_by_path(&self, file_path: &str) -> Option<INodeNo> {
+        let map = self.inode_map.blocking_read();
+        map.get_by_right(file_path).copied().map(INodeNo)
+    }
+
+    fn get_path_by_inode(&self, ino: INodeNo) -> Option<String> {
+        let map = self.inode_map.blocking_read();
+        map.get_by_left(&ino.0).cloned()
+    }
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 fn main() {
-    let cli = Cli::parse();
     let settings = Arc::new(load_config());
 
     common::init_tracing("cli", "DEBUG");
@@ -511,7 +682,7 @@ fn main() {
     info!("DAFS CLI starting");
     info!("Master node: {}", settings.master_endpoints.join(", "));
     let mut config = Config::default();
-    config.mount_options = vec![MountOption::RO, MountOption::AutoUnmount];
+    config.mount_options = vec![MountOption::RW, MountOption::AutoUnmount];
     config.acl = fuser::SessionACL::All;
     let fs = DAFSfs {
         inode_map: RwLock::new(BiMap::new()),
@@ -520,104 +691,8 @@ fn main() {
         token: RwLock::new(String::new()),
         ttl: Duration::from_secs(2),
         settings,
+        state: Arc::new(RwLock::new(DAFSState { files: HashMap::new() })),
     };
     fs.intitialize();
     mount2(fs, "/tmp/DAFS", &config).expect("Failed to mount DAFS");
-    // if let Err(e) = run(cli, settings).await {
-    //     error!("Error: {}", e);
-    //     std::process::exit(1);
-    // }
-}
-
-async fn run(
-    cli: Cli,
-    settings: Arc<DafsSettings>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    match cli.command {
-        Some(Commands::Register { username, password }) => {
-            fscore::register_user(Arc::clone(&settings), username, password).await?;
-            info!("User registered successfully");
-        }
-        Some(Commands::Login { username, password }) => {
-            fscore::login_user(Arc::clone(&settings), username, password).await?;
-            info!("Login successful");
-        }
-        Some(Commands::Upload { file, remote_path }) => {
-            let token = fscore::read_access_token(&settings.access_token_path)?;
-            let remote = remote_path.unwrap_or_else(|| {
-                std::path::Path::new(&file)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&file)
-                    .to_string()
-            });
-            info!("Uploading {} to {}", file, remote);
-            let resp = fscore::upload_file(Arc::clone(&settings), file, remote, &token).await?;
-            info!("File uploaded successfully");
-            info!("Blocks created: {}", resp.blocks.len());
-        }
-        Some(Commands::Download {
-            remote_path,
-            output,
-        }) => {
-            let token = fscore::read_access_token(&settings.access_token_path)?;
-            info!("Downloading {} to {}", remote_path, output);
-            fscore::download_file(Arc::clone(&settings), remote_path, output, &token).await?;
-            info!("File downloaded successfully");
-        }
-        Some(Commands::List { path }) => {
-            let token = fscore::read_access_token(&settings.access_token_path)?;
-            let dir = path.unwrap_or_else(|| settings.default_list_path.clone());
-            let response =
-                fscore::list_directory(Arc::clone(&settings), dir.clone(), &token).await?;
-            let file_count = response.files.len();
-            println!(
-                "{:<30} {:<12} {:<15} {:<15} {:<20} {:<20} {:<12}",
-                "Filename", "Type", "Size", "Owner", "Created", "Modified", "Status"
-            );
-            println!("{}", "-".repeat(124));
-            for file in response.files {
-                let file_type = if file.is_directory {
-                    "Directory"
-                } else {
-                    "File"
-                };
-                let size_str = if file.is_directory {
-                    "-".to_string()
-                } else {
-                    format_file_size(file.size)
-                };
-                println!(
-                    "{:<30} {:<12} {:<15} {:<15} {:<20} {:<20} {:<12}",
-                    file.filename,
-                    file_type,
-                    size_str,
-                    file.owner,
-                    format_timestamp(file.created_at),
-                    format_timestamp(file.last_modified_at),
-                    file.file_status
-                );
-            }
-            info!(file_count, directory = dir, "Directory listing completed");
-        }
-        Some(Commands::Rename { old_path, new_path }) => {
-            let token = fscore::read_access_token(&settings.access_token_path)?;
-            let old = old_path.unwrap_or_else(|| settings.default_rename_old_path.clone());
-            let new = new_path.unwrap_or_else(|| settings.default_rename_new_path.clone());
-            info!("Renaming/Moving from {} to {}", old, new);
-            fscore::rename_file(Arc::clone(&settings), old, new, &token).await?;
-            info!("File renamed/moved successfully");
-        }
-        Some(Commands::Delete { file_path }) => {
-            let token = fscore::read_access_token(&settings.access_token_path)?;
-            let path = file_path.unwrap_or_else(|| settings.default_rename_old_path.clone());
-            fscore::delete_file(Arc::clone(&settings), path, &token).await?;
-            info!("File deleted successfully");
-        }
-        None => {
-            error!("No command provided. Use --help for usage information.");
-            std::process::exit(1);
-        }
-    }
-    Ok(())
 }

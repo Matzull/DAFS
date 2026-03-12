@@ -851,6 +851,7 @@ dependencies = [
  "libc",
  "serde",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]

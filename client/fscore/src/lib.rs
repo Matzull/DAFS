@@ -541,21 +541,14 @@ async fn download_block(
 
 // ─── File-level I/O ───────────────────────────────────────────────────────────
 
-/// Upload a local file to the DFS at the given remote path.
-///
-/// `remote_path` is the path in the DFS namespace (e.g. `/photos/cat.jpg`).
-/// `access_token` is the JWT obtained via [`login_user`].
-#[instrument(skip(settings, access_token))]
-pub async fn upload_file(
+pub async fn create_file(
     settings: Arc<DafsSettings>,
-    local_path: String,
     remote_path: String,
     access_token: &str,
+    file_size: i64,
 ) -> Result<CreateFileResponse, Box<dyn Error + Send + Sync>> {
-    info!(local_path, remote_path, "Starting file upload");
+    info!(remote_path, "Creating file");
     let access_token = Arc::new(access_token.to_owned());
-    let file_handle = std::fs::File::open(&local_path)?;
-    let file_size = file_handle.metadata()?.size() as i64;
     let preferred = discover_leader_endpoint(settings.as_ref()).await;
     let mut meta_client = connect_metadata_client(settings.as_ref(), preferred).await?;
     let mut create_file_request = Request::new(CreateFileRequest {
@@ -581,6 +574,63 @@ pub async fn upload_file(
         }
         Err(status) => return Err(Box::new(status)),
     };
+    Ok(create_file_response)
+}
+
+pub async fn set_file_status_ready(
+    settings: Arc<DafsSettings>,
+    file_path: String,
+    access_token: &str,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let mut set_status_request = Request::new(SetFileStatusRequest {
+        path: file_path.clone(),
+        status: settings.upload_ready_status.clone(),
+    });
+    common::attach_bearer_token(&mut set_status_request, access_token.clone())?;
+    let preferred = discover_leader_endpoint(settings.as_ref()).await;
+    let mut meta_client = connect_metadata_client(settings.as_ref(), preferred).await?;
+    match meta_client.set_file_status(set_status_request).await {
+        Ok(_) => Ok(true),
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            let Some(leader_addr) = parse_leader_addr_from_message(status.message()) else {
+                return Err(Box::new(status));
+            };
+            let mut retry_client =
+                connect_metadata_client(settings.as_ref(), Some(leader_addr)).await?;
+            let mut retry_request = Request::new(SetFileStatusRequest {
+                path: file_path,
+                status: settings.upload_ready_status.clone(),
+            });
+            common::attach_bearer_token(&mut retry_request, access_token.clone())?;
+            retry_client.set_file_status(retry_request).await?;
+            Ok(true)
+        }
+        Err(status) => return Err(Box::new(status)),
+    }
+}
+
+/// Upload a local file to the DFS at the given remote path.
+///
+/// `remote_path` is the path in the DFS namespace (e.g. `/photos/cat.jpg`).
+/// `access_token` is the JWT obtained via [`login_user`].
+#[instrument(skip(settings, access_token))]
+pub async fn upload_file(
+    settings: Arc<DafsSettings>,
+    local_path: String,
+    remote_path: String,
+    access_token: &str,
+) -> Result<CreateFileResponse, Box<dyn Error + Send + Sync>> {
+    info!(local_path, remote_path, "Starting file upload");
+    let access_token = Arc::new(access_token.to_owned());
+    let file_handle = std::fs::File::open(&local_path)?;
+    let file_size = file_handle.metadata()?.size() as i64;
+    let create_file_response = create_file(
+        settings.clone(),
+        remote_path.clone(),
+        &access_token,
+        file_size,
+    )
+    .await?;
 
     let shared_file_handle = Arc::new(file_handle);
     let semaphore = Arc::new(Semaphore::new(settings.upload_concurrency));
@@ -636,28 +686,7 @@ pub async fn upload_file(
         "File upload completed"
     );
 
-    let mut set_status_request = Request::new(SetFileStatusRequest {
-        path: remote_path.clone(),
-        status: settings.upload_ready_status.clone(),
-    });
-    common::attach_bearer_token(&mut set_status_request, access_token.as_str())?;
-    match meta_client.set_file_status(set_status_request).await {
-        Ok(_) => {}
-        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
-            let Some(leader_addr) = parse_leader_addr_from_message(status.message()) else {
-                return Err(Box::new(status));
-            };
-            let mut retry_client =
-                connect_metadata_client(settings.as_ref(), Some(leader_addr)).await?;
-            let mut retry_request = Request::new(SetFileStatusRequest {
-                path: remote_path,
-                status: settings.upload_ready_status.clone(),
-            });
-            common::attach_bearer_token(&mut retry_request, access_token.as_str())?;
-            retry_client.set_file_status(retry_request).await?;
-        }
-        Err(status) => return Err(Box::new(status)),
-    }
+    set_file_status_ready(settings.clone(), remote_path.clone(), &access_token).await?;
     Ok(create_file_response)
 }
 
