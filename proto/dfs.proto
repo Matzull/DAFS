@@ -33,6 +33,9 @@ service MetadataService {
 
     // Updates file metadata (e.g., after a successful upload).
   rpc SetFileStatus (SetFileStatusRequest) returns (SetFileStatusResponse);
+
+    // Master allocates new blocks for a file upload.
+  rpc AllocateBlocks (AllocateBlocksRequest) returns (AllocateBlocksResponse);
 }
 
 // -----------------------------------------------------------------------
@@ -188,6 +191,16 @@ message SetFileStatusResponse {
   string error_message = 2;
 }
 
+message AllocateBlocksRequest {
+  string file_id = 1;
+  uint64 offset  = 2; // Offset in the file where new blocks should be allocated
+  uint64  size    = 3; // Total size of the file in bytes
+}
+
+message AllocateBlocksResponse {
+  repeated BlockAssignment blocks = 1;
+}
+
 // --- DataNode Messages ---
 
 message WriteBlockRequest {
@@ -202,6 +215,7 @@ message WriteBlockRequest {
 message BlockMetadata {
   string block_id   = 1;
   int64  total_size = 2;
+  uint64 offset     = 3; // Position within block to start writing (for append/overwrite)
 }
 
 message WriteBlockResponse {

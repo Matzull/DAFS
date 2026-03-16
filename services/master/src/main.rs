@@ -10,12 +10,12 @@ use crate::auth::AuthManager;
 use crate::models::{BlockMetadata, DatanodeInfo, FileMetadata, FileStatus, MasterState};
 use common::dfs::metadata_service_server::{MetadataService, MetadataServiceServer};
 use common::dfs::{
-    data_node_service_client, BlockAssignment, BlockList, CreateFileRequest, CreateFileResponse,
-    DeleteBlockRequest, DeleteFileRequest, DeleteFileResponse, FileInfo, GetFileRequest,
-    GetFileResponse, HeartbeatRequest, HeartbeatResponse, ListDirectoryRequest,
-    ListDirectoryResponse, LoginUserRequest, LoginUserResponse, RegisterUserRequest,
-    RegisterUserResponse, RenameFileRequest, RenameFileResponse, ReplicateBlocksRequest,
-    SetFileStatusRequest, SetFileStatusResponse,
+    data_node_service_client, AllocateBlocksRequest, AllocateBlocksResponse, BlockAssignment,
+    BlockList, CreateFileRequest, CreateFileResponse, DeleteBlockRequest, DeleteFileRequest,
+    DeleteFileResponse, FileInfo, GetFileRequest, GetFileResponse, HeartbeatRequest,
+    HeartbeatResponse, ListDirectoryRequest, ListDirectoryResponse, LoginUserRequest,
+    LoginUserResponse, RegisterUserRequest, RegisterUserResponse, RenameFileRequest,
+    RenameFileResponse, ReplicateBlocksRequest, SetFileStatusRequest, SetFileStatusResponse,
 };
 use common::raft::raft_service_server::{RaftService, RaftServiceServer};
 use common::raft::{
@@ -41,7 +41,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::{
-    cmp::min,
+    cmp::{max, min},
     collections::HashMap,
     sync::Arc,
     time::{self},
@@ -469,6 +469,160 @@ impl Clone for Metadatanode {
 }
 
 impl Metadatanode {
+    #[instrument(skip(state, settings, self))]
+    async fn allocate_blocks(
+        &self,
+        state: &Arc<MasterState>,
+        settings: &Arc<InternalSettings>,
+        file_size: u64,
+    ) -> Result<Vec<BlockMetadata>, (i8, String)> {
+        let file_size = file_size as i64; // CAUTION
+        let num_blocks: usize = ((file_size + settings.block_size - 1) / settings.block_size)
+            .try_into()
+            .unwrap_or(0);
+
+        let datanodes_lock = state.available_datanodes.read().await;
+        let datanodes: Vec<u16> = datanodes_lock.keys().cloned().collect();
+        drop(datanodes_lock);
+
+        if datanodes.is_empty() {
+            error!("No datanodes found");
+            return Err((2, "No datanodes found".to_string()));
+        }
+
+        let mut blocks = Vec::<BlockMetadata>::new();
+        for block_idx in 0..num_blocks {
+            let block_id = Uuid::new_v4().to_string();
+            let mut block_datanodes = vec![];
+            for datanode_id in 0..min(settings.replication_factor, datanodes.len() as i32) {
+                block_datanodes
+                    .push(datanodes[(block_idx + datanode_id as usize) % datanodes.len()]);
+            }
+            let current_block_size = if (block_idx as i64 + 1) * settings.block_size < file_size {
+                settings.block_size
+            } else {
+                file_size - (block_idx as i64) * settings.block_size
+            };
+            blocks.push(BlockMetadata {
+                id: block_id,
+                index: block_idx as i32,
+                size: current_block_size,
+                locations: block_datanodes,
+                checksum: "TO_IMPLEMENT".to_string(),
+            });
+        }
+
+        Ok(blocks)
+    }
+
+    // Allocate write segments for an existing file range [offset, offset + write_size).
+    // `order` in returned BlockAssignment is used as the write offset within the target block.
+    async fn allocate_write_segments(
+        &self,
+        state: &Arc<MasterState>,
+        settings: &Arc<InternalSettings>,
+        existing: &FileMetadata,
+        offset: u64,
+        write_size: u64,
+    ) -> Result<(Vec<BlockAssignment>, FileMetadata), (i8, String)> {
+        if write_size == 0 {
+            return Ok((Vec::new(), existing.clone()));
+        }
+
+        let block_size = settings.block_size as u64;
+        if block_size == 0 {
+            return Err((2, "Invalid block size configuration".to_string()));
+        }
+
+        let write_end = offset
+            .checked_add(write_size)
+            .ok_or_else(|| (2, "Write range overflow".to_string()))?;
+
+        let datanodes_lock = state.available_datanodes.read().await;
+        let datanodes: Vec<(u16, String)> = datanodes_lock
+            .iter()
+            .map(|(id, info)| (*id, info.addr.clone()))
+            .collect();
+        drop(datanodes_lock);
+
+        if datanodes.is_empty() {
+            error!("No datanodes found");
+            return Err((2, "No datanodes found".to_string()));
+        }
+
+        let replication = min(settings.replication_factor.max(1) as usize, datanodes.len());
+        let mut updated = existing.clone();
+        let mut blocks_by_index: HashMap<i32, BlockMetadata> = updated
+            .blocks
+            .iter()
+            .cloned()
+            .map(|b| (b.index, b))
+            .collect();
+
+        let start_idx = (offset / block_size) as i32;
+        let end_idx = ((write_end - 1) / block_size) as i32;
+        let mut assignments = Vec::new();
+
+        for block_idx in start_idx..=end_idx {
+            let block_start = (block_idx as u64) * block_size;
+            let block_end = block_start + block_size;
+            let seg_start = max(offset, block_start);
+            let seg_end = min(write_end, block_end);
+            if seg_end <= seg_start {
+                continue;
+            }
+
+            let write_len = (seg_end - seg_start) as i64;
+            let write_offset_in_block = (seg_start - block_start) as i64;
+
+            let block = blocks_by_index.entry(block_idx).or_insert_with(|| {
+                let mut block_datanodes = Vec::with_capacity(replication);
+                for repl_idx in 0..replication {
+                    let node_idx = (block_idx as usize + repl_idx) % datanodes.len();
+                    block_datanodes.push(datanodes[node_idx].0);
+                }
+
+                BlockMetadata {
+                    id: Uuid::new_v4().to_string(),
+                    index: block_idx,
+                    size: 0,
+                    locations: block_datanodes,
+                    checksum: "TO_IMPLEMENT".to_string(),
+                }
+            });
+
+            let primary = *block
+                .locations
+                .first()
+                .ok_or_else(|| (2, format!("Block {} has no assigned datanodes", block_idx)))?;
+            let primary_addr = datanodes
+                .iter()
+                .find(|(id, _)| *id == primary)
+                .map(|(_, addr)| addr.clone())
+                .ok_or_else(|| (2, format!("Primary datanode {} not available", primary)))?;
+
+            block.size = max(block.size, (seg_end - block_start) as i64);
+
+            assignments.push(BlockAssignment {
+                block_id: block.id.clone(),
+                node_address: primary_addr,
+                block_size: write_len,
+                order: write_offset_in_block,
+            });
+        }
+
+        let mut updated_blocks = blocks_by_index.into_values().collect::<Vec<_>>();
+        updated_blocks.sort_by_key(|b| b.index);
+        updated.blocks = updated_blocks;
+        updated.size = max(updated.size, write_end as i64);
+        updated.last_modified_at = time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis() as i64;
+
+        Ok((assignments, updated))
+    }
+
     #[allow(clippy::result_large_err)]
     fn authorize_any(
         &self,
@@ -553,44 +707,20 @@ impl Metadatanode {
             error!("File {} already exists", full_path);
             return Err((1, format!("File {full_path} already exists")));
         }
-        let num_blocks = ((file_size + settings.block_size - 1) / settings.block_size)
-            .try_into()
-            .unwrap();
+
         let file_id = Uuid::new_v4().to_string();
-        let datanodes_lock = state.available_datanodes.read().await;
-        let datanodes: Vec<u16> = datanodes_lock.keys().cloned().collect();
-        drop(datanodes_lock);
-        if datanodes.is_empty() {
-            error!("No datanodes found");
-            return Err((2, "No datanodes found".to_string()));
-        }
+
+        let blocks = self
+            .allocate_blocks(state, settings, file_size as u64)
+            .await?;
 
         info!(
             "Creating file ID: {} with {} blocks for {}",
-            file_id, num_blocks, file_path
+            file_id,
+            blocks.len(),
+            file_path
         );
 
-        let mut blocks = Vec::<BlockMetadata>::new();
-        for block_idx in 0..num_blocks {
-            let block_id = Uuid::new_v4().to_string();
-            let mut block_datanodes = vec![];
-            for datanode_id in 0..min(settings.replication_factor, datanodes.len() as i32) {
-                block_datanodes
-                    .push(datanodes[(block_idx + datanode_id as usize) % datanodes.len()]);
-            }
-            let current_block_size = if (block_idx as i64 + 1) * settings.block_size < file_size {
-                settings.block_size
-            } else {
-                file_size - (block_idx as i64) * settings.block_size
-            };
-            blocks.push(BlockMetadata {
-                id: block_id,
-                index: block_idx as i32,
-                size: current_block_size,
-                locations: block_datanodes.clone(),
-                checksum: "TO_IMPLEMENT".to_string(),
-            });
-        }
         let now_miliseconds = time::SystemTime::now()
             .duration_since(time::UNIX_EPOCH)
             .expect("Time went backwards")
@@ -1233,6 +1363,94 @@ impl MetadataService for Metadatanode {
             error_message: "".to_string(),
         }))
     }
+
+    #[instrument(skip(self, request))]
+    async fn allocate_blocks(
+        &self,
+        request: Request<AllocateBlocksRequest>,
+    ) -> Result<Response<AllocateBlocksResponse>, Status> {
+        self.ensure_leader_for_write().await?;
+        info!("Received block allocation request");
+        let claims = self.authorize_user_or_master(request.metadata())?;
+
+        let allocate_req = request.into_inner();
+
+        let file_metadata = {
+            let files_lock = self.state.files.read().await;
+
+            let by_path = files_lock.get(&allocate_req.file_id).cloned();
+            let by_id = files_lock
+                .iter()
+                .find(|(_, meta)| meta.id == allocate_req.file_id)
+                .map(|(_, meta)| meta.clone());
+
+            by_path.or(by_id)
+        };
+
+        let Some(existing) = file_metadata else {
+            warn!(file_id = allocate_req.file_id, "File does not exist");
+            self.audit_failure(
+                "BLOCK_ALLOCATE",
+                Some(allocate_req.file_id.clone()),
+                "NOT_FOUND",
+                claims.sub.clone(),
+                json!({ "file_id": allocate_req.file_id }),
+            )
+            .await;
+            return Err(Status::not_found("File does not exist"));
+        };
+        if allocate_req.offset > existing.size as u64 {
+            return Err(Status::invalid_argument(
+                "Offset has to be smaller than file size",
+            ));
+        }
+        if !self.can_access_path(&existing.owner, &claims) {
+            self.audit_failure(
+                "BLOCK_ALLOCATE",
+                Some(existing.path.clone()),
+                "FORBIDDEN",
+                claims.sub.clone(),
+                json!({ "file_id": existing.id }),
+            )
+            .await;
+            return Err(Status::permission_denied(
+                "Not allowed to allocate blocks for this file",
+            ));
+        }
+
+        let (assignments, updated) = self
+            .allocate_write_segments(
+                &self.state,
+                &self.settings,
+                &existing,
+                allocate_req.offset,
+                allocate_req.size,
+            )
+            .await
+            .map_err(|(_, msg)| Status::failed_precondition(msg))?;
+
+        {
+            let mut files_lock = self.state.files.write().await;
+            files_lock.insert(updated.path.clone(), updated.clone());
+        }
+
+        self.audit_success(
+            "BLOCK_ALLOCATE",
+            Some(existing.path),
+            claims.sub,
+            json!({
+                "file_id": existing.id,
+                "requested_size": allocate_req.size,
+                "offset": allocate_req.offset,
+                "block_count": assignments.len(),
+            }),
+        )
+        .await;
+
+        Ok(Response::new(AllocateBlocksResponse {
+            blocks: assignments,
+        }))
+    }
 }
 
 impl Metadatanode {
@@ -1708,7 +1926,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting MetadataNode server on {}", address);
     info!("Datanodes will self-register via heartbeat");
-    
+
     let master_ref_gc = Arc::clone(&metadatanode);
     garbage_collector(garbage_collector_rx, master_ref_gc);
     log_sender(audit_rx, settings.elastic_allow_invalid_certs);
@@ -1716,10 +1934,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     block_replicator(block_replicator_rx, master_ref_br);
 
     // Spawn membership manager to automatically manage cluster membership
-    let membership_manager = MembershipManager::new(
-        Arc::clone(&raft_ctx),
-        Arc::clone(&settings),
-    );
+    let membership_manager = MembershipManager::new(Arc::clone(&raft_ctx), Arc::clone(&settings));
     membership_manager.spawn();
 
     Server::builder()

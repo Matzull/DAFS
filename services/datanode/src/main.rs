@@ -345,6 +345,7 @@ impl Datanode {
             request_data: Some(RequestData::Metadata(common::dfs::BlockMetadata {
                 block_id: block_id.clone(),
                 total_size: 0,
+                offset: 0,  // Replication always writes from block start
             })),
         })
         .await
@@ -412,7 +413,6 @@ impl DataNodeService for Datanode {
         debug!("Received write_block request");
         let mut hasher = Hasher::new();
         let mut stream = request.into_inner();
-        // let mut file: Option<File> = None;
         let mut writer: Option<BufWriter<File>> = None;
         let mut bytes_written: i64 = 0;
         let mut block_id_str = String::new();
@@ -424,7 +424,14 @@ impl DataNodeService for Datanode {
                     if block_id_str.contains('/') || block_id_str.contains('.') {
                         return Err(Status::invalid_argument("Invalid block_id"));
                     }
-                    debug!(block_id = %block_id_str, "Received metadata for block");
+                    
+                    let write_offset = metadata.offset as i64;
+                    debug!(
+                        block_id = %block_id_str,
+                        offset = write_offset,
+                        "Received metadata for block"
+                    );
+                    
                     let mut file_path_pathbuf = PathBuf::from(&self.settings.data_folder);
                     file_path_pathbuf.push(&block_id_str[..2]);
                     file_path_pathbuf.push(&block_id_str[2..4]);
@@ -433,19 +440,31 @@ impl DataNodeService for Datanode {
                         Status::internal(err.to_string())
                     })?;
                     file_path_pathbuf.push(&block_id_str);
-                    let f = OpenOptions::new()
+                    
+                    // Open file with truncate only if offset is 0 (overwrite), else append mode
+                    let mut f = OpenOptions::new()
                         .write(true)
                         .create(true)
-                        .truncate(true)
+                        .truncate(write_offset == 0)  // Only truncate if offset is 0
                         .open(file_path_pathbuf)
                         .await
                         .map_err(|err| {
                             error!(%err, "Failed to create file");
                             Status::internal(err.to_string())
                         })?;
+                    
+                    // If offset > 0, seek to that position
+                    if write_offset > 0 {
+                        use tokio::io::AsyncSeekExt;
+                        f.seek(std::io::SeekFrom::Start(write_offset as u64))
+                            .await
+                            .map_err(|err| {
+                                error!(%err, "Failed to seek to offset {}", write_offset);
+                                Status::internal(err.to_string())
+                            })?;
+                    }
 
                     writer = Some(BufWriter::with_capacity(self.settings.write_buffer_size, f));
-                    // file = Some(f);
                 }
                 Some(RequestData::ChunkData(chunkdata)) => {
                     if let Some(ref mut w) = writer {

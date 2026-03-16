@@ -4,10 +4,7 @@ use common::dfs::metadata_service_client::MetadataServiceClient;
 use common::dfs::read_block_response::ResponseData;
 use common::dfs::write_block_request::RequestData;
 use common::dfs::{
-    CreateFileRequest, CreateFileResponse, DeleteFileRequest, GetFileRequest, GetFileResponse,
-    ListDirectoryRequest, ListDirectoryResponse, LoginUserRequest, ReadBlockRequest,
-    RegisterUserRequest, RenameFileRequest, SetFileStatusRequest, WriteBlockRequest,
-    WriteBlockResponse,
+    AllocateBlocksRequest, AllocateBlocksResponse, CreateFileRequest, CreateFileResponse, DeleteFileRequest, GetFileRequest, GetFileResponse, ListDirectoryRequest, ListDirectoryResponse, LoginUserRequest, ReadBlockRequest, RegisterUserRequest, RenameFileRequest, SetFileStatusRequest, WriteBlockRequest, WriteBlockResponse
 };
 use common::raft::raft_service_client::RaftServiceClient;
 use common::raft::GetLeaderRequest;
@@ -411,6 +408,7 @@ async fn upload_block(
         request_data: Some(RequestData::Metadata(common::dfs::BlockMetadata {
             block_id: block_id.clone(),
             total_size: block_size,
+            offset: 0,  // New blocks always write from start; offset used for append/overwrite
         })),
     })
     .await
@@ -466,6 +464,64 @@ async fn upload_block(
         "Block upload completed"
     );
     Ok(inner)
+}
+
+#[instrument(skip(data_node_client, settings, access_token, chunk_data))]
+async fn upload_block_from_bytes(
+    block_id: String,
+    data_node_client: DataNodeServiceClient<tonic::transport::Channel>,
+    write_offset_in_block: u64,
+    chunk_data: Vec<u8>,
+    settings: Arc<DafsSettings>,
+    access_token: Arc<String>,
+) -> Result<WriteBlockResponse, String> {
+    debug!(
+        block_id,
+        write_offset_in_block,
+        bytes = chunk_data.len(),
+        "Starting in-memory block upload"
+    );
+    let mut hasher = Hasher::new();
+    let (tx, rx) = mpsc::channel(settings.mpsc_upload_channel_size as usize);
+    let mut client = data_node_client;
+    let mut write_request = Request::new(ReceiverStream::new(rx));
+    common::attach_bearer_token(&mut write_request, access_token.as_str())
+        .map_err(|e| format!("Failed to attach access token: {e}"))?;
+    let response_fut = client.write_block(write_request);
+
+    tx.send(WriteBlockRequest {
+        request_data: Some(RequestData::Metadata(common::dfs::BlockMetadata {
+            block_id: block_id.clone(),
+            total_size: chunk_data.len() as i64,
+            offset: write_offset_in_block,
+        })),
+    })
+    .await
+    .map_err(|e| format!("Failed to send block metadata: {e}"))?;
+
+    let chunk_size = settings.upload_chunk_size.max(1);
+    for chunk in chunk_data.chunks(chunk_size) {
+        hasher.update(chunk);
+        tx.send(WriteBlockRequest {
+            request_data: Some(RequestData::ChunkData(chunk.to_vec())),
+        })
+        .await
+        .map_err(|e| format!("Failed to send chunk data: {e}"))?;
+    }
+
+    let checksum = hasher.finalize();
+    tx.send(WriteBlockRequest {
+        request_data: Some(RequestData::Checksum(checksum.to_string())),
+    })
+    .await
+    .map_err(|e| format!("Failed to send checksum: {e}"))?;
+    drop(tx);
+
+    let response = response_fut.await.map_err(|e| {
+        error!("Failed to get write block response: {}", e);
+        format!("Failed to get write block response: {e}")
+    })?;
+    Ok(response.into_inner())
 }
 
 #[instrument(skip(file_handle, data_node_client, settings, access_token))]
@@ -537,6 +593,55 @@ async fn download_block(
     }
     debug!(block_id, "Block downloaded");
     Ok(())
+}
+
+#[instrument(skip(data_node_client, access_token))]
+async fn download_block_to_vec(
+    block_id: String,
+    data_node_client: DataNodeServiceClient<tonic::transport::Channel>,
+    access_token: Arc<String>,
+) -> Result<Vec<u8>, String> {
+    let mut hasher = Hasher::new();
+    let mut client = data_node_client;
+    let mut stream = client
+        .read_block({
+            let mut req = Request::new(ReadBlockRequest {
+                block_id: block_id.clone(),
+            });
+            common::attach_bearer_token(&mut req, access_token.as_str())
+                .map_err(|e| format!("Could not attach access token: {e}"))?;
+            req
+        })
+        .await
+        .map_err(|e| format!("Could not read block: {e}"))?
+        .into_inner();
+
+    let mut block_data = Vec::new();
+    while let Some(msg) = stream.next().await {
+        let data = msg.map_err(|e| format!("Failed to receive block chunk: {e}"))?;
+        if let Some(ResponseData::Checksum(checksum)) = data.response_data {
+            let calculated_checksum = hasher.finalize();
+            if checksum != calculated_checksum.to_string() {
+                return Err(format!(
+                    "Checksum mismatch for block {block_id}: expected {checksum}, got {calculated_checksum}"
+                ));
+            }
+            break;
+        }
+
+        let chunk_data = match data.response_data {
+            Some(ResponseData::ChunkData(data)) => data,
+            _ => {
+                return Err(format!(
+                    "Unexpected response data type for block {block_id}"
+                ))
+            }
+        };
+        hasher.update(&chunk_data);
+        block_data.extend_from_slice(&chunk_data);
+    }
+
+    Ok(block_data)
 }
 
 // ─── File-level I/O ───────────────────────────────────────────────────────────
@@ -762,4 +867,204 @@ pub async fn download_file(
     }
     info!(remote_path, local_path, "File download completed");
     Ok(())
+}
+
+#[instrument(skip(settings, access_token))]
+pub async fn allocate_blocks(
+    settings: Arc<DafsSettings>,
+    file_path: String,
+    file_size: u64,
+    blocks_offset: u64,
+    access_token: &str,
+) -> Result<AllocateBlocksResponse, Box<dyn Error + Send + Sync>> {
+    info!(file_path, file_size, blocks_offset, "Starting block allocation");
+    let access_token = Arc::new(access_token.to_owned());
+    let preferred = discover_leader_endpoint(settings.as_ref()).await;
+    let mut meta_client = connect_metadata_client(settings.as_ref(), preferred).await?;
+    let mut allocate_blocks_request = Request::new(AllocateBlocksRequest {
+        file_id: file_path.clone(),
+        size: file_size,
+        offset: blocks_offset
+    });
+    common::attach_bearer_token(&mut allocate_blocks_request, access_token.as_str())?;
+    let allocate_block_response = match meta_client.allocate_blocks(allocate_blocks_request).await {
+        Ok(resp) => resp.into_inner(),
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            let Some(leader_addr) = parse_leader_addr_from_message(status.message()) else {
+                return Err(Box::new(status));
+            };
+            meta_client = connect_metadata_client(settings.as_ref(), Some(leader_addr)).await?;
+            let mut retry_request = Request::new(AllocateBlocksRequest {
+                file_id: file_path.clone(),
+                size: file_size,
+                offset: blocks_offset
+            });
+            common::attach_bearer_token(&mut retry_request, access_token.as_str())?;
+            meta_client.allocate_blocks(retry_request).await?.into_inner()
+        }
+        Err(status) => return Err(Box::new(status)),
+    };
+    Ok(allocate_block_response)
+}
+
+#[instrument(skip(settings, access_token, write_data))]
+pub async fn write_file_range(
+    settings: Arc<DafsSettings>,
+    remote_path: String,
+    offset: u64,
+    write_data: Vec<u8>,
+    access_token: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if write_data.is_empty() {
+        return Ok(());
+    }
+
+    let access_token = Arc::new(access_token.to_owned());
+    let allocation = allocate_blocks(
+        Arc::clone(&settings),
+        remote_path.clone(),
+        write_data.len() as u64,
+        offset,
+        access_token.as_str(),
+    )
+    .await?;
+
+    let nodes_to_connect: HashSet<_> = allocation
+        .blocks
+        .iter()
+        .map(|b| b.node_address.clone())
+        .collect();
+    let mut clients = HashMap::new();
+    for addr in nodes_to_connect {
+        let client = DataNodeServiceClient::connect(addr.clone()).await?;
+        clients.insert(addr, client);
+    }
+
+    let mut cursor = 0usize;
+    for assignment in allocation.blocks {
+        let chunk_len = assignment.block_size.max(0) as usize;
+        if chunk_len == 0 {
+            continue;
+        }
+        if cursor + chunk_len > write_data.len() {
+            return Err(format!(
+                "AllocateBlocks returned invalid layout: chunk overruns write buffer (cursor={}, chunk_len={}, total={})",
+                cursor,
+                chunk_len,
+                write_data.len()
+            )
+            .into());
+        }
+
+        let chunk = write_data[cursor..cursor + chunk_len].to_vec();
+        cursor += chunk_len;
+
+        let client = clients
+            .get(&assignment.node_address)
+            .ok_or_else(|| format!("No datanode client for {}", assignment.node_address))?
+            .clone();
+
+        upload_block_from_bytes(
+            assignment.block_id,
+            client,
+            assignment.order.max(0) as u64,
+            chunk,
+            Arc::clone(&settings),
+            Arc::clone(&access_token),
+        )
+        .await
+        .map_err(|e| format!("Failed writing file range for {remote_path}: {e}"))?;
+    }
+
+    if cursor != write_data.len() {
+        return Err(format!(
+            "AllocateBlocks returned incomplete layout: wrote {} of {} bytes",
+            cursor,
+            write_data.len()
+        )
+        .into());
+    }
+
+    set_file_status_ready(settings, remote_path, access_token.as_str()).await?;
+    Ok(())
+}
+
+#[instrument(skip(settings, access_token))]
+pub async fn read_file_range(
+    settings: Arc<DafsSettings>,
+    remote_path: String,
+    offset: u64,
+    size: u64,
+    access_token: &str,
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+
+    let access_token = Arc::new(access_token.to_owned());
+    let metadata = get_file_metadata(Arc::clone(&settings), remote_path.clone(), access_token.as_str()).await?;
+    let file_size = metadata.size.max(0) as u64;
+    if offset >= file_size {
+        return Ok(Vec::new());
+    }
+
+    let end = std::cmp::min(offset.saturating_add(size), file_size);
+    let read_len = (end - offset) as usize;
+    let mut out = vec![0u8; read_len];
+
+    let nodes_to_connect: HashSet<_> = metadata
+        .blocks
+        .iter()
+        .map(|b| b.node_address.clone())
+        .collect();
+    let mut clients = HashMap::new();
+    for addr in nodes_to_connect {
+        clients.insert(addr.clone(), DataNodeServiceClient::connect(addr).await?);
+    }
+
+    for block in metadata.blocks {
+        let block_size = block.block_size.max(0) as u64;
+        if block_size == 0 {
+            continue;
+        }
+        let block_start = (block.order.max(0) as u64).saturating_mul(block_size);
+        let block_end = block_start.saturating_add(block_size);
+
+        if block_end <= offset || block_start >= end {
+            continue;
+        }
+
+        let overlap_start = std::cmp::max(block_start, offset);
+        let overlap_end = std::cmp::min(block_end, end);
+        let within_block_start = (overlap_start - block_start) as usize;
+        let overlap_len = (overlap_end - overlap_start) as usize;
+        let out_start = (overlap_start - offset) as usize;
+
+        let client = clients
+            .get(&block.node_address)
+            .ok_or_else(|| format!("No datanode client for {}", block.node_address))?
+            .clone();
+        let block_bytes = download_block_to_vec(
+            block.block_id,
+            client,
+            Arc::clone(&access_token),
+        )
+        .await
+        .map_err(|e| format!("Failed reading block for {remote_path}: {e}"))?;
+
+        if within_block_start + overlap_len > block_bytes.len() {
+            return Err(format!(
+                "Block layout mismatch while reading {remote_path}: slice [{}..{}) exceeds block size {}",
+                within_block_start,
+                within_block_start + overlap_len,
+                block_bytes.len()
+            )
+            .into());
+        }
+
+        out[out_start..out_start + overlap_len]
+            .copy_from_slice(&block_bytes[within_block_start..within_block_start + overlap_len]);
+    }
+
+    Ok(out)
 }
