@@ -24,7 +24,7 @@ use std::{
 };
 use std::{ffi::OsStr, time::SystemTime};
 use tokio::{runtime::Runtime, sync::RwLock};
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 const MOUNTPOINT: &str = "/tmp/DAFS";
 
@@ -32,7 +32,7 @@ fn ensure_mountpoint(path: &str) -> Result<(), Box<dyn std::error::Error + Send 
     let p = Path::new(path);
     if !p.exists() {
         std::fs::create_dir_all(p)?;
-        info!(path, "Created missing mountpoint directory");
+        debug!(path, "Created missing mountpoint directory");
     }
     Ok(())
 }
@@ -56,62 +56,36 @@ fn try_unmount(path: &str) {
     // First attempt: direct lazy unmount.
     let umount_rc = unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) };
     if umount_rc == 0 {
-        info!(path, "Unmounted mountpoint using umount2");
+        debug!(path, "Unmounted mountpoint using umount2");
         return;
     }
 
     // Fallback for user-space FUSE unmount.
-    let fusermount3 = Command::new("fusermount3")
-        .arg("-u")
-        .arg(path)
-        .status();
+    let fusermount3 = Command::new("fusermount3").arg("-u").arg(path).status();
     match fusermount3 {
         Ok(status) if status.success() => {
-            info!(path, "Unmounted mountpoint using fusermount3");
+            debug!(path, "Unmounted mountpoint using fusermount3");
             return;
         }
         _ => {}
     }
 
-    let fusermount = Command::new("fusermount")
-        .arg("-u")
-        .arg(path)
-        .status();
+    let fusermount = Command::new("fusermount").arg("-u").arg(path).status();
     match fusermount {
         Ok(status) if status.success() => {
-            info!(path, "Unmounted mountpoint using fusermount");
+            debug!(path, "Unmounted mountpoint using fusermount");
         }
         Ok(status) => {
-            debug!(path, code = status.code(), "fusermount returned non-zero status");
+            debug!(
+                path,
+                code = status.code(),
+                "fusermount returned non-zero status"
+            );
         }
         Err(err) => {
             debug!(path, error = %err, "fusermount command unavailable or failed to run");
         }
     }
-}
-// ─── Display helpers ──────────────────────────────────────────────────────────
-
-fn format_file_size(bytes: i64) -> String {
-    const KB: i64 = 1024;
-    const MB: i64 = 1024 * KB;
-    const GB: i64 = 1024 * MB;
-
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-fn format_timestamp(millis: i64) -> String {
-    let secs = millis / 1000;
-    chrono::DateTime::from_timestamp(secs, 0)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-        .unwrap_or_else(|| "-".to_string())
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -119,7 +93,7 @@ fn format_timestamp(millis: i64) -> String {
 /// Loads DafsSettings by merging defaults → config.toml → CLI flags.
 pub fn load_config() -> DafsSettings {
     let cli = Cli::parse();
-    info!("Loading CLI configuration from '{}'", cli.config_path);
+    debug!("Loading CLI configuration from '{}'", cli.config_path);
 
     let has_master_endpoints = !cli.master_endpoints.is_empty();
     let master_endpoints = cli.master_endpoints.clone();
@@ -246,7 +220,7 @@ struct DAFSState {
 struct DAFSfs {
     runtime: Arc<tokio::runtime::Runtime>,
     settings: Arc<fscore::DafsSettings>,
-    token: RwLock<String>,
+    token: RwLock<Arc<String>>,
     inode_map: RwLock<BiMap<u64, String>>,
     next_inode: AtomicU64,
     ttl: Duration,
@@ -295,7 +269,7 @@ impl Filesystem for DAFSfs {
 
     // 2. Permitir que el OS encuentre "hola.txt" dentro de la raíz
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        info!(
+        debug!(
             parent = parent.0,
             name = name.to_string_lossy().to_string(),
             "Looking up entry"
@@ -308,7 +282,7 @@ impl Filesystem for DAFSfs {
                 return;
             }
         };
-        info!(
+        debug!(
             parent_path = parent_path,
             name = name.to_string_lossy().to_string(),
             "Resolved parent path"
@@ -320,7 +294,7 @@ impl Filesystem for DAFSfs {
             full_path.clone(),
             &token,
         ));
-        info!(full_path = full_path, "Got file metadata");
+        debug!(full_path = full_path, "Got file metadata");
         let file_metadata = match file_metadata {
             Ok(m) => m,
             Err(err) => {
@@ -328,13 +302,13 @@ impl Filesystem for DAFSfs {
                 return;
             }
         };
-        info!(
+        debug!(
             full_path = full_path,
             size = file_metadata.size,
             "File metadata retrieved successfully"
         );
         let ino = self.get_new_inode(full_path.clone());
-        info!(
+        debug!(
             full_path = full_path,
             ino = ino.0,
             "Assigned inode for entry"
@@ -368,7 +342,7 @@ impl Filesystem for DAFSfs {
                 return;
             }
         };
-        info!(ino = ino.0, path = path, "Reading directory");
+        debug!(ino = ino.0, path = path, "Reading directory");
         //Check if dir or file todo
         let token = self.token.blocking_read().clone();
         let list_directory_response = self.runtime.block_on(fscore::list_directory(
@@ -386,7 +360,7 @@ impl Filesystem for DAFSfs {
                 return;
             }
         };
-        info!(
+        debug!(
             path = path,
             file_count = list_directory_response.files.len(),
             "Directory listed successfully"
@@ -399,7 +373,7 @@ impl Filesystem for DAFSfs {
 
         let mut files = list_directory_response.files;
         files.sort_by(|a, b| a.filename.cmp(&b.filename));
-        info!(
+        debug!(
             path = path,
             file_count = files.len(),
             "Sorted directory entries"
@@ -412,7 +386,7 @@ impl Filesystem for DAFSfs {
                 "..".to_string(),
             ),
         ];
-        info!(path = path, "Added . and .. entries");
+        debug!(path = path, "Added . and .. entries");
         let mut inode_map = self.inode_map.blocking_write();
         for file in files {
             let file_path = self.join_path(&path, OsStr::new(&file.filename));
@@ -434,7 +408,7 @@ impl Filesystem for DAFSfs {
                 file.filename,
             ));
         }
-        info!(
+        debug!(
             path = path,
             entry_count = entries.len(),
             "Prepared directory entries for reply"
@@ -442,7 +416,7 @@ impl Filesystem for DAFSfs {
 
         for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
             // El offset ayuda al kernel a saber por dónde va la lectura
-            info!(ino = entry.0 .0, name = entry.2, "Adding directory entry");
+            debug!(ino = entry.0 .0, name = entry.2, "Adding directory entry");
             if reply.add(entry.0, (i + 1) as u64, entry.1, entry.2) {
                 break;
             }
@@ -460,7 +434,7 @@ impl Filesystem for DAFSfs {
         _flags: i32,
         reply: fuser::ReplyCreate,
     ) {
-        info!(
+        debug!(
             parent = parent.0,
             name = name.to_string_lossy().to_string(),
             "Looking up entry"
@@ -473,7 +447,7 @@ impl Filesystem for DAFSfs {
                 return;
             }
         };
-        info!(
+        debug!(
             parent_path = parent_path,
             name = name.to_string_lossy().to_string(),
             "Resolved parent path"
@@ -528,14 +502,8 @@ impl Filesystem for DAFSfs {
         }
     }
 
-    fn open(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        flags: fuser::OpenFlags,
-        reply: fuser::ReplyOpen,
-    ) {
-        info!(ino = ino.0, flags = ?flags, "Opening file");
+    fn open(&self, _req: &Request, ino: INodeNo, flags: fuser::OpenFlags, reply: fuser::ReplyOpen) {
+        debug!(ino = ino.0, flags = ?flags, "Opening file");
         let path = match self.get_path_by_inode(ino) {
             Some(p) => p,
             None => {
@@ -559,7 +527,7 @@ impl Filesystem for DAFSfs {
 
         let is_truncate = (flags.0 & libc::O_TRUNC) != 0;
         if is_truncate {
-            if let Err(err) = self.truncate_remote_file(&path, &token) {
+            if let Err(err) = self.resize_remote_file(&path, 0, &token) {
                 error!(path = path, error = %err, "Failed to truncate file on open");
                 reply.error(self.map_error(&err));
                 return;
@@ -568,7 +536,11 @@ impl Filesystem for DAFSfs {
 
         // O_APPEND => append writes at end. Otherwise we treat writes as overwrite from 0.
         let is_append = (flags.0 & libc::O_APPEND) != 0;
-        let effective_size = if is_truncate { 0 } else { file_meta.size.max(0) as u64 };
+        let effective_size = if is_truncate {
+            0
+        } else {
+            file_meta.size.max(0) as u64
+        };
         let base_offset = if is_append { effective_size } else { 0 };
         self.state.blocking_write().files.insert(
             FileHandle(ino.0),
@@ -597,49 +569,70 @@ impl Filesystem for DAFSfs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyWrite,
     ) {
-        
-        info!(
+        debug!(
             ino = ino.0,
             fh = fh.0,
             offset,
             len = data.len(),
             "Write request"
         );
-        
-        let mut state_lock = self.state.blocking_write();
-        let entry = match state_lock.files.get_mut(&fh) {
-            Some(e) => e,
-            None => {
-                error!("File handle not found");
-                reply.error(Errno::from_i32(EIO));
+
+        let (buffered_len, flush_threshold) = {
+            let mut state_lock = self.state.blocking_write();
+            let entry = match state_lock.files.get_mut(&fh) {
+                Some(e) => e,
+                None => {
+                    error!("File handle not found");
+                    reply.error(Errno::from_i32(EIO));
+                    return;
+                }
+            };
+
+            // No sparse writes: enforce a contiguous stream from base_offset.
+            if offset != entry.next_expected_offset {
+                error!(
+                    expected = entry.next_expected_offset,
+                    got = offset,
+                    "Sparse/non-contiguous write rejected"
+                );
+                reply.error(Errno::from_i32(libc::EINVAL));
                 return;
             }
+
+            entry.buffer.extend_from_slice(data);
+            entry.next_expected_offset = entry.next_expected_offset.saturating_add(data.len() as u64);
+            entry.size = entry.size.max(entry.next_expected_offset);
+            entry.dirty = true;
+
+            let buffered = entry.buffer.len();
+            // Flush in larger batches to amortize allocate_blocks + set_ready RPC overhead.
+            // With 64 KiB upload chunks, this yields a 4 MiB threshold by default.
+            let thresh = (self.settings.upload_chunk_size.saturating_mul(64))
+                .clamp(1024 * 1024, 8 * 1024 * 1024);
+            debug!(
+                fh = fh.0,
+                offset,
+                len = data.len(),
+                buffered = buffered,
+                "Write buffered"
+            );
+            (buffered, thresh)
         };
 
-        // No sparse writes: enforce a contiguous stream from base_offset.
-        if offset != entry.next_expected_offset {
-            error!(
-                expected = entry.next_expected_offset,
-                got = offset,
-                "Sparse/non-contiguous write rejected"
-            );
-            reply.error(Errno::from_i32(libc::EINVAL));
-            return;
+        let should_flush = buffered_len >= flush_threshold;
+        if should_flush {
+            match self.flush_pending_buffer(fh, flush_threshold) {
+                Ok(()) => {
+                    debug!(fh = fh.0, threshold = flush_threshold, "Buffered chunk upload completed after write");
+                }
+                Err(err) => {
+                    error!(fh = fh.0, error = %err, "Failed buffered chunk upload during write");
+                    reply.error(Errno::from_i32(EIO));
+                    return;
+                }
+            }
         }
 
-        entry.buffer.extend_from_slice(data);
-        entry.next_expected_offset = entry
-            .next_expected_offset
-            .saturating_add(data.len() as u64);
-        entry.size = entry.size.max(entry.next_expected_offset);
-        entry.dirty = true;
-
-        info!(
-            fh = fh.0,
-            offset,
-            len = data.len(),
-            "Write buffered"
-        );
         reply.written(data.len() as u32);
     }
 
@@ -684,66 +677,26 @@ impl Filesystem for DAFSfs {
         _lock_owner: fuser::LockOwner,
         reply: fuser::ReplyEmpty,
     ) {
-        info!(ino = ino.0, fh = fh.0, "Flush request");
-        
-        let mut state_lock = self.state.blocking_write();
-        let entry = match state_lock.files.get_mut(&fh) {
-            Some(e) => e,
-            None => {
-                info!("File handle not found, considering already closed");
-                reply.ok();
-                return;
-            }
-        };
-
-        if !entry.dirty {
-            debug!(fh = fh.0, "File not dirty, skipping flush");
-            reply.ok();
-            return;
-        }
-
-        // Prepare data for upload
-        let remote_path = entry.remote_path.clone();
-        let buffer = entry.buffer.clone();
-        let base_offset = entry.base_offset;
-
-        drop(state_lock);
-
-        let token = self.token.blocking_read().clone();
-        
-        info!(
-            path = &remote_path,
-            size = buffer.len(),
-            base_offset,
-            "Starting streamed file range upload"
-        );
-
-        match self.runtime.block_on(fscore::write_file_range(
-            self.settings.clone(),
-            remote_path.clone(),
-            base_offset,
-            buffer,
-            &token,
-        )) {
-            Ok(_) => {
-                info!(path = &remote_path, "File range uploaded successfully");
-                let mut state_lock = self.state.blocking_write();
-                if let Some(entry) = state_lock.files.get_mut(&fh) {
-                    entry.dirty = false;
-                    entry.base_offset = entry.next_expected_offset;
-                    entry.buffer.clear();
-                }
-                reply.ok();
-            }
+        debug!(ino = ino.0, fh = fh.0, "Flush request");
+        match self.flush_pending_buffer(fh, 1) {
+            Ok(()) => reply.ok(),
             Err(err) => {
-                error!(path = &remote_path, error = %err, "Failed to stream file range");
-                let mut state_lock = self.state.blocking_write();
-                if let Some(entry) = state_lock.files.get_mut(&fh) {
-                    entry.dirty = true;
-                }
+                error!(fh = fh.0, error = %err, "Failed to flush buffered data");
                 reply.error(Errno::from_i32(EIO));
             }
         }
+    }
+
+    fn fsync(
+            &self,
+            req: &Request,
+            ino: INodeNo,
+            fh: FileHandle,
+            datasync: bool,
+            reply: fuser::ReplyEmpty,
+        ) {
+        debug!(ino = ino.0, fh = fh.0, datasync, "Fsync request");
+        self.flush(req, ino, fh, fuser::LockOwner(0), reply);
     }
 
     fn release(
@@ -756,13 +709,13 @@ impl Filesystem for DAFSfs {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        info!(ino = ino.0, fh = fh.0, "Release request");
-        
+        debug!(ino = ino.0, fh = fh.0, "Release request");
+
         let mut state_lock = self.state.blocking_write();
         if let Some(_entry) = state_lock.files.remove(&fh) {
-            info!(fh = fh.0, "File handle released and cleaned up");
+            debug!(fh = fh.0, "File handle released and cleaned up");
         }
-        
+
         reply.ok();
     }
 
@@ -784,7 +737,7 @@ impl Filesystem for DAFSfs {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        info!(ino = ino.0, size = size, "Setattr request");
+        debug!(ino = ino.0, size = size, "Setattr request");
         let path = match self.get_path_by_inode(ino) {
             Some(p) => p,
             None => {
@@ -794,31 +747,41 @@ impl Filesystem for DAFSfs {
         };
         let token = self.token.blocking_read().clone();
         if let Some(new_size) = size {
-            if new_size != 0 {
-                reply.error(Errno::from_i32(libc::ENOSYS));
-                return;
-            }
-
-            match self.truncate_remote_file(&path, &token) {
+            match self.resize_remote_file(&path, new_size, &token) {
                 Ok(_) => {
-                    // Reset any open buffered state for this path after truncation.
+                    // Reset open buffered state for this path after resize.
                     let mut state = self.state.blocking_write();
                     for entry in state.files.values_mut() {
                         if entry.remote_path == path {
                             entry.dirty = false;
-                            entry.size = 0;
+                            entry.size = new_size;
                             entry.buffer.clear();
-                            entry.base_offset = 0;
-                            entry.next_expected_offset = 0;
+                            if entry.base_offset > new_size {
+                                entry.base_offset = new_size;
+                            }
+                            if entry.next_expected_offset > new_size {
+                                entry.next_expected_offset = new_size;
+                            }
                         }
                     }
-                    reply.attr(
-                        &self.ttl,
-                        &self.file_attr(ino, 0, 0, FileType::RegularFile),
-                    );
+
+                    match self.runtime.block_on(fscore::get_file_metadata(
+                        self.settings.clone(),
+                        path,
+                        &token,
+                    )) {
+                        Ok(meta) => reply.attr(
+                            &self.ttl,
+                            &self.file_attr(ino, meta.size, meta.created_at, FileType::RegularFile),
+                        ),
+                        Err(_) => reply.attr(
+                            &self.ttl,
+                            &self.file_attr(ino, new_size as i64, 0, FileType::RegularFile),
+                        ),
+                    }
                 }
                 Err(err) => {
-                    error!(path = path, error = %err, "Failed to truncate file on setattr");
+                    error!(path = path, size = new_size, error = %err, "Failed to resize file on setattr");
                     reply.error(self.map_error(&err));
                 }
             }
@@ -837,7 +800,7 @@ impl Filesystem for DAFSfs {
         _flags: fuser::RenameFlags,
         reply: fuser::ReplyEmpty,
     ) {
-        info!(
+        debug!(
             parent = parent.0,
             new_parent = newparent.0,
             current_name = name.to_str(),
@@ -884,9 +847,201 @@ impl Filesystem for DAFSfs {
             }
         }
     }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
+        debug!(
+            parent = parent.0,
+            name = name.to_str(),
+            "Deleting file"
+        );
+
+        let parent_path = match self.get_path_by_inode(parent) {
+            Some(p) => p,
+            None => {
+                reply.error(Errno::from_i32(ENOENT));
+                return;
+            }
+        };
+
+        let file_path = self.join_path(&parent_path, name);
+
+        let token = self.token.blocking_read().clone();
+
+        match self.runtime.block_on(fscore::delete_file(
+            self.settings.clone(),
+            file_path.clone(),
+            &token,
+        )) {
+            Ok(_) => {
+                let mut inode_map = self.inode_map.blocking_write();
+                if let Some(ino) = inode_map.get_by_right(&file_path).copied() {
+                    inode_map.remove_by_left(&ino);
+                }
+                reply.ok();
+            }
+            Err(err) => {
+                error!(path = file_path, error = %err, "Delete failed");
+                reply.error(self.map_error(&err));
+            }
+        }
+    }
+
+    fn mkdir(
+            &self,
+            _req: &Request,
+            _parent: INodeNo,
+            _name: &OsStr,
+            _mode: u32,
+            _umask: u32,
+            reply: ReplyEntry,
+        ) {
+        reply.error(Errno::from_i32(libc::ENOSYS));
+    }
+
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
+        reply.statfs(4096, 4096, 4096, 50, 255, 10000, 255, 4096*4);
+    }
 }
 
 impl DAFSfs {
+    fn flush_pending_buffer(
+        &self,
+        fh: FileHandle,
+        min_bytes_to_flush: usize,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (remote_path, base_offset, mut pending) = {
+            let mut state_lock = self.state.blocking_write();
+            let entry = match state_lock.files.get_mut(&fh) {
+                Some(e) => e,
+                None => return Ok(()),
+            };
+
+            if !entry.dirty {
+                return Ok(());
+            }
+
+            if entry.buffer.is_empty() {
+                entry.dirty = false;
+                return Ok(());
+            }
+
+            if entry.buffer.len() < min_bytes_to_flush {
+                return Ok(());
+            }
+
+            (
+                entry.remote_path.clone(),
+                entry.base_offset,
+                std::mem::take(&mut entry.buffer),
+            )
+        };
+
+        let token = self.token.blocking_read().clone();
+        let to_upload = std::mem::take(&mut pending);
+        let uploaded = to_upload.len() as u64;
+
+        debug!(
+            fh = fh.0,
+            path = &remote_path,
+            base_offset,
+            size = to_upload.len(),
+            "Uploading buffered range"
+        );
+
+        if let Err(err) = self.runtime.block_on(fscore::write_file_range(
+            self.settings.clone(),
+            remote_path.clone(),
+            base_offset,
+            to_upload.clone(),
+            &token,
+        )) {
+            let mut state_lock = self.state.blocking_write();
+            if let Some(entry) = state_lock.files.get_mut(&fh) {
+                if entry.buffer.is_empty() {
+                    entry.buffer = to_upload;
+                } else {
+                    let mut merged = to_upload;
+                    merged.extend_from_slice(&entry.buffer);
+                    entry.buffer = merged;
+                }
+                entry.base_offset = base_offset;
+                entry.dirty = true;
+            }
+            return Err(err);
+        }
+
+        let mut state_lock = self.state.blocking_write();
+        if let Some(entry) = state_lock.files.get_mut(&fh) {
+            entry.base_offset = base_offset.saturating_add(uploaded);
+            entry.dirty = !entry.buffer.is_empty();
+        }
+
+        Ok(())
+    }
+
+    fn resize_remote_file(
+        &self,
+        path: &str,
+        new_size: u64,
+        token: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let meta = self.runtime.block_on(fscore::get_file_metadata(
+            self.settings.clone(),
+            path.to_string(),
+            token,
+        ))?;
+        let current_size = meta.size.max(0) as u64;
+
+        if new_size == current_size {
+            return Ok(());
+        }
+
+        if new_size == 0 {
+            return self.truncate_remote_file(path, token);
+        }
+
+        if new_size < current_size {
+            // Keep prefix bytes [0, new_size), rebuild file, then write prefix back.
+            let preserved = self.runtime.block_on(fscore::read_file_range(
+                self.settings.clone(),
+                path.to_string(),
+                0,
+                new_size,
+                token,
+            ))?;
+            self.truncate_remote_file(path, token)?;
+            if !preserved.is_empty() {
+                self.runtime.block_on(fscore::write_file_range(
+                    self.settings.clone(),
+                    path.to_string(),
+                    0,
+                    preserved,
+                    token,
+                ))?;
+            }
+            return Ok(());
+        }
+
+        // Extend with zero-filled chunks.
+        let mut remaining = new_size - current_size;
+        let mut write_offset = current_size;
+        const ZERO_CHUNK_SIZE: usize = 1024 * 1024;
+        while remaining > 0 {
+            let chunk_len = std::cmp::min(remaining, ZERO_CHUNK_SIZE as u64) as usize;
+            self.runtime.block_on(fscore::write_file_range(
+                self.settings.clone(),
+                path.to_string(),
+                write_offset,
+                vec![0u8; chunk_len],
+                token,
+            ))?;
+            write_offset += chunk_len as u64;
+            remaining -= chunk_len as u64;
+        }
+
+        Ok(())
+    }
+
     fn truncate_remote_file(
         &self,
         path: &str,
@@ -927,13 +1082,13 @@ impl DAFSfs {
 
     fn map_error(&self, err: &Box<dyn std::error::Error + Send + Sync>) -> Errno {
         if let Some(status) = err.downcast_ref::<tonic::Status>() {
-            return match status.code() {
+            match status.code() {
                 tonic::Code::NotFound => Errno::from_i32(ENOENT),
                 tonic::Code::AlreadyExists => Errno::from_i32(EEXIST),
                 tonic::Code::FailedPrecondition => Errno::from_i32(ENOTDIR),
                 tonic::Code::PermissionDenied => Errno::from_i32(libc::EACCES),
                 _ => Errno::from_i32(EIO),
-            };
+            }
         } else {
             Errno::from_i32(EIO)
         }
@@ -942,14 +1097,14 @@ impl DAFSfs {
     fn intitialize(&self) {
         self.inode_map.blocking_write().insert(1, "/".to_string());
         self.runtime
-            .block_on(fscore::login_user(
+            .block_on(fscore::register_user(
                 self.settings.clone(),
                 "pepe".to_string(),
                 "pepe".to_string(),
             ))
             .unwrap();
         let token = fscore::read_access_token(&self.settings.access_token_path).unwrap();
-        *self.token.blocking_write() = token;
+        *self.token.blocking_write() = Arc::new(token);
     }
 
     fn join_path(&self, parent_path: &str, name: &OsStr) -> String {
@@ -987,7 +1142,7 @@ impl DAFSfs {
         FileAttr {
             ino,
             size: size.max(0) as u64,
-            blocks: ((size.max(0) as u64) + 511) / 512,
+            blocks: (size.max(0) as u64).div_ceil(512),
             atime: timestamp,
             mtime: timestamp,
             ctime: timestamp,
@@ -1005,11 +1160,6 @@ impl DAFSfs {
             flags: 0,
             blksize: 512,
         }
-    }
-
-    fn is_not_found_error(&self, msg: &str) -> bool {
-        let lower = msg.to_lowercase();
-        lower.contains("notfound") || lower.contains("not found")
     }
 
     fn is_not_directory_error(&self, msg: &str) -> bool {
@@ -1072,10 +1222,10 @@ impl DAFSfs {
 fn main() {
     let settings = Arc::new(load_config());
 
-    common::init_tracing("fuse", "DEBUG");
+    let _guard = common::init_tracing("fuse", &settings.log_level);
     debug!("CLI configuration loaded: {:?}", settings);
-    info!("DAFS CLI starting");
-    info!("Master node: {}", settings.master_endpoints.join(", "));
+    debug!("DAFS CLI starting");
+    debug!("Master node: {}", settings.master_endpoints.join(", "));
     let mut config = Config::default();
     config.mount_options = vec![MountOption::RW, MountOption::AutoUnmount];
     config.acl = fuser::SessionACL::All;
@@ -1083,10 +1233,12 @@ fn main() {
         inode_map: RwLock::new(BiMap::new()),
         runtime: Arc::new(Runtime::new().unwrap()),
         next_inode: AtomicU64::new(2),
-        token: RwLock::new(String::new()),
+        token: RwLock::new(Arc::new(String::new())),
         ttl: Duration::from_secs(2),
         settings,
-        state: Arc::new(RwLock::new(DAFSState { files: HashMap::new() })),
+        state: Arc::new(RwLock::new(DAFSState {
+            files: HashMap::new(),
+        })),
     };
 
     if let Err(err) = ensure_mountpoint(MOUNTPOINT) {
@@ -1094,13 +1246,19 @@ fn main() {
     }
 
     if is_likely_mounted(MOUNTPOINT) {
-        info!(path = MOUNTPOINT, "Detected existing mount; trying to unmount stale mount before start");
+        debug!(
+            path = MOUNTPOINT,
+            "Detected existing mount; trying to unmount stale mount before start"
+        );
         try_unmount(MOUNTPOINT);
     }
 
     let mountpoint_for_signal = MOUNTPOINT.to_string();
     if let Err(err) = ctrlc::set_handler(move || {
-        info!(path = mountpoint_for_signal, "Signal received, attempting unmount");
+        debug!(
+            path = mountpoint_for_signal,
+            "Signal received, attempting unmount"
+        );
         try_unmount(&mountpoint_for_signal);
         std::process::exit(130);
     }) {

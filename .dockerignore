@@ -1,0 +1,22 @@
+# Build outputs and VCS metadata
+.git
+.gitignore
+target
+
+# Local/secret files
+.token
+.env
+**/.env
+
+# Auditing stack assets are not needed to compile Rust services
+Auditing/certs
+Auditing/esdata
+Auditing/esdata01
+Auditing/grafana/storage
+
+# Docs and non-runtime project artifacts
+Memoria
+Internal
+
+# Optional: local test artifacts
+testing

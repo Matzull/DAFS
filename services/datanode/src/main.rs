@@ -1,4 +1,8 @@
 use clap::Parser;
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use common::dfs::data_node_service_client::DataNodeServiceClient;
 use common::dfs::data_node_service_server::{DataNodeService, DataNodeServiceServer};
 use common::dfs::metadata_service_client::MetadataServiceClient;
@@ -681,7 +685,7 @@ impl DataNodeService for Datanode {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = Arc::new(load_config());
 
-    common::init_tracing("datanode", &settings.log_level);
+    let _guard = common::init_tracing("datanode", &settings.log_level);
     info!("Starting DataNode with settings: {:?}", settings);
     debug!("Creating directory to store files");
     create_dir_all(&settings.data_folder).await?;
@@ -737,7 +741,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             let current_node_id = *node_id_arc.lock().await as u32;
 
-            info!("Sending heartbeat");
+            debug!("Sending heartbeat");
             let token = match common::create_access_token(
                 &settings.jwt_secret,
                 &format!("datanode-{current_node_id}"),
@@ -860,6 +864,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     Server::builder()
+        .concurrency_limit_per_connection(512)
+        .initial_stream_window_size(Some(2 * 1024 * 1024))
+        .initial_connection_window_size(Some(8 * 1024 * 1024))
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
+        .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
+        .tcp_nodelay(true)
         .add_service(service)
         .serve(address)
         .await?;

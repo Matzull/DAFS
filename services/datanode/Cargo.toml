@@ -19,6 +19,7 @@ figment = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
 crc32fast = { workspace = true }
 bytes ={ workspace = true}
+mimalloc = "0.1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

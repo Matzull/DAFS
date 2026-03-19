@@ -11,6 +11,7 @@ tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 jsonwebtoken = { workspace = true }
+tracing-appender = "0.2.4"
 
 [build-dependencies]
 tonic-build = { workspace = true }

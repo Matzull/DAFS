@@ -1,0 +1,36 @@
+services:
+  datanode:
+    build:
+      context: ..
+      dockerfile: deployment/dockerfiles/datanode.dockerfile
+    container_name: ${DATANODE_CONTAINER_NAME:-dafs-datanode}
+    ports:
+      - "${DATANODE_HOST_PORT:-8080}:8080"
+    volumes:
+      - datanode-data:/app/data
+      - datanode-logs:/app/logs
+      - ${DATANODE_CONFIG_PATH:-../services/datanode/config.toml}:/config/datanode.toml:ro
+    environment:
+      - RUST_LOG=${DATANODE_RUST_LOG:-info}
+    command:
+      - --config-path
+      - /config/datanode.toml
+      - --listen-address
+      - ${DATANODE_LISTEN_ADDRESS:-[::]:8080}
+      - --data-folder
+      - /app/data/datanode
+      - --metadata-node-address
+      - ${DATANODE_METADATA_ADDRESS:-http://master0:9090}
+      - --metadata-node-endpoints
+      - ${DATANODE_METADATA_ENDPOINTS:-http://master0:9090,http://master1:9091,http://master2:9092}
+    networks:
+      - dafs-net
+
+volumes:
+  datanode-data:
+  datanode-logs:
+
+networks:
+  dafs-net:
+    external: true
+    name: ${DAFS_NETWORK_NAME:-dafs-net}

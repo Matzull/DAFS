@@ -25,7 +25,7 @@ struct SnapshotState {
     available_datanodes: HashMap<u16, DatanodeInfo>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct StoreInner {
     vote: Option<Vote<NodeId>>,
     committed: Option<LogId<NodeId>>,
@@ -34,20 +34,6 @@ struct StoreInner {
     last_membership: StoredMembership<NodeId, BasicNode>,
     logs: BTreeMap<u64, Entry<TypeConfig>>,
     current_snapshot: Option<Snapshot<TypeConfig>>,
-}
-
-impl Default for StoreInner {
-    fn default() -> Self {
-        Self {
-            vote: None,
-            committed: None,
-            last_purged_log_id: None,
-            last_applied_log: None,
-            last_membership: StoredMembership::default(),
-            logs: BTreeMap::new(),
-            current_snapshot: None,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -69,9 +55,9 @@ impl Default for MasterStateMachine {
 }
 
 impl MasterStateMachine {
-    pub fn new() -> Self {
-        Self::default()
-    }
+    // pub fn new() -> Self {
+    //     Self::default()
+    // }
 
     pub fn new_with_state(state: Arc<MasterState>) -> Self {
         Self {

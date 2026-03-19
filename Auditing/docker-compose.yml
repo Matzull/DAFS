@@ -1,7 +1,7 @@
 networks:
- default:
-   name: elastic
-   external: false
+  default:
+    external: true
+    name: elastic
 
 services:
   setup:
@@ -49,12 +49,7 @@ services:
         chown -R root:root config/certs;
         find . -type d -exec chmod 750 \{\} \;;
         find . -type f -exec chmod 640 \{\} \;;
-        echo "Waiting for Elasticsearch availability";
-        until curl -s --cacert config/certs/ca/ca.crt https://es01:9200 | grep -q "missing authentication credentials"; do sleep 30; done;
-        echo "Setting kibana_system password";
-        echo "Waiting for Elasticsearch to accept API requests";
-        until curl -s -X POST --cacert config/certs/ca/ca.crt -u "elastic:${ELASTIC_PASSWORD}" -H "Content-Type: application/json" https://es01:9200/_security/user/kibana_system/_password -d "{\"password\":\"${KIBANA_PASSWORD}\"}" | grep -q "^{}"; do sleep 10; done;
-        echo "Importing Elasticsearch index template";
+        echo "Skipping Elasticsearch API bootstrap in setup (handled after stack is up)";
         echo "All done!";
       '
     healthcheck:
@@ -66,7 +61,7 @@ services:
   es01:
     depends_on:
       setup:
-        condition: service_healthy
+        condition: service_completed_successfully
     image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
     labels:
       co.elastic.logs/module: elasticsearch
@@ -79,7 +74,9 @@ services:
       - node.name=es01
       - cluster.name=${CLUSTER_NAME}
       - discovery.type=single-node
+      - ES_JAVA_OPTS=${ES_JAVA_OPTS:--Xms384m -Xmx384m}
       - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - xpack.ml.enabled=${ES_XPACK_ML_ENABLED:-false}
       - bootstrap.memory_lock=true
       - xpack.security.enabled=true
       - xpack.security.http.ssl.enabled=true

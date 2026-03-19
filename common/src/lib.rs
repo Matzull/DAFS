@@ -139,28 +139,31 @@ pub fn attach_bearer_token<T>(
     Ok(())
 }
 
-pub fn init_tracing(component: &str, default_level: &str) {
+pub fn init_tracing(component: &str, default_level: &str) -> tracing_appender::non_blocking::WorkerGuard {
     let configured_level = std::env::var("RUST_LOG").unwrap_or_else(|_| default_level.to_string());
-    let base_filter = tracing_subscriber::EnvFilter::new("info");
-    let directive = format!("{component}={configured_level}").parse();
 
-    let filter = match directive {
-        Ok(directive) => base_filter.add_directive(directive),
-        Err(_) => base_filter,
-    }
-    // OpenRaft internals can generate high-frequency transport/election logs during
-    // outages; keep app-level quorum and membership logs as the primary signal.
-    .add_directive("openraft=off".parse().expect("valid tracing directive"));
+    let filter = tracing_subscriber::EnvFilter::new(configured_level.clone())
+        .add_directive(
+            format!("{component}={configured_level}")
+                .parse()
+                .unwrap_or("info".parse().unwrap()),
+        )
+        .add_directive("openraft=off".parse().expect("valid tracing directive"));
 
-    if let Err(err) = tracing_subscriber::fmt()
+    // 'never' es perfecto si vas a usar logrotate con copytruncate
+    let file_appender = tracing_appender::rolling::never("./logs", format!("{}.log", component));
+    let (non_blocking_file, guard) = tracing_appender::non_blocking(file_appender);
+
+    tracing_subscriber::fmt()
         .compact()
         .with_timer(CompactTimestamp)
         .with_target(false)
         .with_env_filter(filter)
-        .try_init()
-    {
-        eprintln!("Tracing init skipped: {err}");
-    }
+        .with_ansi(false) // Recomendado: evita caracteres de colores en el archivo
+        .with_writer(non_blocking_file) // <--- ESTO ES CLAVE
+        .init();
+
+    guard // Devolvemos el guard
 }
 
 // Helper to easily print Audit Events (Optional but useful for debugging)

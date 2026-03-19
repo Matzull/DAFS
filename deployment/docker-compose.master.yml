@@ -1,0 +1,43 @@
+services:
+  master:
+    build:
+      context: ..
+      dockerfile: deployment/dockerfiles/master.dockerfile
+    container_name: ${MASTER_CONTAINER_NAME:-dafs-master}
+    ports:
+      - "${MASTER_HOST_PORT:-9090}:${MASTER_SERVICE_PORT:-9090}"
+    volumes:
+      - master-data:/app/data
+      - master-logs:/app/logs
+      - ${MASTER_CONFIG_PATH:-../services/master/config.toml}:/config/master.toml:ro
+      - ${MASTER_ENV_PATH:-../services/master/.env}:/config/master.env:ro
+    environment:
+      - RUST_LOG=${MASTER_RUST_LOG:-info}
+    command:
+      - --config-path
+      - /config/master.toml
+      - --listen-address
+      - ${MASTER_LISTEN_ADDRESS:-[::]:9090}
+      - --raft-bootstrap
+      - ${MASTER_RAFT_BOOTSTRAP:-false}
+      - --raft-node-id
+      - ${MASTER_RAFT_NODE_ID:-0}
+      - --raft-initial-members
+      - ${MASTER_RAFT_INITIAL_MEMBERS:-}
+      - --wal-path
+      - ${MASTER_WAL_PATH:-/app/data/master.wal}
+      - --auth-db-path
+      - ${MASTER_AUTH_DB_PATH:-/app/data/users.db}
+      - --env-file-path
+      - /config/master.env
+    networks:
+      - dafs-net
+
+volumes:
+  master-data:
+  master-logs:
+
+networks:
+  dafs-net:
+    external: true
+    name: ${DAFS_NETWORK_NAME:-dafs-net}

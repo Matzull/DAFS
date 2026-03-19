@@ -157,7 +157,7 @@ async fn main() {
     let cli = Cli::parse();
     let settings = Arc::new(load_config());
 
-    common::init_tracing("cli", &settings.log_level);
+    let _guard = common::init_tracing("cli", &settings.log_level);
     debug!("CLI configuration loaded: {:?}", settings);
     info!("DAFS CLI starting");
     info!("Master node: {}", settings.master_endpoints.join(", "));

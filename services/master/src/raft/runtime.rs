@@ -48,8 +48,7 @@ impl MasterRaftContext {
         settings: &InternalSettings,
         initial_state: Arc<MasterState>,
     ) -> Result<Self, Box<dyn Error>> {
-        let mut config = openraft::Config::default();
-        config.cluster_name = settings.raft_cluster_name.clone();
+        let config =openraft::Config { cluster_name: settings.raft_cluster_name.clone(), ..Default::default() };
         let config = Arc::new(config.validate()?);
 
         let store = MasterStateMachine::new_with_state(initial_state);
@@ -151,26 +150,26 @@ fn parse_member_nodes(items: &[String]) -> Result<HashMap<NodeId, BasicNode>, Bo
     Ok(nodes)
 }
 
-fn warn_membership_fault_tolerance(voter_count: usize) {
-    if voter_count <= 1 {
-        return;
-    }
+// fn warn_membership_fault_tolerance(voter_count: usize) {
+//     if voter_count <= 1 {
+//         return;
+//     }
 
-    if voter_count == 2 {
-        warn!(
-            voter_count,
-            "Raft cluster configured with 2 voters: if one node disconnects, there is no quorum for writes or leader election"
-        );
-        return;
-    }
+//     if voter_count == 2 {
+//         warn!(
+//             voter_count,
+//             "Raft cluster configured with 2 voters: if one node disconnects, there is no quorum for writes or leader election"
+//         );
+//         return;
+//     }
 
-    if voter_count % 2 == 0 {
-        warn!(
-            voter_count,
-            "Raft cluster configured with an even number of voters; use an odd number (3,5,...) for better fault tolerance"
-        );
-    }
-}
+//     if voter_count % 2 == 0 {
+//         warn!(
+//             voter_count,
+//             "Raft cluster configured with an even number of voters; use an odd number (3,5,...) for better fault tolerance"
+//         );
+//     }
+// }
 
 fn normalize_http_addr(addr: &str) -> String {
     if addr.starts_with("http://") || addr.starts_with("https://") {

@@ -15,7 +15,7 @@ download_concurrency = 16
 log_level = "info"
 
 # Upload streaming chunk size (bytes)
-upload_chunk_size = 65536
+upload_chunk_size = 1048576
 
 # Metadata user identity and status defaults
 default_user_id = "1"

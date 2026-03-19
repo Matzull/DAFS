@@ -55,8 +55,8 @@ impl Default for DafsSettings {
             master_endpoints: vec!["http://[::1]:9090".to_string()],
             upload_concurrency: 2,
             download_concurrency: 10,
-            log_level: "info".to_string(),
-            upload_chunk_size: 64 * 1024,
+            log_level: "warn".to_string(),
+            upload_chunk_size: 1024 * 1024,
             default_user_id: "1".to_string(),
             upload_ready_status: "READY".to_string(),
             default_list_path: "/".to_string(),
@@ -691,7 +691,7 @@ pub async fn set_file_status_ready(
         path: file_path.clone(),
         status: settings.upload_ready_status.clone(),
     });
-    common::attach_bearer_token(&mut set_status_request, access_token.clone())?;
+    common::attach_bearer_token(&mut set_status_request, access_token)?;
     let preferred = discover_leader_endpoint(settings.as_ref()).await;
     let mut meta_client = connect_metadata_client(settings.as_ref(), preferred).await?;
     match meta_client.set_file_status(set_status_request).await {
@@ -706,11 +706,11 @@ pub async fn set_file_status_ready(
                 path: file_path,
                 status: settings.upload_ready_status.clone(),
             });
-            common::attach_bearer_token(&mut retry_request, access_token.clone())?;
+            common::attach_bearer_token(&mut retry_request, access_token)?;
             retry_client.set_file_status(retry_request).await?;
             Ok(true)
         }
-        Err(status) => return Err(Box::new(status)),
+        Err(status) => Err(Box::new(status)),
     }
 }
 

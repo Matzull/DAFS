@@ -36,3 +36,6 @@ Auditing/grafana/storage/*
 Auditing/grafana/plugin/node_modules/
 Auditing/grafana/plugin/dist/
 Auditing/grafana/plugin/backend/__pycache__/
+
+deployment/ansible/generated/*
+deployment/ansible/cluster_config.json

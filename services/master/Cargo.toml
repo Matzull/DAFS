@@ -25,6 +25,7 @@ argon2 = { workspace = true }
 rusqlite = { workspace = true }
 radix_trie = "0.3.0"
 openraft = { version = "0.9.21", features = ["serde"] }
+mimalloc = "0.1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

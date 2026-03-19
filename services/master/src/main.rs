@@ -6,6 +6,10 @@ mod raft {
     pub mod state_machine;
     pub mod types;
 }
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use crate::auth::AuthManager;
 use crate::models::{BlockMetadata, DatanodeInfo, FileMetadata, FileStatus, MasterState};
 use common::dfs::metadata_service_server::{MetadataService, MetadataServiceServer};
@@ -273,7 +277,7 @@ struct Cli {
     raft_bootstrap: Option<bool>,
 
     /// Initial raft members in format <id>=<addr>; can be specified multiple times
-    #[arg(long)]
+    #[arg(long, value_delimiter = ',')]
     #[serde(skip_serializing_if = "Option::is_none")]
     raft_initial_members: Option<Vec<String>>,
 
@@ -427,7 +431,7 @@ impl RaftService for RaftRpcNode {
                 voters = ?req.voter_ids,
                 "Requested 2-voter membership: if one node disconnects, cluster loses quorum"
             );
-        } else if req.voter_ids.len() > 2 && req.voter_ids.len() % 2 == 0 {
+        } else if req.voter_ids.len() > 2 && req.voter_ids.len().is_multiple_of(2) {
             warn!(
                 voters = ?req.voter_ids,
                 "Requested even number of voters; odd voter counts (3,5,...) are recommended for Raft availability"
@@ -1285,8 +1289,8 @@ impl MetadataService for Metadatanode {
             "Received heartbeat from node"
         );
 
-        let mut audit_success = true;
-        let mut audit_status = "SUCCESS";
+        // let mut audit_success = true;
+        // let mut audit_status = "SUCCESS";
         let node_id = node_request.node_id as u16;
 
         if self
@@ -1308,41 +1312,42 @@ impl MetadataService for Metadatanode {
             })
             .await?;
         } else {
-            audit_success = false;
-            audit_status = "UNKNOWN_NODE";
+            // audit_success = false;
+            // audit_status = "UNKNOWN_NODE";
             warn!(
                 node_id = node_request.node_id,
                 "Heartbeat from unknown node"
             );
         }
-        if audit_success {
-            self.audit_success(
-                "DATANODE_HEARTBEAT",
-                Some(format!("node:{}", node_request.node_id)),
-                claims.sub.clone(),
-                json!({
-                    "cpu_usage": node_request.cpu_usage,
-                    "free_space": node_request.free_space,
-                    "used_space": node_request.used_space,
-                    "addr": node_request.addr,
-                }),
-            )
-            .await;
-        } else {
-            self.audit_failure(
-                "DATANODE_HEARTBEAT",
-                Some(format!("node:{}", node_request.node_id)),
-                audit_status,
-                claims.sub.clone(),
-                json!({
-                    "cpu_usage": node_request.cpu_usage,
-                    "free_space": node_request.free_space,
-                    "used_space": node_request.used_space,
-                    "addr": node_request.addr,
-                }),
-            )
-            .await;
-        }
+        //Commented because it causes so much noise in the dashboard
+        // if audit_success {
+        //     self.audit_success(
+        //         "DATANODE_HEARTBEAT",
+        //         Some(format!("node:{}", node_request.node_id)),
+        //         claims.sub.clone(),
+        //         json!({
+        //             "cpu_usage": node_request.cpu_usage,
+        //             "free_space": node_request.free_space,
+        //             "used_space": node_request.used_space,
+        //             "addr": node_request.addr,
+        //         }),
+        //     )
+        //     .await;
+        // } else {
+        //     self.audit_failure(
+        //         "DATANODE_HEARTBEAT",
+        //         Some(format!("node:{}", node_request.node_id)),
+        //         audit_status,
+        //         claims.sub.clone(),
+        //         json!({
+        //             "cpu_usage": node_request.cpu_usage,
+        //             "free_space": node_request.free_space,
+        //             "used_space": node_request.used_space,
+        //             "addr": node_request.addr,
+        //         }),
+        //     )
+        //     .await;
+        // }
         Ok(Response::new(HeartbeatResponse {
             acknowledgement: true,
             assigned_node_id: node_request.node_id,
@@ -1866,7 +1871,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = Arc::new(load_config());
     dotenvy::from_path(std::path::Path::new(&settings.env_file_path)).ok();
 
-    common::init_tracing("master", &settings.log_level);
+    let _guard = common::init_tracing("master", &settings.log_level);
 
     info!("Configuration loaded: {:?}", settings);
 
@@ -1938,6 +1943,13 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     membership_manager.spawn();
 
     Server::builder()
+        .concurrency_limit_per_connection(512)
+        .initial_stream_window_size(Some(2 * 1024 * 1024))
+        .initial_connection_window_size(Some(8 * 1024 * 1024))
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
+        .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
+        .tcp_nodelay(true)
         .add_service(service)
         .add_service(raft_service)
         .serve(address)

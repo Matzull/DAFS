@@ -18,7 +18,16 @@ members = [
 # Luego en los hijos solo pondremos: tonic = { workspace = true }
 [workspace.dependencies]
 # Async Runtime
-tokio = { version = "1.36", features = ["full"] }
+tokio = { version = "1.36", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "fs",
+    "io-util",
+    "net",
+    "signal",
+] }
 tokio-stream = "0.1"
 
 # gRPC & Protobuf
@@ -45,3 +54,10 @@ crc32fast = "1.5.0"
 jsonwebtoken = "9.3"
 argon2 = "0.5"
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+[profile.release]
+# Optimizacion orientada a produccion para servicios de larga vida.
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
