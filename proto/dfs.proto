@@ -28,6 +28,15 @@ service MetadataService {
     // Renames a file from old path to new path.
   rpc RenameFile (RenameFileRequest) returns (RenameFileResponse);
     
+    // Creates a directory in the namespace.
+  rpc CreateDirectory (CreateDirectoryRequest) returns (CreateDirectoryResponse);
+    
+    // Deletes a directory from the namespace (must be empty).
+  rpc DeleteDirectory (DeleteDirectoryRequest) returns (DeleteDirectoryResponse);
+    
+    // Gets filesystem capacity and usage statistics.
+  rpc GetSystemStats (GetSystemStatsRequest) returns (GetSystemStatsResponse);
+    
     // Heartbeat sent by the datanodes to the master server.
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
 
@@ -36,6 +45,9 @@ service MetadataService {
 
     // Master allocates new blocks for a file upload.
   rpc AllocateBlocks (AllocateBlocksRequest) returns (AllocateBlocksResponse);
+
+  // Sets file permissions (chmod).
+  rpc SetFilePermissions (SetFilePermissionsRequest) returns (SetFilePermissionsResponse);
 }
 
 // -----------------------------------------------------------------------
@@ -120,6 +132,7 @@ message GetFileResponse {
   int64                    last_modified_at = 6;
   string                   file_status      = 7;
   repeated BlockAssignment blocks           = 8; // The map: Which node has which block?
+  uint32                   mode             = 9; // File permissions (e.g., 0o755 for directories, 0o644 for files)
 }
 
 message DeleteFileRequest {
@@ -151,6 +164,41 @@ message RenameFileResponse {
   string error_message = 2;
 }
 
+message CreateDirectoryRequest {
+  string path    = 1; // Full path e.g., "/home/user/documents"
+  string user_id = 2; // User creating the directory
+}
+
+message CreateDirectoryResponse {
+  bool   success       = 1;
+  string error_message = 2;
+}
+
+message DeleteDirectoryRequest {
+  string path    = 1; // Full path to directory (must be empty)
+  string user_id = 2;
+}
+
+message DeleteDirectoryResponse {
+  bool   success       = 1;
+  string error_message = 2;
+}
+
+message GetSystemStatsRequest {
+  // Empty - no parameters needed
+}
+
+message GetSystemStatsResponse {
+  int64 total_blocks    = 1; // Total blocks available in the system
+  int64 used_blocks     = 2; // Blocks currently used
+  int64 free_blocks     = 3; // Blocks available for allocation
+  int64 block_size      = 4; // Size of each block in bytes
+  int64 total_inodes    = 5; // Total number of inodes
+  int64 used_inodes     = 6; // Inodes currently used
+  int64 free_inodes     = 7; // Inodes available
+  string error_message  = 8; // Error if query failed
+}
+
 message FileInfo {
   string                   filename         = 1;
   bool                     is_directory     = 2;
@@ -159,6 +207,7 @@ message FileInfo {
   int64                    created_at       = 5;
   int64                    last_modified_at = 6;
   string                   file_status      = 7;
+  uint32                   mode             = 8; // File permissions
 }
 
 message BlockAssignment {
@@ -199,6 +248,16 @@ message AllocateBlocksRequest {
 
 message AllocateBlocksResponse {
   repeated BlockAssignment blocks = 1;
+}
+
+message SetFilePermissionsRequest {
+  string path = 1; // Full path to the file
+  uint32 mode = 2; // New permissions (e.g., 0o755)
+}
+
+message SetFilePermissionsResponse {
+  bool   success       = 1;
+  string error_message = 2;
 }
 
 // --- DataNode Messages ---

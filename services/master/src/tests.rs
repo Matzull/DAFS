@@ -11,6 +11,7 @@ fn sample_file(path: &str, status: FileStatus) -> FileMetadata {
         created_at: 1,
         last_modified_at: 2,
         file_status: status,
+        is_directory: false,
         blocks: vec![BlockMetadata {
             id: "block-1".to_string(),
             index: 0,

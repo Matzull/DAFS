@@ -14,12 +14,7 @@ use crate::auth::AuthManager;
 use crate::models::{BlockMetadata, DatanodeInfo, FileMetadata, FileStatus, MasterState};
 use common::dfs::metadata_service_server::{MetadataService, MetadataServiceServer};
 use common::dfs::{
-    data_node_service_client, AllocateBlocksRequest, AllocateBlocksResponse, BlockAssignment,
-    BlockList, CreateFileRequest, CreateFileResponse, DeleteBlockRequest, DeleteFileRequest,
-    DeleteFileResponse, FileInfo, GetFileRequest, GetFileResponse, HeartbeatRequest,
-    HeartbeatResponse, ListDirectoryRequest, ListDirectoryResponse, LoginUserRequest,
-    LoginUserResponse, RegisterUserRequest, RegisterUserResponse, RenameFileRequest,
-    RenameFileResponse, ReplicateBlocksRequest, SetFileStatusRequest, SetFileStatusResponse,
+    AllocateBlocksRequest, AllocateBlocksResponse, BlockAssignment, BlockList, CreateDirectoryRequest, CreateDirectoryResponse, CreateFileRequest, CreateFileResponse, DeleteBlockRequest, DeleteDirectoryRequest, DeleteDirectoryResponse, DeleteFileRequest, DeleteFileResponse, FileInfo, GetFileRequest, GetFileResponse, GetSystemStatsRequest, GetSystemStatsResponse, HeartbeatRequest, HeartbeatResponse, ListDirectoryRequest, ListDirectoryResponse, LoginUserRequest, LoginUserResponse, RegisterUserRequest, RegisterUserResponse, RenameFileRequest, RenameFileResponse, ReplicateBlocksRequest, SetFilePermissionsRequest, SetFilePermissionsResponse, SetFileStatusRequest, SetFileStatusResponse, data_node_service_client
 };
 use common::raft::raft_service_server::{RaftService, RaftServiceServer};
 use common::raft::{
@@ -48,7 +43,7 @@ use std::{
     cmp::{max, min},
     collections::HashMap,
     sync::Arc,
-    time::{self},
+    time::{self, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use tonic::transport::Server;
@@ -611,7 +606,7 @@ impl Metadatanode {
                 block_id: block.id.clone(),
                 node_address: primary_addr,
                 block_size: write_len,
-                order: write_offset_in_block,
+                order: block.index as i64,  // block index (0,1,2...), NOT byte offset
             });
         }
 
@@ -739,7 +734,9 @@ impl Metadatanode {
             created_at: now_miliseconds,
             last_modified_at: now_miliseconds,
             file_status: FileStatus::Uploading,
+            is_directory: false,
             blocks,
+            mode: 0o644, // Default file permissions
         };
 
         info!("File metadata planned for {}", file.id);
@@ -1017,6 +1014,7 @@ impl MetadataService for Metadatanode {
             // checksum: file_metadata.checksum.clone(),
             file_status: file_metadata.file_status.to_string(),
             blocks: block_assignments,
+            mode: file_metadata.mode,
         }))
     }
 
@@ -1106,18 +1104,30 @@ impl MetadataService for Metadatanode {
                 sub_trie
                     .iter()
                     .filter(|(path, file)| {
-                        path.starts_with(&dir_path)
-                            && (claims.role == common::ROLE_MASTER || file.owner == claims.sub)
+                        if !(path.starts_with(&dir_path)
+                            && (claims.role == common::ROLE_MASTER || file.owner == claims.sub))
+                        {
+                            return false;
+                        }
+
+                        // Return only immediate children for this directory.
+                        let suffix = path.strip_prefix(&dir_path).unwrap_or("");
+                        if suffix.is_empty() {
+                            return false;
+                        }
+                        let normalized = suffix.trim_end_matches('/');
+                        !normalized.is_empty() && !normalized.contains('/')
                     })
                     .map(|(_, v)| FileInfo {
                         filename: v.name.clone(),
-                        is_directory: false,
+                        is_directory: v.is_directory,
                         size: v.size,
                         owner: v.owner.clone(),
                         created_at: v.created_at,
                         last_modified_at: v.last_modified_at,
                         // checksum: v.checksum.clone(),
                         file_status: v.file_status.to_string(),
+                        mode: v.mode,
                     })
                     .collect()
             }
@@ -1150,29 +1160,17 @@ impl MetadataService for Metadatanode {
         let claims = self.authorize_user_or_master(request.metadata())?;
 
         let rename_req = request.into_inner();
-        let files_lock = self.state.files.read().await;
-        if files_lock.get(&rename_req.new_path).is_some() {
-            warn!(
-                new_path = rename_req.new_path,
-                "Rename target already exists"
-            );
-            self.audit_failure(
-                "FILE_RENAME",
-                Some(rename_req.old_path.clone()),
-                "ALREADY_EXISTS",
-                claims.sub.clone(),
-                json!({
-                    "new_path": rename_req.new_path,
-                }),
-            )
-            .await;
-            return Err(Status::already_exists(format!(
-                "File {} already exists",
-                rename_req.new_path
-            )));
+
+        if rename_req.old_path == rename_req.new_path {
+            // POSIX-compatible no-op rename.
+            return Ok(Response::new(RenameFileResponse {
+                success: true,
+                error_message: String::new(),
+            }));
         }
 
-        if let Some(existing) = files_lock.get(&rename_req.old_path) {
+        let files_lock = self.state.files.read().await;
+        let src_file = if let Some(existing) = files_lock.get(&rename_req.old_path) {
             if !self.can_access_path(&existing.owner, &claims) {
                 self.audit_failure(
                     "FILE_RENAME",
@@ -1186,6 +1184,7 @@ impl MetadataService for Metadatanode {
                 .await;
                 return Err(Status::permission_denied("Not allowed to rename this file"));
             }
+            existing.clone()
         } else {
             warn!(old_path = rename_req.old_path, "File not found for rename");
             self.audit_failure(
@@ -1199,6 +1198,42 @@ impl MetadataService for Metadatanode {
             )
             .await;
             return Err(Status::not_found("Couldnt rename file"));
+        };
+
+        // POSIX rename allows replacing an existing non-directory target.
+        let dst_file = files_lock.get(&rename_req.new_path).cloned();
+        if let Some(existing_dst) = dst_file.as_ref() {
+            if existing_dst.is_directory {
+                self.audit_failure(
+                    "FILE_RENAME",
+                    Some(rename_req.old_path.clone()),
+                    "ALREADY_EXISTS",
+                    claims.sub.clone(),
+                    json!({
+                        "new_path": rename_req.new_path,
+                        "reason": "destination_is_directory",
+                    }),
+                )
+                .await;
+                return Err(Status::already_exists("Destination directory already exists"));
+            }
+
+            if !self.can_access_path(&existing_dst.owner, &claims) {
+                self.audit_failure(
+                    "FILE_RENAME",
+                    Some(rename_req.old_path.clone()),
+                    "FORBIDDEN",
+                    claims.sub.clone(),
+                    json!({
+                        "new_path": rename_req.new_path,
+                        "reason": "cannot_overwrite_destination",
+                    }),
+                )
+                .await;
+                return Err(Status::permission_denied(
+                    "Not allowed to overwrite destination file",
+                ));
+            }
         }
         drop(files_lock);
 
@@ -1208,9 +1243,20 @@ impl MetadataService for Metadatanode {
         })
         .await?;
 
+        // If rename replaced an existing file, queue old blocks for GC.
+        let mut overwritten_blocks = 0usize;
+        if let Some(existing_dst) = dst_file {
+            overwritten_blocks = existing_dst.blocks.len();
+            if overwritten_blocks > 0 {
+                self.garbage_collector_tx.send(existing_dst.blocks).await.ok();
+            }
+        }
+
         info!(
             old_path = rename_req.old_path,
             new_path = rename_req.new_path,
+            src_is_directory = src_file.is_directory,
+            overwritten_blocks,
             "File renamed successfully"
         );
 
@@ -1220,6 +1266,8 @@ impl MetadataService for Metadatanode {
             claims.sub.clone(),
             json!({
                 "new_path": rename_req.new_path,
+                "src_is_directory": src_file.is_directory,
+                "overwritten_blocks": overwritten_blocks,
             }),
         )
         .await;
@@ -1454,6 +1502,260 @@ impl MetadataService for Metadatanode {
 
         Ok(Response::new(AllocateBlocksResponse {
             blocks: assignments,
+        }))
+    }
+
+    #[instrument(skip(self, request))]
+    async fn set_file_permissions(
+        &self,
+        request: Request<SetFilePermissionsRequest>,
+    ) -> Result<Response<SetFilePermissionsResponse>, Status> {
+        self.ensure_leader_for_write().await?;
+        info!("Received set_file_permissions request");
+        let claims = self.authorize_user_or_master(request.metadata())?;
+        let perm_request = request.into_inner();
+
+        let mut files_lock = self.state.files.write().await;
+        let file_metadata = match files_lock.get_mut(&perm_request.path) {
+            Some(f) => f,
+            None => {
+                return Err(Status::not_found(format!(
+                    "File not found: {}",
+                    perm_request.path
+                )));
+            }
+        };
+
+        // Update the mode
+        file_metadata.mode = perm_request.mode;
+
+        self.audit_success(
+            "FILE_SET_PERMISSIONS",
+            Some(perm_request.path.clone()),
+            claims.sub,
+            json!({
+                "path": perm_request.path,
+                "mode": format!("{:o}", perm_request.mode),
+            }),
+        )
+        .await;
+
+        Ok(Response::new(SetFilePermissionsResponse {
+            success: true,
+            error_message: String::new(),
+        }))
+    }
+
+    #[instrument(skip(self, request))]
+    async fn create_directory(
+        &self,
+        request: Request<CreateDirectoryRequest>,
+    ) -> Result<Response<CreateDirectoryResponse>, Status> {
+        self.ensure_leader_for_write().await?;
+        info!("Received create_directory request");
+        let claims = self.authorize_user_or_master(request.metadata())?;
+        let dir_request = request.into_inner();
+        let mut dir_path = dir_request.path.clone();
+        
+        // Normalize path to end with /
+        if !dir_path.ends_with('/') {
+            dir_path.push('/');
+        }
+
+        // Check if directory already exists
+        {
+            let files_lock = self.state.files.read().await;
+            if files_lock.get(&dir_path).is_some() {
+                info!(path = dir_path, "Directory already exists");
+                self.audit_failure(
+                    "MKDIR",
+                    Some(dir_path.clone()),
+                    "EEXIST",
+                    claims.sub.clone(),
+                    json!({ "path": dir_path }),
+                )
+                .await;
+                return Err(Status::already_exists("Directory already exists"));
+            }
+        }
+
+        // Create directory entry (as empty file with directory flag)
+        let file_metadata = FileMetadata {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: dir_request.path.split('/').last().unwrap_or("").to_string(),
+            path: dir_path.clone(),
+            size: 0,
+            owner: claims.sub.clone(),
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
+            last_modified_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
+            file_status: FileStatus::Ready,
+            blocks: Default::default(),
+            is_directory: true,  // Mark as directory
+            mode: 0o755, // Default directory permissions
+        };
+
+        // Store in filesystem
+        {
+            let mut files_lock = self.state.files.write().await;
+            files_lock.insert(dir_path.clone(), file_metadata);
+        }
+
+        info!(path = dir_path, "Directory created successfully");
+        self.audit_success(
+            "MKDIR",
+            Some(dir_path),
+            claims.sub,
+            json!({}),
+        )
+        .await;
+
+        Ok(Response::new(CreateDirectoryResponse {
+            success: true,
+            error_message: String::new(),
+        }))
+    }
+
+    #[instrument(skip(self, request))]
+    async fn delete_directory(
+        &self,
+        request: Request<DeleteDirectoryRequest>,
+    ) -> Result<Response<DeleteDirectoryResponse>, Status> {
+        self.ensure_leader_for_write().await?;
+        info!("Received delete_directory request");
+        let claims = self.authorize_user_or_master(request.metadata())?;
+        let del_request = request.into_inner();
+        let mut dir_path = del_request.path.clone();
+        
+        if !dir_path.ends_with('/') {
+            dir_path.push('/');
+        }
+
+        // Check if directory exists
+        let dir_metadata = {
+            let files_lock = self.state.files.read().await;
+            files_lock.get(&dir_path).cloned()
+        };
+
+        let Some(metadata) = dir_metadata else {
+            info!(path = dir_path, "Directory not found for deletion");
+            self.audit_failure(
+                "RMDIR",
+                Some(dir_path.clone()),
+                "ENOENT",
+                claims.sub.clone(),
+                json!({ "path": dir_path }),
+            )
+            .await;
+            return Err(Status::not_found("Directory not found"));
+        };
+
+        if !metadata.is_directory {
+            info!(path = dir_path, "Path is not a directory");
+            return Err(Status::invalid_argument("Path is not a directory"));
+        }
+
+        // Check if directory is empty
+        {
+            let files_lock = self.state.files.read().await;
+            let has_children = files_lock
+                .iter()
+                .any(|(path, _)| path != &dir_path && path.starts_with(&dir_path));
+            
+            if has_children {
+                info!(path = dir_path, "Directory not empty");
+                self.audit_failure(
+                    "RMDIR",
+                    Some(dir_path.clone()),
+                    "ENOTEMPTY",
+                    claims.sub.clone(),
+                    json!({ "path": dir_path }),
+                )
+                .await;
+                return Err(Status::invalid_argument("Directory not empty"));
+            }
+        }
+
+        // Remove directory
+        {
+            let mut files_lock = self.state.files.write().await;
+            files_lock.remove(&dir_path);
+        }
+
+        info!(path = dir_path, "Directory deleted successfully");
+        self.audit_success(
+            "RMDIR",
+            Some(dir_path),
+            claims.sub,
+            json!({}),
+        )
+        .await;
+
+        Ok(Response::new(DeleteDirectoryResponse {
+            success: true,
+            error_message: String::new(),
+        }))
+    }
+
+    #[instrument(skip(self, request))]
+    async fn get_system_stats(
+        &self,
+        request: Request<GetSystemStatsRequest>,
+    ) -> Result<Response<GetSystemStatsResponse>, Status> {
+        info!("Received get_system_stats request");
+        let _claims = self.authorize_user_or_master(request.metadata())?;
+
+        // Count total files and calculate blocks used
+        let (file_count, total_blocks_used) = {
+            let files_lock = self.state.files.read().await;
+            let count = files_lock.len() as i64;
+            let blocks: i64 = files_lock
+                .values()
+                .map(|f| {
+                    // Each file uses ceil(size / block_size) blocks
+                    let block_size = 1024 * 1024;  // 1 MB
+                    ((f.size + block_size - 1) / block_size).max(1)
+                })
+                .sum();
+            (count, blocks)
+        };
+
+        // Get aggregated stats from datanodes via heartbeat info
+        let (_total_free_space, _total_used_space): (i64, i64) = {
+            let nodes_lock = self.state.available_datanodes.read().await;
+            let (mut _free, mut _used) = (0i64, 0i64);
+            for _node in nodes_lock.values() {
+                // We'd extract free_space and used_space from heartbeat tracking
+                // For now, just use the count of datanodes
+            }
+            (_free, _used)
+        };
+
+        // Calculate filesystem metrics
+        let block_size: i64 = 1024 * 1024;  // 1 MB blocks
+        
+        // Estimate total capacity: if datanodes didn't report, assume 100 * 1 MB blocks per node
+        // (This should be updated when datanodes report their capacity via heartbeat)
+        let datanode_count = self.state.available_datanodes.read().await.len().max(1) as i64;
+        let total_blocks = datanode_count * 50000;  // Conservative estimate
+        
+        let free_blocks = (total_blocks - total_blocks_used).max(0);
+        let free_inodes = (10000i64 - file_count).max(0);
+
+        Ok(Response::new(GetSystemStatsResponse {
+            total_blocks,
+            used_blocks: total_blocks_used,
+            free_blocks,
+            block_size,
+            total_inodes: 10000,
+            used_inodes: file_count,
+            free_inodes,
+            error_message: String::new(),
         }))
     }
 }

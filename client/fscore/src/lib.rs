@@ -4,7 +4,7 @@ use common::dfs::metadata_service_client::MetadataServiceClient;
 use common::dfs::read_block_response::ResponseData;
 use common::dfs::write_block_request::RequestData;
 use common::dfs::{
-    AllocateBlocksRequest, AllocateBlocksResponse, CreateFileRequest, CreateFileResponse, DeleteFileRequest, GetFileRequest, GetFileResponse, ListDirectoryRequest, ListDirectoryResponse, LoginUserRequest, ReadBlockRequest, RegisterUserRequest, RenameFileRequest, SetFileStatusRequest, WriteBlockRequest, WriteBlockResponse
+    AllocateBlocksRequest, AllocateBlocksResponse, CreateFileRequest, CreateFileResponse, CreateDirectoryRequest, DeleteFileRequest, DeleteDirectoryRequest, GetFileRequest, GetFileResponse, ListDirectoryRequest, ListDirectoryResponse, LoginUserRequest, ReadBlockRequest, RegisterUserRequest, RenameFileRequest, SetFilePermissionsRequest, SetFileStatusRequest, GetSystemStatsRequest, WriteBlockRequest, WriteBlockResponse
 };
 use common::raft::raft_service_client::RaftServiceClient;
 use common::raft::GetLeaderRequest;
@@ -382,6 +382,128 @@ pub async fn delete_file(
 
     info!(remote_path, "File deleted");
     Ok(())
+}
+
+/// Create a directory in the remote filesystem.
+#[instrument(skip(settings, access_token))]
+pub async fn create_directory(
+    settings: Arc<DafsSettings>,
+    directory_path: String,
+    access_token: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    info!(directory_path, "Creating directory");
+    let preferred = discover_leader_endpoint(settings.as_ref()).await;
+    let mut client = connect_metadata_client(settings.as_ref(), preferred).await?;
+    let mut request = Request::new(CreateDirectoryRequest {
+        path: directory_path.clone(),
+        user_id: settings.default_user_id.clone(),
+    });
+    common::attach_bearer_token(&mut request, access_token)?;
+
+    match client.create_directory(request).await {
+        Ok(_) => {
+            info!(directory_path, "Directory created successfully");
+            Ok(())
+        }
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            let Some(leader_addr) = parse_leader_addr_from_message(status.message()) else {
+                return Err(Box::new(status));
+            };
+            let mut retry_client =
+                connect_metadata_client(settings.as_ref(), Some(leader_addr)).await?;
+            let mut retry_request = Request::new(CreateDirectoryRequest {
+                path: directory_path.clone(),
+                user_id: settings.default_user_id.clone(),
+            });
+            common::attach_bearer_token(&mut retry_request, access_token)?;
+            retry_client.create_directory(retry_request).await?;
+            info!(directory_path, "Directory created successfully (after retry)");
+            Ok(())
+        }
+        Err(status) => Err(Box::new(status)),
+    }
+}
+
+/// Delete a directory from the remote filesystem (must be empty).
+#[instrument(skip(settings, access_token))]
+pub async fn delete_directory(
+    settings: Arc<DafsSettings>,
+    directory_path: String,
+    access_token: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    info!(directory_path, "Deleting directory");
+    let preferred = discover_leader_endpoint(settings.as_ref()).await;
+    let mut client = connect_metadata_client(settings.as_ref(), preferred).await?;
+    let mut request = Request::new(DeleteDirectoryRequest {
+        path: directory_path.clone(),
+        user_id: settings.default_user_id.clone(),
+    });
+    common::attach_bearer_token(&mut request, access_token)?;
+
+    match client.delete_directory(request).await {
+        Ok(_) => {
+            info!(directory_path, "Directory deleted successfully");
+            Ok(())
+        }
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            let Some(leader_addr) = parse_leader_addr_from_message(status.message()) else {
+                return Err(Box::new(status));
+            };
+            let mut retry_client =
+                connect_metadata_client(settings.as_ref(), Some(leader_addr)).await?;
+            let mut retry_request = Request::new(DeleteDirectoryRequest {
+                path: directory_path.clone(),
+                user_id: settings.default_user_id.clone(),
+            });
+            common::attach_bearer_token(&mut retry_request, access_token)?;
+            retry_client.delete_directory(retry_request).await?;
+            info!(directory_path, "Directory deleted successfully (after retry)");
+            Ok(())
+        }
+        Err(status) => Err(Box::new(status)),
+    }
+}
+
+/// Get filesystem statistics (total/free blocks and inodes).
+#[instrument(skip(settings, access_token))]
+pub async fn get_system_stats(
+    settings: Arc<DafsSettings>,
+    access_token: &str,
+) -> Result<common::dfs::GetSystemStatsResponse, Box<dyn Error + Send + Sync>> {
+    info!("Querying system statistics");
+    let preferred = discover_leader_endpoint(settings.as_ref()).await;
+    let mut client = connect_metadata_client(settings.as_ref(), preferred).await?;
+    let mut request = Request::new(GetSystemStatsRequest {});
+    common::attach_bearer_token(&mut request, access_token)?;
+
+    match client.get_system_stats(request).await {
+        Ok(resp) => {
+            let stats = resp.into_inner();
+            info!(
+                total_blocks = stats.total_blocks,
+                free_blocks = stats.free_blocks,
+                total_inodes = stats.total_inodes,
+                free_inodes = stats.free_inodes,
+                "System statistics retrieved"
+            );
+            Ok(stats)
+        }
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            let Some(leader_addr) = parse_leader_addr_from_message(status.message()) else {
+                return Err(Box::new(status));
+            };
+            let mut retry_client =
+                connect_metadata_client(settings.as_ref(), Some(leader_addr)).await?;
+            let mut retry_request = Request::new(GetSystemStatsRequest {});
+            common::attach_bearer_token(&mut retry_request, access_token)?;
+            let stats = retry_client
+                .get_system_stats(retry_request)
+                .await?
+                .into_inner();
+            Ok(stats)
+        }
+        Err(status) => Err(Box::new(status)),
+    }
 }
 
 // ─── Block-level I/O (internal) ───────────────────────────────────────────────
@@ -867,6 +989,47 @@ pub async fn download_file(
     }
     info!(remote_path, local_path, "File download completed");
     Ok(())
+}
+
+/// Set file permissions (chmod).
+#[instrument(skip(settings, access_token))]
+pub async fn set_file_permissions(
+    settings: Arc<DafsSettings>,
+    remote_path: String,
+    mode: u32,
+    access_token: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    info!(remote_path, mode = format!("{:o}", mode), "Setting file permissions");
+    let preferred = discover_leader_endpoint(settings.as_ref()).await;
+    let mut client = connect_metadata_client(settings.as_ref(), preferred).await?;
+    let mut request = Request::new(SetFilePermissionsRequest {
+        path: remote_path.clone(),
+        mode,
+    });
+    common::attach_bearer_token(&mut request, access_token)?;
+
+    match client.set_file_permissions(request).await {
+        Ok(_) => {
+            info!(remote_path, mode = format!("{:o}", mode), "File permissions set successfully");
+            Ok(())
+        }
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            let Some(leader_addr) = parse_leader_addr_from_message(status.message()) else {
+                return Err(Box::new(status));
+            };
+            let mut retry_client =
+                connect_metadata_client(settings.as_ref(), Some(leader_addr)).await?;
+            let mut retry_request = Request::new(SetFilePermissionsRequest {
+                path: remote_path.clone(),
+                mode,
+            });
+            common::attach_bearer_token(&mut retry_request, access_token)?;
+            retry_client.set_file_permissions(retry_request).await?;
+            info!(remote_path, mode = format!("{:o}", mode), "File permissions set successfully (after retry)");
+            Ok(())
+        }
+        Err(status) => Err(Box::new(status)),
+    }
 }
 
 #[instrument(skip(settings, access_token))]
