@@ -572,7 +572,7 @@ impl Metadatanode {
             }
 
             let write_len = (seg_end - seg_start) as i64;
-            let write_offset_in_block = (seg_start - block_start) as i64;
+            // Note: write_offset_in_block is calculated by the client based on the file position and block_idx
 
             let block = blocks_by_index.entry(block_idx).or_insert_with(|| {
                 let mut block_datanodes = Vec::with_capacity(replication);
@@ -606,7 +606,8 @@ impl Metadatanode {
                 block_id: block.id.clone(),
                 node_address: primary_addr,
                 block_size: write_len,
-                order: block.index as i64,  // block index (0,1,2...), NOT byte offset
+                // Block index in logical ordering
+                order: block_idx as i64,
             });
         }
 

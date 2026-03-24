@@ -17,6 +17,18 @@ log_level = "info"
 # Upload streaming chunk size (bytes)
 upload_chunk_size = 1048576
 
+# Coalescing window before forced flush on offset realignment (ms)
+realign_flush_delay_ms = 10
+
+# Metadata cache TTL (ms) to reduce repeated get_file_metadata calls
+metadata_cache_ttl_ms = 500
+
+# Number of downloaded blocks kept in client read cache
+read_block_cache_entries = 512
+
+# Logical DFS block size (must match master block_size)
+block_size = 1000000
+
 # Metadata user identity and status defaults
 default_user_id = "1"
 upload_ready_status = "READY"

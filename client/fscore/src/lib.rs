@@ -16,8 +16,11 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{FileExt, MetadataExt};
+use std::sync::OnceLock;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
+use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
@@ -39,6 +42,10 @@ pub struct DafsSettings {
     pub download_concurrency: usize,
     pub log_level: String,
     pub upload_chunk_size: usize,
+    pub block_size: u64,
+    pub realign_flush_delay_ms: u64,
+    pub metadata_cache_ttl_ms: u64,
+    pub read_block_cache_entries: usize,
     pub default_user_id: String,
     pub upload_ready_status: String,
     pub default_list_path: String,
@@ -57,6 +64,10 @@ impl Default for DafsSettings {
             download_concurrency: 10,
             log_level: "warn".to_string(),
             upload_chunk_size: 1024 * 1024,
+            block_size: 1_000_000,
+            realign_flush_delay_ms: 10,
+            metadata_cache_ttl_ms: 500,
+            read_block_cache_entries: 512,
             default_user_id: "1".to_string(),
             upload_ready_status: "READY".to_string(),
             default_list_path: "/".to_string(),
@@ -65,6 +76,88 @@ impl Default for DafsSettings {
             access_token_path: "client/.token".to_string(),
         }
     }
+}
+
+type DatanodeClient = DataNodeServiceClient<tonic::transport::Channel>;
+static DATANODE_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, DatanodeClient>>> = OnceLock::new();
+static METADATA_CACHE: OnceLock<RwLock<HashMap<String, (Instant, GetFileResponse)>>> = OnceLock::new();
+static BLOCK_READ_CACHE: OnceLock<RwLock<HashMap<String, Arc<Vec<u8>>>>> = OnceLock::new();
+
+fn datanode_client_cache() -> &'static RwLock<HashMap<String, DatanodeClient>> {
+    DATANODE_CLIENT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn metadata_cache() -> &'static RwLock<HashMap<String, (Instant, GetFileResponse)>> {
+    METADATA_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn block_read_cache() -> &'static RwLock<HashMap<String, Arc<Vec<u8>>>> {
+    BLOCK_READ_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+async fn get_cached_metadata(path: &str, ttl_ms: u64) -> Option<GetFileResponse> {
+    let cache = metadata_cache().read().await;
+    let (cached_at, data) = cache.get(path)?;
+    if cached_at.elapsed().as_millis() <= ttl_ms as u128 {
+        Some(data.clone())
+    } else {
+        None
+    }
+}
+
+async fn put_cached_metadata(path: String, metadata: GetFileResponse) {
+    metadata_cache()
+        .write()
+        .await
+        .insert(path, (Instant::now(), metadata));
+}
+
+async fn invalidate_metadata_cache(path: &str) {
+    metadata_cache().write().await.remove(path);
+}
+
+async fn get_cached_block(block_id: &str) -> Option<Arc<Vec<u8>>> {
+    block_read_cache().read().await.get(block_id).cloned()
+}
+
+async fn put_cached_block(block_id: String, data: Vec<u8>, max_entries: usize) {
+    let mut cache = block_read_cache().write().await;
+    if cache.len() >= max_entries.max(1) {
+        if let Some(first_key) = cache.keys().next().cloned() {
+            cache.remove(&first_key);
+        }
+    }
+    cache.insert(block_id, Arc::new(data));
+}
+
+async fn invalidate_block_cache(block_id: &str) {
+    block_read_cache().write().await.remove(block_id);
+}
+
+async fn get_or_connect_datanode_client(
+    addr: &str,
+) -> Result<DatanodeClient, Box<dyn Error + Send + Sync>> {
+    if let Some(client) = datanode_client_cache().read().await.get(addr).cloned() {
+        return Ok(client);
+    }
+
+    let connected = DataNodeServiceClient::connect(addr.to_string()).await?;
+    let mut cache = datanode_client_cache().write().await;
+    let client = cache
+        .entry(addr.to_string())
+        .or_insert_with(|| connected.clone())
+        .clone();
+    Ok(client)
+}
+
+async fn build_datanode_clients(
+    node_addresses: HashSet<String>,
+) -> Result<HashMap<String, DatanodeClient>, Box<dyn Error + Send + Sync>> {
+    let mut clients = HashMap::new();
+    for addr in node_addresses {
+        clients.insert(addr.clone(), get_or_connect_datanode_client(&addr).await?);
+    }
+    Ok(clients)
 }
 
 fn parse_leader_addr_from_message(message: &str) -> Option<String> {
@@ -588,20 +681,29 @@ async fn upload_block(
     Ok(inner)
 }
 
-#[instrument(skip(data_node_client, settings, access_token, chunk_data))]
-async fn upload_block_from_bytes(
+#[instrument(skip(data_node_client, settings, access_token, shared_data))]
+async fn upload_block_from_shared_range(
     block_id: String,
     data_node_client: DataNodeServiceClient<tonic::transport::Channel>,
     write_offset_in_block: u64,
-    chunk_data: Vec<u8>,
+    shared_data: Arc<Vec<u8>>,
+    range_start: usize,
+    range_len: usize,
     settings: Arc<DafsSettings>,
     access_token: Arc<String>,
 ) -> Result<WriteBlockResponse, String> {
+    let range_end = range_start
+        .checked_add(range_len)
+        .ok_or_else(|| "Range overflow while uploading shared block data".to_string())?;
+    let range = shared_data
+        .get(range_start..range_end)
+        .ok_or_else(|| "Invalid shared range while uploading block".to_string())?;
+
     debug!(
         block_id,
         write_offset_in_block,
-        bytes = chunk_data.len(),
-        "Starting in-memory block upload"
+        bytes = range.len(),
+        "Starting shared-range block upload"
     );
     let mut hasher = Hasher::new();
     let (tx, rx) = mpsc::channel(settings.mpsc_upload_channel_size as usize);
@@ -614,7 +716,7 @@ async fn upload_block_from_bytes(
     tx.send(WriteBlockRequest {
         request_data: Some(RequestData::Metadata(common::dfs::BlockMetadata {
             block_id: block_id.clone(),
-            total_size: chunk_data.len() as i64,
+            total_size: range.len() as i64,
             offset: write_offset_in_block,
         })),
     })
@@ -622,7 +724,7 @@ async fn upload_block_from_bytes(
     .map_err(|e| format!("Failed to send block metadata: {e}"))?;
 
     let chunk_size = settings.upload_chunk_size.max(1);
-    for chunk in chunk_data.chunks(chunk_size) {
+    for chunk in range.chunks(chunk_size) {
         hasher.update(chunk);
         tx.send(WriteBlockRequest {
             request_data: Some(RequestData::ChunkData(chunk.to_vec())),
@@ -862,24 +964,18 @@ pub async fn upload_file(
     let shared_file_handle = Arc::new(file_handle);
     let semaphore = Arc::new(Semaphore::new(settings.upload_concurrency));
     let mut set = JoinSet::new();
-    let mut block_size = -1i64;
+    let logical_block_size = settings.block_size.max(1);
 
     let nodes_to_connect: HashSet<_> = create_file_response
         .blocks
         .iter()
         .map(|b| b.node_address.clone())
         .collect();
-    let mut clients = HashMap::new();
-    for addr in nodes_to_connect {
-        let client = DataNodeServiceClient::connect(addr.clone()).await?;
-        clients.insert(addr, client);
-    }
+    let clients = build_datanode_clients(nodes_to_connect).await?;
 
     for block_assignment in create_file_response.blocks.clone() {
-        if block_size == -1 {
-            block_size = block_assignment.block_size;
-        }
-        let block_offset = block_assignment.order * block_size;
+        let block_offset = (block_assignment.order.max(0) as u64)
+            .saturating_mul(logical_block_size);
         let block_id = block_assignment.block_id.clone();
         let f_handle = Arc::clone(&shared_file_handle);
         let settings_clone = Arc::clone(&settings);
@@ -891,7 +987,7 @@ pub async fn upload_file(
             upload_block(
                 block_id,
                 client,
-                block_offset as u64,
+                block_offset,
                 block_assignment.block_size,
                 f_handle,
                 settings_clone,
@@ -942,25 +1038,19 @@ pub async fn download_file(
     let shared_file_handle = Arc::new(file_handle);
     let semaphore = Arc::new(Semaphore::new(settings.download_concurrency));
     let mut set = JoinSet::new();
-    let mut block_size = -1i64;
+    let logical_block_size = settings.block_size.max(1);
 
     let nodes_to_connect: HashSet<_> = get_file_response
         .blocks
         .iter()
         .map(|b| b.node_address.clone())
         .collect();
-    let mut clients = HashMap::new();
-    for addr in nodes_to_connect {
-        let client = DataNodeServiceClient::connect(addr.clone()).await?;
-        clients.insert(addr, client);
-    }
+    let clients = build_datanode_clients(nodes_to_connect).await?;
 
     for block_assignment in get_file_response.blocks.clone() {
-        if block_size == -1 {
-            block_size = block_assignment.block_size;
-        }
         let permit = semaphore.clone().acquire_owned().await?;
-        let block_offset = block_assignment.order * block_size;
+        let block_offset = (block_assignment.order.max(0) as u64)
+            .saturating_mul(logical_block_size);
         let block_id = block_assignment.block_id.clone();
         let f_handle = Arc::clone(&shared_file_handle);
         let settings_clone = Arc::clone(&settings);
@@ -970,7 +1060,7 @@ pub async fn download_file(
             let result = download_block(
                 block_id,
                 client,
-                block_offset as u64,
+                block_offset,
                 f_handle,
                 settings_clone,
                 token_clone,
@@ -1075,7 +1165,7 @@ pub async fn write_file_range(
     settings: Arc<DafsSettings>,
     remote_path: String,
     offset: u64,
-    write_data: Vec<u8>,
+    write_data: Arc<Vec<u8>>,
     access_token: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     if write_data.is_empty() {
@@ -1097,13 +1187,13 @@ pub async fn write_file_range(
         .iter()
         .map(|b| b.node_address.clone())
         .collect();
-    let mut clients = HashMap::new();
-    for addr in nodes_to_connect {
-        let client = DataNodeServiceClient::connect(addr.clone()).await?;
-        clients.insert(addr, client);
-    }
+    let clients = build_datanode_clients(nodes_to_connect).await?;
 
+    let logical_block_size = settings.block_size.max(1);
     let mut cursor = 0usize;
+    let mut written_block_ids: Vec<String> = Vec::new();
+    let semaphore = Arc::new(Semaphore::new(settings.upload_concurrency.max(1)));
+    let mut set = JoinSet::new();
     for assignment in allocation.blocks {
         let chunk_len = assignment.block_size.max(0) as usize;
         if chunk_len == 0 {
@@ -1119,7 +1209,14 @@ pub async fn write_file_range(
             .into());
         }
 
-        let chunk = write_data[cursor..cursor + chunk_len].to_vec();
+        let chunk_start = cursor;
+
+        // Calculate the offset within the block
+        let block_idx = assignment.order.max(0) as u64;
+        let block_start = block_idx * logical_block_size;
+        let file_position = offset + chunk_start as u64;
+        let write_offset_in_block = file_position - block_start;
+
         cursor += chunk_len;
 
         let client = clients
@@ -1127,16 +1224,32 @@ pub async fn write_file_range(
             .ok_or_else(|| format!("No datanode client for {}", assignment.node_address))?
             .clone();
 
-        upload_block_from_bytes(
-            assignment.block_id,
-            client,
-            assignment.order.max(0) as u64,
-            chunk,
-            Arc::clone(&settings),
-            Arc::clone(&access_token),
-        )
-        .await
-        .map_err(|e| format!("Failed writing file range for {remote_path}: {e}"))?;
+        let block_id = assignment.block_id;
+        written_block_ids.push(block_id.clone());
+        let settings_clone = Arc::clone(&settings);
+        let token_clone = Arc::clone(&access_token);
+        let sem = Arc::clone(&semaphore);
+        let shared_data = Arc::clone(&write_data);
+        let remote_path_for_task = remote_path.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.map_err(|e| e.to_string())?;
+            upload_block_from_shared_range(
+                block_id,
+                client,
+                write_offset_in_block,
+                shared_data,
+                chunk_start,
+                chunk_len,
+                settings_clone,
+                token_clone,
+            )
+            .await
+            .map_err(|e| format!("Failed writing file range for {remote_path_for_task}: {e}"))
+        });
+    }
+
+    while let Some(res) = set.join_next().await {
+        res.map_err(|e| format!("write_file_range task panicked: {e}"))??;
     }
 
     if cursor != write_data.len() {
@@ -1148,7 +1261,11 @@ pub async fn write_file_range(
         .into());
     }
 
-    set_file_status_ready(settings, remote_path, access_token.as_str()).await?;
+    invalidate_metadata_cache(&remote_path).await;
+    for block_id in written_block_ids {
+        invalidate_block_cache(&block_id).await;
+    }
+
     Ok(())
 }
 
@@ -1165,7 +1282,17 @@ pub async fn read_file_range(
     }
 
     let access_token = Arc::new(access_token.to_owned());
-    let metadata = get_file_metadata(Arc::clone(&settings), remote_path.clone(), access_token.as_str()).await?;
+    let metadata = if let Some(cached) =
+        get_cached_metadata(&remote_path, settings.metadata_cache_ttl_ms).await
+    {
+        cached
+    } else {
+        let fresh =
+            get_file_metadata(Arc::clone(&settings), remote_path.clone(), access_token.as_str())
+                .await?;
+        put_cached_metadata(remote_path.clone(), fresh.clone()).await;
+        fresh
+    };
     let file_size = metadata.size.max(0) as u64;
     if offset >= file_size {
         return Ok(Vec::new());
@@ -1175,22 +1302,23 @@ pub async fn read_file_range(
     let read_len = (end - offset) as usize;
     let mut out = vec![0u8; read_len];
 
+    // Physical block payload size varies (last/partial writes), but logical
+    // block addressing always uses configured DFS block span.
+    let logical_block_size = settings.block_size.max(1);
+
     let nodes_to_connect: HashSet<_> = metadata
         .blocks
         .iter()
         .map(|b| b.node_address.clone())
         .collect();
-    let mut clients = HashMap::new();
-    for addr in nodes_to_connect {
-        clients.insert(addr.clone(), DataNodeServiceClient::connect(addr).await?);
-    }
+    let clients = build_datanode_clients(nodes_to_connect).await?;
 
     for block in metadata.blocks {
         let block_size = block.block_size.max(0) as u64;
         if block_size == 0 {
             continue;
         }
-        let block_start = (block.order.max(0) as u64).saturating_mul(block_size);
+        let block_start = (block.order.max(0) as u64).saturating_mul(logical_block_size);
         let block_end = block_start.saturating_add(block_size);
 
         if block_end <= offset || block_start >= end {
@@ -1203,17 +1331,28 @@ pub async fn read_file_range(
         let overlap_len = (overlap_end - overlap_start) as usize;
         let out_start = (overlap_start - offset) as usize;
 
-        let client = clients
-            .get(&block.node_address)
-            .ok_or_else(|| format!("No datanode client for {}", block.node_address))?
-            .clone();
-        let block_bytes = download_block_to_vec(
-            block.block_id,
-            client,
-            Arc::clone(&access_token),
-        )
-        .await
-        .map_err(|e| format!("Failed reading block for {remote_path}: {e}"))?;
+        let block_bytes = if let Some(cached) = get_cached_block(&block.block_id).await {
+            (*cached).clone()
+        } else {
+            let client = clients
+                .get(&block.node_address)
+                .ok_or_else(|| format!("No datanode client for {}", block.node_address))?
+                .clone();
+            let downloaded = download_block_to_vec(
+                block.block_id.clone(),
+                client,
+                Arc::clone(&access_token),
+            )
+            .await
+            .map_err(|e| format!("Failed reading block for {remote_path}: {e}"))?;
+            put_cached_block(
+                block.block_id.clone(),
+                downloaded.clone(),
+                settings.read_block_cache_entries,
+            )
+            .await;
+            downloaded
+        };
 
         if within_block_start + overlap_len > block_bytes.len() {
             return Err(format!(

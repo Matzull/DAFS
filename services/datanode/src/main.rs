@@ -23,6 +23,7 @@ use figment::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::fs::{self, create_dir_all, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::sync::{mpsc, Mutex, Semaphore};
@@ -37,6 +38,7 @@ const DEFAULT_LISTEN_ADDRESS: &str = "[::1]:8080";
 const DEFAULT_METADATA_NODE_ADDRESS: &str = "http://[::1]:9090";
 const DEFAULT_JWT_SECRET: &str = "change-me-master-secret";
 const DEFAULT_SERVICE_TOKEN_EXP_SECONDS: i64 = 300;
+const DEFAULT_WRITE_SYNC_POLICY: &str = "all";
 
 #[derive(Parser, Debug, Serialize, Deserialize, Default)]
 pub struct InternalSettings {
@@ -46,6 +48,8 @@ pub struct InternalSettings {
     pub mpsc_channel_size: u8,
     pub read_buffer_size: usize,
     pub write_buffer_size: usize,
+    pub write_sync_policy: String,
+    pub write_sync_interval_ms: u64,
     pub metadata_node_address: String,
     pub metadata_node_endpoints: Vec<String>,
     pub replication_max_parallel_blocks: usize,
@@ -71,6 +75,8 @@ pub fn load_config() -> InternalSettings {
             mpsc_channel_size: 4,
             read_buffer_size: 64 * 1024,
             write_buffer_size: 128 * 1024,
+            write_sync_policy: DEFAULT_WRITE_SYNC_POLICY.to_string(),
+            write_sync_interval_ms: 0,
             metadata_node_address: DEFAULT_METADATA_NODE_ADDRESS.to_string(),
             metadata_node_endpoints: vec![DEFAULT_METADATA_NODE_ADDRESS.to_string()],
             replication_max_parallel_blocks: 16,
@@ -124,6 +130,16 @@ struct Cli {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     write_buffer_size: Option<usize>,
+
+    /// Write sync policy: all | data | none
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    write_sync_policy: Option<String>,
+
+    /// Minimum interval between sync operations for the same block (ms). 0 = always.
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    write_sync_interval_ms: Option<u64>,
 
     /// Metadata node address
     #[arg(long)]
@@ -194,6 +210,7 @@ struct Cli {
 pub struct Datanode {
     pub node_id: Arc<Mutex<u16>>,
     pub settings: Arc<InternalSettings>,
+    pub block_last_sync: Arc<Mutex<std::collections::HashMap<String, Instant>>>,
 }
 
 fn parse_leader_addr_from_message(message: &str) -> Option<String> {
@@ -287,6 +304,24 @@ async fn connect_metadata_client(
 }
 
 impl Datanode {
+    async fn should_sync_block_now(&self, block_id: &str) -> bool {
+        let interval_ms = self.settings.write_sync_interval_ms;
+        if interval_ms == 0 {
+            return true;
+        }
+
+        let min_interval = Duration::from_millis(interval_ms);
+        let now = Instant::now();
+        let mut last_sync = self.block_last_sync.lock().await;
+        match last_sync.get(block_id) {
+            Some(prev) if now.duration_since(*prev) < min_interval => false,
+            _ => {
+                last_sync.insert(block_id.to_string(), now);
+                true
+            }
+        }
+    }
+
     #[allow(clippy::result_large_err)]
     fn authorize_any(
         &self,
@@ -445,28 +480,28 @@ impl DataNodeService for Datanode {
                     })?;
                     file_path_pathbuf.push(&block_id_str);
                     
-                    // Open file with truncate only if offset is 0 (overwrite), else append mode
+                    // Never truncate here: iozone and similar workloads can issue
+                    // partial rewrites at offset 0, and truncation would drop the
+                    // untouched tail of the block.
                     let mut f = OpenOptions::new()
                         .write(true)
                         .create(true)
-                        .truncate(write_offset == 0)  // Only truncate if offset is 0
+                        .truncate(false)
                         .open(file_path_pathbuf)
                         .await
                         .map_err(|err| {
                             error!(%err, "Failed to create file");
                             Status::internal(err.to_string())
                         })?;
-                    
-                    // If offset > 0, seek to that position
-                    if write_offset > 0 {
-                        use tokio::io::AsyncSeekExt;
-                        f.seek(std::io::SeekFrom::Start(write_offset as u64))
-                            .await
-                            .map_err(|err| {
-                                error!(%err, "Failed to seek to offset {}", write_offset);
-                                Status::internal(err.to_string())
-                            })?;
-                    }
+
+                    // Position cursor exactly at requested in-block offset.
+                    use tokio::io::AsyncSeekExt;
+                    f.seek(std::io::SeekFrom::Start(write_offset as u64))
+                        .await
+                        .map_err(|err| {
+                            error!(%err, "Failed to seek to offset {}", write_offset);
+                            Status::internal(err.to_string())
+                        })?;
 
                     writer = Some(BufWriter::with_capacity(self.settings.write_buffer_size, f));
                 }
@@ -507,10 +542,35 @@ impl DataNodeService for Datanode {
                 error!(%err, "Failed to flush buffer");
                 Status::internal(err.to_string())
             })?;
-            w.get_mut().sync_all().await.map_err(|err| {
-                error!(%err, "Failed to sync file");
-                Status::internal(err.to_string())
-            })?;
+
+            let policy = self.settings.write_sync_policy.to_ascii_lowercase();
+            let should_sync = self.should_sync_block_now(&block_id_str).await;
+            match policy.as_str() {
+                "none" => {}
+                "data" if should_sync => {
+                    w.get_mut().sync_data().await.map_err(|err| {
+                        error!(%err, block_id = %block_id_str, "Failed to sync file data");
+                        Status::internal(err.to_string())
+                    })?;
+                }
+                "data" => {}
+                "all" if should_sync => {
+                    w.get_mut().sync_all().await.map_err(|err| {
+                        error!(%err, block_id = %block_id_str, "Failed to sync file");
+                        Status::internal(err.to_string())
+                    })?;
+                }
+                "all" => {}
+                other => {
+                    warn!(policy = %other, "Unknown write_sync_policy, defaulting to sync_all");
+                    if should_sync {
+                        w.get_mut().sync_all().await.map_err(|err| {
+                            error!(%err, block_id = %block_id_str, "Failed to sync file");
+                            Status::internal(err.to_string())
+                        })?;
+                    }
+                }
+            }
         }
         debug!(block_id = %block_id_str, bytes_written, "Successfully wrote block");
         Ok(Response::new(WriteBlockResponse {
@@ -693,6 +753,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let datanode = Datanode {
         node_id: Arc::new(Mutex::new(0)),
         settings: Arc::clone(&settings),
+        block_last_sync: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
     let node_id_arc = Arc::clone(&datanode.node_id);
     let service = DataNodeServiceServer::new(datanode);

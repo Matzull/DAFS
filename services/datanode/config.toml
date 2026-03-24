@@ -18,6 +18,12 @@ read_buffer_size = 65536
 # Buffer size for writing blocks (in bytes)
 write_buffer_size = 131072
 
+# Write sync policy: all | data | none
+write_sync_policy = "data"
+
+# Minimum interval between sync operations for the same block (ms). 0 = always.
+write_sync_interval_ms = 10
+
 metadata_node_address = "http://[::1]:9090"
 metadata_node_endpoints = ["http://[::1]:9090", "http://[::1]:9091", "http://[::1]:9092"]
 
