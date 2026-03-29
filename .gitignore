@@ -43,3 +43,5 @@ deployment/ansible/cluster_config.json
 profiling/*
 tools/*
 Memoria/*.pdf
+rendered/
+tools/
