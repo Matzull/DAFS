@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FileStatus {
-    Uploading,  // File is being written to, reading is bloqued
+    Uploading,  // File is being written to, reading is blocked
     Ready,      // File can be read and written to
     Replicated, // File has been replicated to other nodes
     Deleted,    // Marked to be deleted
