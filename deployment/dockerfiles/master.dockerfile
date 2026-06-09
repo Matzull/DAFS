@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # --- ETAPA 1: PLANIFICACION (cache de dependencias) ---
-FROM rust:1.94-slim-bookworm AS chef
+FROM rust:1.96-slim-bookworm AS chef
 WORKDIR /app
 
 # Dependencias necesarias para compilar:

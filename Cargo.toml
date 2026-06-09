@@ -10,7 +10,6 @@ members = [
     "client/fscore",
     "client/cli",
     "client/fuse_daemon",
-    "client/preload_shim",
 ]
 
 # --- DEPENDENCIAS GLOBALES ---

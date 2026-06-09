@@ -45,3 +45,4 @@ tools/*
 Memoria/*.pdf
 rendered/
 tools/
+*.tmp

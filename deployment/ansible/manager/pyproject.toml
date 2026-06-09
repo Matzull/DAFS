@@ -1,0 +1,11 @@
+[project]
+name = "dafs-cluster-manager"
+version = "0.2.0"
+description = "DAFS Cluster Manager GUI — PyQt6 desktop app"
+requires-python = ">=3.13"
+dependencies = [
+    "pyqt6>=6.11.0",
+]
+
+[tool.uv]
+dev-dependencies = []

@@ -1583,7 +1583,7 @@ impl MetadataService for Metadatanode {
         // Create directory entry (as empty file with directory flag)
         let file_metadata = FileMetadata {
             id: uuid::Uuid::new_v4().to_string(),
-            name: dir_request.path.split('/').last().unwrap_or("").to_string(),
+            name: dir_request.path.split('/').next_back().unwrap_or("").to_string(),
             path: dir_path.clone(),
             size: 0,
             owner: claims.sub.clone(),
