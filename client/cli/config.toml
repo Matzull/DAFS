@@ -27,7 +27,7 @@ metadata_cache_ttl_ms = 500
 read_block_cache_entries = 512
 
 # Logical DFS block size (must match master block_size)
-block_size = 1000000
+block_size = 1048576
 
 # Metadata user identity and status defaults
 default_user_id = "1"

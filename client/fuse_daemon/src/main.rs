@@ -231,6 +231,33 @@ struct DAFSfs {
 }
 
 impl Filesystem for DAFSfs {
+    fn init(
+        &mut self,
+        _req: &Request,
+        config: &mut fuser::KernelConfig,
+    ) -> std::io::Result<()> {
+        // Negotiate large I/O units so the kernel hands us 1 MiB chunks instead
+        // of the default ~128 KiB. Fewer FUSE round-trips per MB → less overhead
+        // on both the write (buffer fill) and read (readahead) paths.
+        if let Err(actual) = config.set_max_write(1024 * 1024) {
+            debug!(granted = actual, "max_write capped by kernel");
+        }
+        if let Err(actual) = config.set_max_readahead(1024 * 1024) {
+            debug!(granted = actual, "max_readahead capped by kernel");
+        }
+        // Let the kernel coalesce dirty pages and issue larger async writes
+        // instead of small synchronous ones.
+        if let Err(missing) = config.add_capabilities(fuser::InitFlags::FUSE_WRITEBACK_CACHE) {
+            debug!(missing = ?missing, "writeback cache capability unavailable");
+        }
+        // Allow more outstanding requests so the kernel can keep many readahead
+        // reads in flight; we now service them concurrently on the runtime.
+        if let Err(actual) = config.set_max_background(64) {
+            debug!(granted = actual, "max_background capped by kernel");
+        }
+        Ok(())
+    }
+
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         debug!(ino = ino.0, "Looking up path for inode");
         if ino == fuser::INodeNo(1) {
@@ -543,6 +570,7 @@ impl Filesystem for DAFSfs {
                 );
             }
             Err(err) => {
+                error!(error = %err, "Failed to create file");
                 reply.error(self.map_error(&err));
             }
         }
@@ -669,12 +697,10 @@ impl Filesystem for DAFSfs {
 
         // Some workloads (e.g. git index-pack) issue writes at varying offsets.
         // Flush the previous contiguous segment and start buffering at the new offset.
+        // Note: we intentionally do NOT sleep here — the FUSE session is
+        // single-threaded, so blocking this thread stalls every other in-flight
+        // operation. Flush the realigned segment immediately instead.
         if needs_realign_flush {
-            let delay = self.settings.realign_flush_delay_ms.min(20);
-            if delay > 0 {
-                // Small coalescing window to absorb bursts of offset realignments.
-                std::thread::sleep(Duration::from_millis(delay));
-            }
             if let Err(err) = self.flush_pending_buffer(fh, 1) {
                 error!(fh = fh.0, error = %err, "Failed to flush before write realignment");
                 reply.error(Errno::from_i32(EIO));
@@ -780,17 +806,19 @@ impl Filesystem for DAFSfs {
         };
         let token = self.token.blocking_read().clone();
         let settings = self.settings.clone();
-        let read_result = self.runtime.block_on(fscore::read_file_range(
-            settings,
-            path,
-            offset,
-            size as u64,
-            &token,
-        ));
-        match read_result {
-            Ok(data) => reply.data(&data),
-            Err(_) => reply.error(Errno::from_i32(EIO)),
-        }
+
+        // The fuser session loop is single-threaded: if we `block_on` here, no
+        // other request can be dispatched until this read's network round-trips
+        // finish. Instead, hand the work to the runtime and move the (Send)
+        // reply into the task, freeing the session thread to dispatch the next
+        // read immediately. The kernel keeps up to `max_background` reads in
+        // flight, so they now execute concurrently.
+        self.runtime.spawn(async move {
+            match fscore::read_file_range(settings, path, offset, size as u64, &token).await {
+                Ok(data) => reply.data(&data),
+                Err(_) => reply.error(Errno::from_i32(EIO)),
+            }
+        });
     }
 
     fn flush(
@@ -1634,7 +1662,7 @@ impl DAFSfs {
         // Register user, ignoring error if already exists
         match self.runtime.block_on(fscore::register_user(
             self.settings.clone(),
-            "pepe".to_string(),
+            "pep".to_string(),
             "pepe".to_string(),
         )) {
             Ok(_) => {},
@@ -1768,8 +1796,11 @@ fn main() {
     let mut initial_dirs = HashSet::new();
     initial_dirs.insert("/".to_string());  // Root is always a directory
     
+    let inode_map = RwLock::new(BiMap::new());
+    inode_map.blocking_write().insert(1u64, "/".to_string());  // Register root inode
+    
     let fs = DAFSfs {
-        inode_map: RwLock::new(BiMap::new()),
+        inode_map,
         runtime: Arc::new(Runtime::new().unwrap()),
         next_inode: AtomicU64::new(2),
         next_fh: AtomicU64::new(1),

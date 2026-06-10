@@ -13,16 +13,18 @@ log_level = "info"
 mpsc_channel_size = 64
 
 # Buffer size for reading blocks (in bytes)
-read_buffer_size = 65536
+# Larger chunks => fewer gRPC messages per block on the read path.
+read_buffer_size = 262144
 
 # Buffer size for writing blocks (in bytes)
-write_buffer_size = 131072
+# Matches the client upload chunk size so each chunk is one buffered write.
+write_buffer_size = 1048576
 
 # Write sync policy: all | data | none
 write_sync_policy = "data"
 
 # Minimum interval between sync operations for the same block (ms). 0 = always.
-write_sync_interval_ms = 10
+write_sync_interval_ms = 200
 
 metadata_node_address = "http://[::1]:9090"
 metadata_node_endpoints = ["http://[::1]:9090", "http://[::1]:9091", "http://[::1]:9092"]

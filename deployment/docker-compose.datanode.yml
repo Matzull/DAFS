@@ -3,6 +3,7 @@ services:
     build:
       context: ..
       dockerfile: deployment/dockerfiles/datanode.dockerfile
+    image: dafs-datanode:latest
     container_name: ${DATANODE_CONTAINER_NAME:-dafs-datanode}
     ports:
       - "${DATANODE_HOST_PORT:-8080}:8080"

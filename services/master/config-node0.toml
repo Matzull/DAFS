@@ -4,7 +4,7 @@
 listen_address = "[::1]:9090"
 
 # Block size (in bytes) - should match datanode settings
-block_size = 1000000
+block_size = 1048576
 
 # Replication factor - minimum number of nodes that must contain a block
 replication_factor = 2

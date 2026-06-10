@@ -3,6 +3,7 @@ services:
     build:
       context: ..
       dockerfile: deployment/dockerfiles/master.dockerfile
+    image: dafs-master:latest
     container_name: ${MASTER_CONTAINER_NAME:-dafs-master}
     ports:
       - "${MASTER_HOST_PORT:-9090}:${MASTER_SERVICE_PORT:-9090}"
@@ -32,6 +33,7 @@ services:
       - /config/master.env
     networks:
       - dafs-net
+      - elastic
 
 volumes:
   master-data:
@@ -41,3 +43,6 @@ networks:
   dafs-net:
     external: true
     name: ${DAFS_NETWORK_NAME:-dafs-net}
+  elastic:
+    external: true
+    name: ${ELASTIC_NETWORK_NAME:-elastic}

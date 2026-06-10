@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import json
-import os
 import queue
 import shlex
 import shutil
 import subprocess
 import sys
 import threading
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -149,44 +150,84 @@ def _is_windows_unc() -> bool:
     return sys.platform == "win32"
 
 
-def _run_in_wsl(cmd: list[str]) -> subprocess.CompletedProcess:
+def _run_in_wsl(cmd: list[str], timeout: int | None = None) -> subprocess.CompletedProcess:
     """Run a command, routing through wsl on Windows if needed."""
     if not _is_windows_unc():
-        return subprocess.run(cmd, capture_output=True, text=True)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     # On Windows WSL: strip outer "bash", "-lc" since wsl gives us bash
     cmd_str = cmd[2] if len(cmd) >= 2 and cmd[0] == "bash" and cmd[1] == "-lc" else " ".join(shlex.quote(c) for c in cmd)
-    return subprocess.run(["wsl", "bash", "-lc", cmd_str], capture_output=True, text=True)
+    return subprocess.run(["wsl", "bash", "-lc", cmd_str], capture_output=True, text=True, timeout=timeout)
 
 
-def run_cmd(cmd: list[str], timeout: int = 600) -> str:
+def run_cmd(cmd: list[str], timeout: int = 600) -> tuple[int, str]:
+    """Run a command, returning (exit_code, combined_output)."""
     try:
-        r = _run_in_wsl(cmd)
-        return r.stdout + r.stderr or f"(exit {r.returncode})"
+        r = _run_in_wsl(cmd, timeout)
+        return r.returncode, (r.stdout + r.stderr)
     except subprocess.TimeoutExpired:
-        return "TIMEOUT"
+        return 124, f"TIMEOUT (exceeded {timeout}s)"
     except Exception as e:
-        return f"ERROR: {e}"
+        return 1, f"ERROR: {e}"
+
+
+def step(p, label: str, cmd: list[str], timeout: int = 600) -> bool:
+    """Run one labelled command, streaming its output framed by ✓/✗ markers."""
+    p(f"  ▸ {label} …")
+    rc, out = run_cmd(cmd, timeout)
+    out = out.strip()
+    if out:
+        p(out)
+    if rc == 0:
+        p(f"  ✓ {label}")
+    else:
+        p(f"  ✗ {label}  (exit {rc})")
+    return rc == 0
 
 
 # ── Log queue (thread-safe) ────────────────────────────────────────────
 
+# Messages are (log_key, kind, payload):
+#   kind == "log"    → payload is a text line, routed to the section's box
+#   kind == "status" → payload is one of idle/running/done/failed
 _log_queue: queue.Queue = queue.Queue()
 
+# Human-friendly titles for operation banners, keyed by function name.
+_OP_TITLES = {
+    "op_init": "Initialize cluster config",
+    "op_build": "Build Docker images",
+    "op_deploy": "Deploy cluster (Ansible)",
+    "op_compose": "Docker Compose",
+    "op_clean": "Clean generated config",
+    "op_destroy": "Destroy cluster",
+}
 
-def bg(fn, *a, **kw):
-    def _print(text: str) -> None:
-        _log_queue.put(text)
+
+def bg(fn, *a, log_key: str = "GLOBAL", **kw):
+    """Run `fn(print, *a, **kw)` in a background thread, routing its output to
+    the `log_key` section with start/finish banners and a live status state."""
+    def _emit_log(text: str) -> None:
+        _log_queue.put((log_key, "log", text))
+
+    def _emit_status(state: str) -> None:
+        _log_queue.put((log_key, "status", state))
 
     def _target():
-        _print(f"▶ {fn.__name__}")
+        title = _OP_TITLES.get(fn.__name__, fn.__name__)
+        _emit_status("running")
+        started = time.monotonic()
+        _emit_log("")
+        _emit_log(f"╭─ ▶  {title}   ·   {datetime.now():%H:%M:%S}")
         try:
-            r = fn(_print, *a, **kw)
+            r = fn(_emit_log, *a, **kw)
             if isinstance(r, str):
-                _print(r)
-            else:
-                _print("✓ done")
+                _emit_log(r)
+            elapsed = time.monotonic() - started
+            _emit_log(f"╰─ ✓  {title}  —  done in {elapsed:.1f}s")
+            _emit_status("done")
         except Exception as e:
-            _print(f"✗ ERROR: {e}")
+            elapsed = time.monotonic() - started
+            _emit_log(f"╰─ ✗  {title}  —  FAILED after {elapsed:.1f}s: {e}")
+            _emit_status("failed")
 
     threading.Thread(target=_target, daemon=True).start()
 
@@ -201,7 +242,12 @@ def op_init(p, machines: list[dict]):
             nid, cn, sp = mid, f"master{mid}", 9090 + mid
             cc = REPO_ROOT / "services" / "master" / f"config-node{nid}.toml"
             cp = f"../services/master/config-node{nid}.toml" if cc.exists() else "../services/master/config.toml"
-            eh = mac.get("advertise_host") or mac["host"]
+            # For local connections, use container_name (Docker DNS) instead of localhost
+            # For remote SSH connections, use the host IP / advertise_host
+            if mac["connection"] == "local":
+                eh = cn
+            else:
+                eh = mac.get("advertise_host") or mac["host"]
             ms.append({"compose_project": f"dafs-master-{nid}", "container_name": cn, "node_id": nid,
                        "raft_bootstrap": nid == 0, "config_path": cp, "host_port": sp, "service_port": sp,
                        "listen_address": f"[::]:{sp}", "wal_path": f"/app/data/master{nid}.wal",
@@ -227,40 +273,41 @@ def op_init(p, machines: list[dict]):
 def op_build(p):
     cfg = load_config()
     if not cfg:
-        p("ERROR: No cluster config.")
+        p("✗ No cluster config. Run the Init Wizard first.")
         return
     for h in cfg["hosts"]:
         if h["connection"] != "local":
-            p(f"SKIP {h['name']} (remote not supported)")
+            p(f"⊘ Skipping {h['name']} (remote build not supported)")
             continue
         r = _fix_repo_root(h["repo_root"])
         bp = "DOCKER_BUILDKIT=1 BUILDKIT_PROGRESS=plain "
-        cmds = []
+        steps = []
         if h["enable_auditing"]:
-            cmds.append(f"{bp}docker compose -p dafs-auditing -f {r}/Auditing/docker-compose.yml build --progress=plain")
+            steps.append(("Auditing images", f"{bp}docker compose -p dafs-auditing -f {r}/Auditing/docker-compose.yml build --progress=plain"))
         if h["masters"]:
-            cmds.append(f"{bp}docker compose -f {r}/deployment/docker-compose.master.yml build --progress=plain")
+            steps.append(("Master image", f"{bp}docker compose -f {r}/deployment/docker-compose.master.yml build --progress=plain"))
         if h["datanodes"]:
-            cmds.append(f"{bp}docker compose -f {r}/deployment/docker-compose.datanode.yml build --progress=plain")
-        for c in cmds:
-            p(f"$ {c}")
-            p(run_cmd(["bash", "-lc", c], 1200))
+            steps.append(("Datanode image", f"{bp}docker compose -f {r}/deployment/docker-compose.datanode.yml build --progress=plain"))
+        if not steps:
+            p(f"Nothing to build for {h['name']}.")
+            continue
+        p(f"Building {len(steps)} image set(s) on {h['name']}…")
+        for label, c in steps:
+            step(p, label, ["bash", "-lc", c], 1200)
 
 
 def op_deploy(p, bp: str):
     cfg = load_config()
     if not cfg:
-        p("ERROR: No cluster config.")
+        p("✗ No cluster config. Run the Init Wizard first.")
         return
     for h in cfg["hosts"]:
-        r = _fix_repo_root(h["repo_root"])
         vp = GENERATED_DIR / f"vars-{h['name']}.json"
         cmd = ["ansible-playbook", "-vv", "-i", _p(INVENTORY_PATH), "-l", h["name"],
                _p(PLAYBOOK_PATH), "-e", f"@{_p(vp)}", "-e", "dafs_build_images=false"]
         if bp:
             cmd += ["-e", json.dumps({"ansible_become_password": bp, "logrotate_sudo_password": bp})]
-        p(f"$ {' '.join(cmd)}")
-        p(run_cmd(cmd, 600))
+        step(p, f"Ansible → {h['name']}", cmd, 600)
 
 
 def _fix_repo_root(r: str) -> str:
@@ -285,23 +332,25 @@ def _fix_repo_root(r: str) -> str:
 def op_compose(p, action: str):
     cfg = load_config()
     if not cfg:
-        p("ERROR: No cluster config.")
+        p("✗ No cluster config. Run the Init Wizard first.")
         return
     for h in cfg["hosts"]:
         if h["connection"] != "local":
             continue
         r = _fix_repo_root(h["repo_root"])
-        cs = []
+        # One labelled step per service so output is attributable, not a wall.
+        units = []
         if h["enable_auditing"]:
-            cs.append(f"docker compose -p dafs-auditing -f {r}/Auditing/docker-compose.yml {action}")
+            units.append(("auditing", f"docker compose -p dafs-auditing -f {r}/Auditing/docker-compose.yml {action}"))
         for m in h["masters"]:
-            cs.append(f"docker compose -p {m['compose_project']} -f {r}/deployment/docker-compose.master.yml {action}")
+            units.append((m["compose_project"], f"docker compose -p {m['compose_project']} -f {r}/deployment/docker-compose.master.yml {action}"))
         for d in h["datanodes"]:
-            cs.append(f"docker compose -p {d['compose_project']} -f {r}/deployment/docker-compose.datanode.yml {action}")
-        s = " && ".join(c for c in cs if c)
-        if s:
-            p(f"$ {s}")
-            p(run_cmd(["bash", "-lc", s]))
+            units.append((d["compose_project"], f"docker compose -p {d['compose_project']} -f {r}/deployment/docker-compose.datanode.yml {action}"))
+        if not units:
+            p(f"No services configured on {h['name']}.")
+            continue
+        for name, c in units:
+            step(p, f"{name}: {action}", ["bash", "-lc", c])
 
 
 def op_clean(p):
@@ -316,16 +365,18 @@ def op_clean(p):
 def op_destroy(p):
     cfg = load_config()
     if not cfg:
-        p("ERROR: No cluster config.")
+        p("✗ No cluster config to destroy.")
         return
     for h in cfg["hosts"]:
         h["repo_root"] = _fix_repo_root(h["repo_root"])
-        p(f"--- Destroying {h['name']} ---")
-        p(run_cmd(["bash", "-lc", destroy_script(h)], 300))
+        step(p, f"Tear down {h['name']}", ["bash", "-lc", destroy_script(h)], 300)
+    removed = []
     for pth in [CONFIG_PATH, GENERATED_DIR]:
         if pth.exists():
             (shutil.rmtree if pth.is_dir() else pth.unlink)(pth)
-    p("✓ Cluster destroyed.")
+            removed.append(pth.name)
+    if removed:
+        p("Removed generated files: " + ", ".join(removed))
 
 
 # ── Main Window ──────────────────────────────────────────────────────────
@@ -349,6 +400,14 @@ QLineEdit, QSpinBox, QComboBox {
 }
 QCheckBox { color: #cdd6f4; }
 """
+
+# Status pill text + colour for each operation state.
+_STATUS_STYLES = {
+    "idle":    ("● Idle",      "#6c7086"),
+    "running": ("● Running…",  "#f9e2af"),
+    "done":    ("● Done",      "#a6e3a1"),
+    "failed":  ("● Failed",    "#f38ba8"),
+}
 
 
 class MainWindow(QMainWindow):
@@ -374,6 +433,7 @@ class MainWindow(QMainWindow):
         lo.addWidget(self.tabs)
 
         self._log_boxes: dict[str, QPlainTextEdit] = {}
+        self._status_labels: dict[str, QLabel] = {}
 
         self._build_dashboard()
         self._build_wizard()
@@ -397,17 +457,42 @@ class MainWindow(QMainWindow):
     def _register_log(self, key: str, w: QPlainTextEdit):
         self._log_boxes[key] = w
 
+    def _append_to(self, key: str, text: str):
+        box = self._log_boxes.get(key) or self._log_boxes.get("GLOBAL")
+        if box is None:
+            return
+        box.appendPlainText(text)
+        sb = box.verticalScrollBar()
+        if sb:
+            sb.setValue(sb.maximum())
+
+    def _set_status(self, key: str, state: str):
+        lb = self._status_labels.get(key)
+        if lb is None:
+            return
+        text, color = _STATUS_STYLES.get(state, _STATUS_STYLES["idle"])
+        lb.setText(text)
+        lb.setStyleSheet(f"color: {color}; font-weight: bold;")
+
+    def _clear_log(self, key: str):
+        box = self._log_boxes.get(key)
+        if box:
+            box.clear()
+        self._set_status(key, "idle")
+
     def _drain_logs(self):
         while True:
             try:
-                text = _log_queue.get_nowait()
-                for box in self._log_boxes.values():
-                    box.appendPlainText(text)
-                    sb = box.verticalScrollBar()
-                    if sb:
-                        sb.setValue(sb.maximum())
+                key, kind, payload = _log_queue.get_nowait()
             except queue.Empty:
                 break
+            if kind == "status":
+                self._set_status(key, payload)
+                continue
+            # Route to the owning section, and mirror everything into GLOBAL.
+            self._append_to(key, payload)
+            if key != "GLOBAL":
+                self._append_to("GLOBAL", payload)
 
     # ── Widget helpers ────────────────────────────────────────────────
 
@@ -426,6 +511,23 @@ class MainWindow(QMainWindow):
         b = QPushButton(text)
         b.clicked.connect(slot)
         return b
+
+    def _status_label(self, key: str) -> QLabel:
+        lb = self._label("● Idle", size=10)
+        lb.setStyleSheet("color: #6c7086; font-weight: bold;")
+        self._status_labels[key] = lb
+        return lb
+
+    def _action_row(self, key: str, *buttons: QPushButton) -> QHBoxLayout:
+        """A button row with a 'Clear' button and a live status pill on the right."""
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        for b in buttons:
+            row.addWidget(b)
+        row.addWidget(self._btn("Clear", lambda: self._clear_log(key)))
+        row.addStretch()
+        row.addWidget(self._status_label(key))
+        return row
 
     def _log_widget(self) -> QPlainTextEdit:
         w = QPlainTextEdit()
@@ -626,8 +728,8 @@ class MainWindow(QMainWindow):
         if machines[0]["connection"] != "local":
             self._dash_info.setPlainText("The first machine must be 'local'.")
             return
-        bg(op_init, machines)
-        self._dash_info.setPlainText("Saving configuration...")
+        bg(op_init, machines, log_key="GLOBAL")
+        self._dash_info.setPlainText("Saving configuration… (see the Logs tab for details)")
 
     # ── Build ────────────────────────────────────────────────────────
 
@@ -636,7 +738,10 @@ class MainWindow(QMainWindow):
         lo.setContentsMargins(16, 16, 16, 16)
         lo.setSpacing(8)
         lo.addWidget(self._label("Build Docker Images", bold=True, size=14))
-        lo.addWidget(self._btn("Start Build", lambda: bg(op_build)))
+        lo.addLayout(self._action_row(
+            "BUILD",
+            self._btn("Start Build", lambda: bg(op_build, log_key="BUILD")),
+        ))
         w = self._log_widget()
         self._register_log("BUILD", w)
         lo.addWidget(w, 1)
@@ -654,7 +759,10 @@ class MainWindow(QMainWindow):
         self._become.setEchoMode(QLineEdit.EchoMode.Password)
         self._become.setMaximumWidth(240)
         lo.addWidget(self._become)
-        lo.addWidget(self._btn("Deploy", lambda: bg(op_deploy, self._become.text())))
+        lo.addLayout(self._action_row(
+            "DEPLOY",
+            self._btn("Deploy", lambda: bg(op_deploy, self._become.text(), log_key="DEPLOY")),
+        ))
         w = self._log_widget()
         self._register_log("DEPLOY", w)
         lo.addWidget(w, 1)
@@ -667,10 +775,11 @@ class MainWindow(QMainWindow):
         lo.setContentsMargins(16, 16, 16, 16)
         lo.setSpacing(8)
         lo.addWidget(self._label("Docker Compose", bold=True, size=14))
-        br = QHBoxLayout()
-        for text, act in [("Status", "ps"), ("Restart", "restart"), ("Stop", "stop"), ("Down", "down")]:
-            br.addWidget(self._btn(text, lambda checked, a=act: bg(op_compose, a)))
-        lo.addLayout(br)
+        buttons = [
+            self._btn(text, lambda checked=False, a=act: bg(op_compose, a, log_key="COMPOSE"))
+            for text, act in [("Status", "ps"), ("Restart", "restart"), ("Stop", "stop"), ("Down", "down")]
+        ]
+        lo.addLayout(self._action_row("COMPOSE", *buttons))
         w = self._log_widget()
         self._register_log("COMPOSE", w)
         lo.addWidget(w, 1)
@@ -682,8 +791,9 @@ class MainWindow(QMainWindow):
         lo = QVBoxLayout()
         lo.setContentsMargins(16, 16, 16, 16)
         lo.setSpacing(8)
-        lo.addWidget(self._label("Operation Logs", bold=True, size=14))
-        lo.addWidget(self._btn("Clear", lambda: [b.clear() for b in self._log_boxes.values()]))
+        lo.addWidget(self._label("Operation Logs (all sections)", bold=True, size=14))
+        lo.addWidget(self._label("Aggregated view. Each operation also has its own tab.", size=9, color="#6c7086"))
+        lo.addWidget(self._btn("Clear All", lambda: [b.clear() for b in self._log_boxes.values()]))
         w = self._log_widget()
         self._register_log("GLOBAL", w)
         lo.addWidget(w, 1)
@@ -697,12 +807,13 @@ class MainWindow(QMainWindow):
         lo.setSpacing(8)
         lo.addWidget(self._label("Danger Zone", bold=True, size=14, color="#f38ba8"))
         lo.addWidget(self._label("Clean removes generated config. Destroy removes ALL containers, volumes, networks and data.", size=9))
-        br = QHBoxLayout()
-        br.addWidget(self._btn("Clean Config", lambda: bg(op_clean)))
-        db = self._btn("Destroy Cluster", lambda: bg(op_destroy))
+        db = self._btn("Destroy Cluster", lambda: bg(op_destroy, log_key="DANGER"))
         db.setStyleSheet("background: #f38ba8; color: #1e1e2e;")
-        br.addWidget(db)
-        lo.addLayout(br)
+        lo.addLayout(self._action_row(
+            "DANGER",
+            self._btn("Clean Config", lambda: bg(op_clean, log_key="DANGER")),
+            db,
+        ))
         w = self._log_widget()
         self._register_log("DANGER", w)
         lo.addWidget(w, 1)

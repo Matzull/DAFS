@@ -142,6 +142,16 @@
         state: present
       when: enable_auditing | bool
 
+    - name: Ensure Elasticsearch data directory has correct ownership (uid 1000)
+      become: true
+      ansible.builtin.file:
+        path: "{{ dafs_repo_root }}/Auditing/esdata01"
+        state: directory
+        owner: "1000"
+        group: "1000"
+        mode: "0755"
+      when: enable_auditing | bool
+
     - name: Start auditing stack (idempotent)
       community.docker.docker_compose_v2:
         project_src: "{{ dafs_repo_root }}/Auditing"
@@ -155,11 +165,11 @@
     - name: Build computed masters metadata endpoints
       ansible.builtin.set_fact:
         masters_metadata_endpoints: >-
-          {% set endpoints = [] %}
-          {% for m in master_cluster_members %}
-          {% set _ = endpoints.append('http://' ~ (m.metadata_host | default(m.container_name)) ~ ':' ~ (m.service_port | string)) %}
-          {% endfor %}
-          {{ endpoints | join(',') }}
+          {%- set endpoints = [] -%}
+          {%- for m in master_cluster_members -%}
+          {%- set _ = endpoints.append('http://' ~ (m.metadata_host | default(m.container_name)) ~ ':' ~ (m.service_port | string)) -%}
+          {%- endfor -%}
+          {{- endpoints | join(',') -}}
       when:
         - master_cluster_members | length > 0
 
@@ -186,6 +196,7 @@
         build: "{{ 'always' if (dafs_build_images | bool) else 'never' }}"
       environment:
         DAFS_NETWORK_NAME: "{{ dafs_network_name }}"
+        ELASTIC_NETWORK_NAME: "{{ auditing_network_name }}"
         MASTER_CONTAINER_NAME: "{{ item.container_name }}"
         MASTER_CONFIG_PATH: "{{ item.config_path }}"
         MASTER_HOST_PORT: "{{ item.host_port | string }}"
@@ -194,13 +205,13 @@
         MASTER_RAFT_BOOTSTRAP: "{{ item.raft_bootstrap | lower }}"
         MASTER_RAFT_NODE_ID: "{{ item.node_id | string }}"
         MASTER_RAFT_INITIAL_MEMBERS: >-
-          {% set peers = [] %}
-          {% for m in master_cluster_members %}
-          {% if m.node_id != item.node_id %}
-          {% set _ = peers.append((m.node_id | string) ~ '=' ~ (m.raft_host | default(m.container_name)) ~ ':' ~ (m.service_port | string)) %}
-          {% endif %}
-          {% endfor %}
-          {{ peers | join(',') }}
+          {%- set peers = [] -%}
+          {%- for m in master_cluster_members -%}
+          {%- if m.node_id != item.node_id -%}
+          {%- set _ = peers.append((m.node_id | string) ~ '=' ~ (m.raft_host | default(m.container_name)) ~ ':' ~ (m.service_port | string)) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{- peers | join(',') -}}
         MASTER_WAL_PATH: "{{ item.wal_path }}"
         MASTER_AUTH_DB_PATH: "{{ item.auth_db_path }}"
         MASTER_ENV_PATH: "{{ master_env_path }}"

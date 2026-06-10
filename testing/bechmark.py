@@ -8,18 +8,74 @@ import sys
 import re
 
 # --- CONFIGURACIÓN DE LAS PRUEBAS ---
-DFS_PATH = "/tmp/DAFS/testfile"
-NATIVE_PATH = "/tmp/testfile"
+# IMPORTANTE (equidad de la comparativa):
+#   El baseline "nativo" DEBE vivir en el MISMO medio físico que el almacenamiento
+#   del datanode. Por defecto el datanode guarda en ./testing/datanode (disco real,
+#   p.ej. btrfs/NVMe). Si el baseline apunta a /tmp y /tmp es tmpfs, estarías
+#   midiendo RAM contra red+disco real: la comparación deja de tener sentido.
+#   Aquí el nativo se coloca junto al storage del datanode (mismo FS/disco).
+#   Puedes sobreescribir ambas rutas con las variables de entorno
+#   DFS_PATH y NATIVE_PATH.
+DFS_PATH = os.environ.get("DFS_PATH", "/tmp/DAFS/testfile")
+NATIVE_PATH = os.environ.get(
+    "NATIVE_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "native_baseline", "testfile"),
+)
+# Poner a True para forzar lecturas "frías" vaciando la page cache entre la fase
+# de escritura y la de lectura. Requiere privilegios (sudo) para drop_caches.
+DROP_CACHES = os.environ.get("DROP_CACHES", "0") == "1"
 BLOCK_SIZES = ["64k", "256k", "1m"]
 FILE_SIZES = ["64m", "512m"]
 # BLOCK_SIZES = ["256k", "1m"]
 # FILE_SIZES = ["64m"]
+
+
+def warn_if_different_filesystems():
+    """Avisa si el baseline nativo y el storage del DFS no comparten medio físico."""
+    def fstype(path):
+        p = path
+        while p and not os.path.exists(p):
+            p = os.path.dirname(p)
+        try:
+            out = subprocess.check_output(
+                ["findmnt", "-no", "FSTYPE,SOURCE", "-T", p], text=True
+            ).strip()
+            return out
+        except Exception:
+            return "?"
+
+    native_fs = fstype(NATIVE_PATH)
+    if "tmpfs" in native_fs.lower():
+        print(
+            "\n⚠️  AVISO: el baseline nativo está en tmpfs (RAM). La comparativa NO "
+            "es justa:\n   estarías midiendo RAM contra red+disco. Ajusta NATIVE_PATH "
+            "a un disco real.\n"
+        )
+
+def maybe_drop_caches():
+    """sync + (opcional) vaciar la page cache para forzar lecturas frías."""
+    subprocess.run(["sync"], check=False)
+    if not DROP_CACHES:
+        return
+    try:
+        with open("/proc/sys/vm/drop_caches", "w") as f:
+            f.write("3\n")
+    except PermissionError:
+        # Requiere root; intentamos vía sudo -n (no interactivo).
+        subprocess.run(
+            ["sudo", "-n", "sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"],
+            check=False,
+        )
+
 
 def run_iozone_benchmark(target_path, label):
     all_results = []
     print(f"\n{'='*60}")
     print(f"🚀 INICIANDO TEST: {label}")
     print(f"{'='*60}")
+
+    # Asegura que el directorio del fichero objetivo existe (p.ej. native_baseline/).
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
     for f_size in FILE_SIZES:
         # Calculamos los KB esperados para identificar la línea de datos
@@ -29,8 +85,12 @@ def run_iozone_benchmark(target_path, label):
         for b_size in BLOCK_SIZES:
             print(f"\n[SISTEMA: {label}] | Archivo: {f_size} | Bloque: {b_size}")
             
-            cmd = ["iozone", "-e", "-+u", "-i", "0", "-i", "1", "-i", "2", 
+            # -e: incluye fsync/fflush en el tiempo (escrituras durables, justo).
+            cmd = ["iozone", "-e", "-+u", "-i", "0", "-i", "1", "-i", "2",
                    "-r", b_size, "-s", f_size, "-f", target_path]
+
+            # Arranca cada combinación desde un estado de caché conocido.
+            maybe_drop_caches()
 
             master_fd, slave_fd = pty.openpty()
             process = subprocess.Popen(cmd, stdout=slave_fd, stderr=slave_fd, text=True)
@@ -155,6 +215,9 @@ def generate_text_report(df):
                   f"Random_RW: {row['Random_RW']} KB/s")
 
 if __name__ == "__main__":
+    # Verifica que la comparativa sea justa (mismo medio físico).
+    warn_if_different_filesystems()
+
     # Ejecución de benchmarks
     results_native = run_iozone_benchmark(NATIVE_PATH, "Linux_Nativo")
     results_dfs = run_iozone_benchmark(DFS_PATH, "DFS_Distribuido")

@@ -64,7 +64,7 @@ impl Default for DafsSettings {
             download_concurrency: 10,
             log_level: "warn".to_string(),
             upload_chunk_size: 1024 * 1024,
-            block_size: 1_000_000,
+            block_size: 1_048_576,
             realign_flush_delay_ms: 10,
             metadata_cache_ttl_ms: 500,
             read_block_cache_entries: 512,
@@ -79,20 +79,43 @@ impl Default for DafsSettings {
 }
 
 type DatanodeClient = DataNodeServiceClient<tonic::transport::Channel>;
+type MetadataClient = MetadataServiceClient<Channel>;
 static DATANODE_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, DatanodeClient>>> = OnceLock::new();
+static METADATA_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, MetadataClient>>> = OnceLock::new();
+static LEADER_CACHE: OnceLock<RwLock<Option<(Instant, String)>>> = OnceLock::new();
 static METADATA_CACHE: OnceLock<RwLock<HashMap<String, (Instant, GetFileResponse)>>> = OnceLock::new();
-static BLOCK_READ_CACHE: OnceLock<RwLock<HashMap<String, Arc<Vec<u8>>>>> = OnceLock::new();
+static BLOCK_READ_CACHE: OnceLock<RwLock<BlockReadCache>> = OnceLock::new();
+
+/// LRU cache of downloaded block payloads. Each entry tracks a logical access
+/// tick; eviction drops the least-recently-used entry. Eviction is O(n) over
+/// the (small, bounded) entry set, only on insert-when-full.
+#[derive(Default)]
+struct BlockReadCache {
+    map: HashMap<String, (Arc<Vec<u8>>, u64)>,
+    clock: u64,
+}
+
+/// How long a discovered Raft leader stays trusted before we re-discover it.
+const LEADER_CACHE_TTL_MS: u64 = 30_000;
 
 fn datanode_client_cache() -> &'static RwLock<HashMap<String, DatanodeClient>> {
     DATANODE_CLIENT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn metadata_client_cache() -> &'static RwLock<HashMap<String, MetadataClient>> {
+    METADATA_CLIENT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn leader_cache() -> &'static RwLock<Option<(Instant, String)>> {
+    LEADER_CACHE.get_or_init(|| RwLock::new(None))
 }
 
 fn metadata_cache() -> &'static RwLock<HashMap<String, (Instant, GetFileResponse)>> {
     METADATA_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn block_read_cache() -> &'static RwLock<HashMap<String, Arc<Vec<u8>>>> {
-    BLOCK_READ_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+fn block_read_cache() -> &'static RwLock<BlockReadCache> {
+    BLOCK_READ_CACHE.get_or_init(|| RwLock::new(BlockReadCache::default()))
 }
 
 async fn get_cached_metadata(path: &str, ttl_ms: u64) -> Option<GetFileResponse> {
@@ -117,21 +140,41 @@ async fn invalidate_metadata_cache(path: &str) {
 }
 
 async fn get_cached_block(block_id: &str) -> Option<Arc<Vec<u8>>> {
-    block_read_cache().read().await.get(block_id).cloned()
+    // Write lock because a hit bumps the entry's recency. The critical section
+    // is just a hashmap lookup + Arc clone (microseconds), so this does not
+    // meaningfully serialize the concurrent, network-bound block fetches.
+    let mut cache = block_read_cache().write().await;
+    cache.clock += 1;
+    let now = cache.clock;
+    let entry = cache.map.get_mut(block_id)?;
+    entry.1 = now;
+    Some(Arc::clone(&entry.0))
 }
 
-async fn put_cached_block(block_id: String, data: Vec<u8>, max_entries: usize) {
+async fn put_cached_block(block_id: String, data: Vec<u8>, max_entries: usize) -> Arc<Vec<u8>> {
+    let entry = Arc::new(data);
     let mut cache = block_read_cache().write().await;
-    if cache.len() >= max_entries.max(1) {
-        if let Some(first_key) = cache.keys().next().cloned() {
-            cache.remove(&first_key);
+    cache.clock += 1;
+    let now = cache.clock;
+
+    let cap = max_entries.max(1);
+    if !cache.map.contains_key(&block_id) && cache.map.len() >= cap {
+        // Evict the least-recently-used entry (smallest access tick).
+        if let Some(lru_key) = cache
+            .map
+            .iter()
+            .min_by_key(|(_, (_, tick))| *tick)
+            .map(|(key, _)| key.clone())
+        {
+            cache.map.remove(&lru_key);
         }
     }
-    cache.insert(block_id, Arc::new(data));
+    cache.map.insert(block_id, (Arc::clone(&entry), now));
+    entry
 }
 
 async fn invalidate_block_cache(block_id: &str) {
-    block_read_cache().write().await.remove(block_id);
+    block_read_cache().write().await.map.remove(block_id);
 }
 
 async fn get_or_connect_datanode_client(
@@ -185,7 +228,9 @@ fn prioritized_endpoints(settings: &DafsSettings, preferred: Option<String>) -> 
     endpoints
 }
 
-async fn discover_leader_endpoint(settings: &DafsSettings) -> Option<String> {
+/// Actually probe every master via the Raft service to find the current leader.
+/// This opens fresh connections, so callers should prefer the cached wrapper.
+async fn discover_leader_endpoint_uncached(settings: &DafsSettings) -> Option<String> {
     for endpoint in &settings.master_endpoints {
         let mut client = match RaftServiceClient::connect(endpoint.clone()).await {
             Ok(client) => client,
@@ -204,15 +249,54 @@ async fn discover_leader_endpoint(settings: &DafsSettings) -> Option<String> {
     None
 }
 
+/// Cached leader lookup. Avoids re-probing all masters (fresh TCP + RPC) on
+/// every metadata operation; the leader is stable except during failover.
+async fn discover_leader_endpoint(settings: &DafsSettings) -> Option<String> {
+    {
+        let guard = leader_cache().read().await;
+        if let Some((cached_at, addr)) = guard.as_ref() {
+            if cached_at.elapsed().as_millis() <= LEADER_CACHE_TTL_MS as u128 {
+                return Some(addr.clone());
+            }
+        }
+    }
+
+    let discovered = discover_leader_endpoint_uncached(settings).await;
+    if let Some(addr) = discovered.as_ref() {
+        *leader_cache().write().await = Some((Instant::now(), addr.clone()));
+    }
+    discovered
+}
+
+/// Connection-pooled metadata client. HTTP/2 channels multiplex requests, so a
+/// single cached channel per endpoint serves all concurrent calls.
+async fn get_or_connect_metadata_client(
+    endpoint: &str,
+) -> Result<MetadataClient, Box<dyn Error + Send + Sync>> {
+    if let Some(client) = metadata_client_cache().read().await.get(endpoint).cloned() {
+        return Ok(client);
+    }
+
+    let connected = MetadataServiceClient::connect(endpoint.to_string()).await?;
+    let mut cache = metadata_client_cache().write().await;
+    let client = cache
+        .entry(endpoint.to_string())
+        .or_insert_with(|| connected.clone())
+        .clone();
+    Ok(client)
+}
+
 async fn connect_metadata_client(
     settings: &DafsSettings,
     preferred: Option<String>,
 ) -> Result<MetadataServiceClient<Channel>, Box<dyn Error + Send + Sync>> {
+    // Note: on failover the cached leader self-heals when its TTL expires; the
+    // FailedPrecondition retry path still reaches the correct leader meanwhile.
     let mut last_error: Option<Box<dyn Error + Send + Sync>> = None;
     for endpoint in prioritized_endpoints(settings, preferred) {
-        match MetadataServiceClient::connect(endpoint).await {
+        match get_or_connect_metadata_client(&endpoint).await {
             Ok(client) => return Ok(client),
-            Err(err) => last_error = Some(Box::new(err)),
+            Err(err) => last_error = Some(err),
         }
     }
 
@@ -1313,6 +1397,12 @@ pub async fn read_file_range(
         .collect();
     let clients = build_datanode_clients(nodes_to_connect).await?;
 
+    // Fetch every overlapping block concurrently (bounded by download_concurrency)
+    // instead of serializing one network round-trip after another. Each task owns
+    // a disjoint slice of `out`, so copies happen after all fetches complete.
+    let semaphore = Arc::new(Semaphore::new(settings.download_concurrency.max(1)));
+    let mut set = JoinSet::new();
+
     for block in metadata.blocks {
         let block_size = block.block_size.max(0) as u64;
         if block_size == 0 {
@@ -1331,39 +1421,51 @@ pub async fn read_file_range(
         let overlap_len = (overlap_end - overlap_start) as usize;
         let out_start = (overlap_start - offset) as usize;
 
-        let block_bytes = if let Some(cached) = get_cached_block(&block.block_id).await {
-            (*cached).clone()
-        } else {
-            let client = clients
-                .get(&block.node_address)
-                .ok_or_else(|| format!("No datanode client for {}", block.node_address))?
-                .clone();
-            let downloaded = download_block_to_vec(
-                block.block_id.clone(),
-                client,
-                Arc::clone(&access_token),
-            )
-            .await
-            .map_err(|e| format!("Failed reading block for {remote_path}: {e}"))?;
-            put_cached_block(
-                block.block_id.clone(),
-                downloaded.clone(),
-                settings.read_block_cache_entries,
-            )
-            .await;
-            downloaded
-        };
+        let client = clients
+            .get(&block.node_address)
+            .ok_or_else(|| format!("No datanode client for {}", block.node_address))?
+            .clone();
+        let block_id = block.block_id.clone();
+        let sem = Arc::clone(&semaphore);
+        let token_clone = Arc::clone(&access_token);
+        let settings_clone = Arc::clone(&settings);
+        let remote_path_for_task = remote_path.clone();
 
-        if within_block_start + overlap_len > block_bytes.len() {
-            return Err(format!(
-                "Block layout mismatch while reading {remote_path}: slice [{}..{}) exceeds block size {}",
-                within_block_start,
-                within_block_start + overlap_len,
-                block_bytes.len()
-            )
-            .into());
-        }
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.map_err(|e| e.to_string())?;
 
+            // Hold the block as an Arc and slice the needed sub-range out of it.
+            // Avoids copying the whole block (up to `block_size`) on cache hits.
+            let block_bytes: Arc<Vec<u8>> = if let Some(cached) = get_cached_block(&block_id).await {
+                cached
+            } else {
+                let downloaded = download_block_to_vec(block_id.clone(), client, token_clone)
+                    .await
+                    .map_err(|e| format!("Failed reading block for {remote_path_for_task}: {e}"))?;
+                put_cached_block(
+                    block_id.clone(),
+                    downloaded,
+                    settings_clone.read_block_cache_entries,
+                )
+                .await
+            };
+
+            if within_block_start + overlap_len > block_bytes.len() {
+                return Err(format!(
+                    "Block layout mismatch while reading {remote_path_for_task}: slice [{}..{}) exceeds block size {}",
+                    within_block_start,
+                    within_block_start + overlap_len,
+                    block_bytes.len()
+                ));
+            }
+
+            Ok::<_, String>((out_start, within_block_start, overlap_len, block_bytes))
+        });
+    }
+
+    while let Some(res) = set.join_next().await {
+        let (out_start, within_block_start, overlap_len, block_bytes) =
+            res.map_err(|e| format!("read_file_range task panicked: {e}"))??;
         out[out_start..out_start + overlap_len]
             .copy_from_slice(&block_bytes[within_block_start..within_block_start + overlap_len]);
     }

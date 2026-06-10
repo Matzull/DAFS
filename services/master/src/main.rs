@@ -55,7 +55,7 @@ use crate::raft::membership_manager::MembershipManager;
 use crate::raft::runtime::MasterRaftContext;
 use crate::raft::types::{MetadataCommand, MetadataResponse, NodeId};
 
-const DEFAULT_BLOCK_SIZE: i64 = 64 * 1024;
+const DEFAULT_BLOCK_SIZE: i64 = 1024 * 1024;
 const DEFAULT_REPLICATION: i32 = 2;
 const DEFAULT_LISTEN_ADDRESS: &str = "[::1]:9090";
 const DEFAULT_LOG_LEVEL: &str = "info";
