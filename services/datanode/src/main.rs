@@ -573,10 +573,17 @@ impl DataNodeService for Datanode {
             }
         }
         debug!(block_id = %block_id_str, bytes_written, "Successfully wrote block");
+        let synced = match self.settings.write_sync_policy.to_ascii_lowercase().as_str() {
+            "none" => false,
+            "data" => true, // With interval_ms=0, we always sync
+            "all" => true,
+            _ => true,
+        };
         Ok(Response::new(WriteBlockResponse {
             success: true,
             message: "Everything went well".to_string(),
             bytes_written,
+            synced,
         }))
     }
 

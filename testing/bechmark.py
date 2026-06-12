@@ -24,7 +24,7 @@ NATIVE_PATH = os.environ.get(
 # Poner a True para forzar lecturas "frías" vaciando la page cache entre la fase
 # de escritura y la de lectura. Requiere privilegios (sudo) para drop_caches.
 DROP_CACHES = os.environ.get("DROP_CACHES", "0") == "1"
-BLOCK_SIZES = ["64k", "256k", "1m"]
+BLOCK_SIZES = ["128k", "256k", "1m", "4m"]
 FILE_SIZES = ["64m", "512m"]
 # BLOCK_SIZES = ["256k", "1m"]
 # FILE_SIZES = ["64m"]

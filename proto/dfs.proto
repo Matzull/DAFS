@@ -281,6 +281,7 @@ message WriteBlockResponse {
   bool   success       = 1;
   string message       = 2;
   int64  bytes_written = 3;
+  bool   synced        = 4; // True if block was durably written (fsync called)
 }
 
 message ReadBlockRequest {

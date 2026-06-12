@@ -829,7 +829,17 @@ async fn upload_block_from_shared_range(
         error!("Failed to get write block response: {}", e);
         format!("Failed to get write block response: {e}")
     })?;
-    Ok(response.into_inner())
+    let resp = response.into_inner();
+
+    // Ensure the block was durably written (fsync confirmed by datanode)
+    if !resp.synced {
+        return Err(format!(
+            "Block {} write not confirmed as durable by datanode",
+            block_id
+        )
+        .into());
+    }
+    Ok(resp)
 }
 
 #[instrument(skip(file_handle, data_node_client, settings, access_token))]

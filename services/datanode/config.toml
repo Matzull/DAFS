@@ -24,7 +24,9 @@ write_buffer_size = 1048576
 write_sync_policy = "data"
 
 # Minimum interval between sync operations for the same block (ms). 0 = always.
-write_sync_interval_ms = 200
+# Set to 0 for benchmark fairness: ensure every block is durably written before
+# the client's fsync() returns. Higher values batch syncs but delay durability confirmation.
+write_sync_interval_ms = 0
 
 metadata_node_address = "http://[::1]:9090"
 metadata_node_endpoints = ["http://[::1]:9090", "http://[::1]:9091", "http://[::1]:9092"]
