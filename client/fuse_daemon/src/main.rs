@@ -1660,14 +1660,21 @@ impl DAFSfs {
     fn intitialize(&self) {
         self.inode_map.blocking_write().insert(1, "/".to_string());
         // Register user, ignoring error if already exists
-        match self.runtime.block_on(fscore::register_user(
+        let register_result = self.runtime.block_on(fscore::register_user(
             self.settings.clone(),
             "pep".to_string(),
             "pepe".to_string(),
-        )) {
-            Ok(_) => {},
+        ));
+        match register_result {
+            Ok(_) => {}
             Err(e) if e.to_string().contains("already exists") => {
-                debug!("User pepe already registered");
+                debug!("User pep already registered, logging in");
+                self.runtime.block_on(fscore::login_user(
+                    self.settings.clone(),
+                    "pep".to_string(),
+                    "pepe".to_string(),
+                ))
+                .expect("Login failed for existing user");
             }
             Err(e) => panic!("Failed to register user: {}", e),
         }
