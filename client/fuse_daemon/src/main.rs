@@ -1380,7 +1380,6 @@ impl Filesystem for DAFSfs {
         // Not a tty / unsupported ioctl for this FS.
         reply.error(Errno::from_i32(libc::ENOTTY));
     }
-
 }
 
 impl DAFSfs {
