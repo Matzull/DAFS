@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Compilación avanzada
     // .compile( &[archivos], &[includes] )
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .field_attribute(
             "common.dfs.WriteBlockRequest.chunk_data",
             "#[prost(bytes=\"bytes\")]",
@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "common.dfs.ReadBlockResponse.chunk_data",
             "#[prost(bytes=\"bytes\")]",
         )
-        .compile(
+        .compile_protos(
             &[dfs_proto_file, raft_proto_file], // ¿Qué archivo compilar?
             &[proto_dir],                       // ¿Dónde buscar ese archivo y sus dependencias?
         )?;

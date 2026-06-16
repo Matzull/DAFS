@@ -19,6 +19,7 @@ fn sample_file(path: &str, status: FileStatus) -> FileMetadata {
             checksum: "checksum".to_string(),
             locations: vec![1],
         }],
+        mode: 0o644,
     }
 }
 

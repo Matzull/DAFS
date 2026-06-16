@@ -765,6 +765,7 @@ async fn upload_block(
     Ok(inner)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument(skip(data_node_client, settings, access_token, shared_data))]
 async fn upload_block_from_shared_range(
     block_id: String,
@@ -836,8 +837,7 @@ async fn upload_block_from_shared_range(
         return Err(format!(
             "Block {} write not confirmed as durable by datanode",
             block_id
-        )
-        .into());
+        ));
     }
     Ok(resp)
 }

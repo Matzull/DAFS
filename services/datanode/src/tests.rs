@@ -9,8 +9,11 @@ fn test_datanode() -> Datanode {
             log_level: "info".to_string(),
             mpsc_channel_size: 4,
             read_buffer_size: 64 * 1024,
-            metadata_node_address: "http://[::1]:19090".to_string(),
             write_buffer_size: 128 * 1024,
+            write_sync_policy: DEFAULT_WRITE_SYNC_POLICY.to_string(),
+            write_sync_interval_ms: 0,
+            metadata_node_address: "http://[::1]:19090".to_string(),
+            metadata_node_endpoints: vec!["http://[::1]:19090".to_string()],
             replication_max_parallel_blocks: 4,
             heartbeat_retry_initial_ms: 500,
             heartbeat_retry_max_ms: 30_000,
@@ -22,6 +25,7 @@ fn test_datanode() -> Datanode {
             jwt_secret: "test-secret".to_string(),
             service_token_exp_seconds: 300,
         }),
+        block_last_sync: Arc::new(Mutex::new(std::collections::HashMap::new())),
     }
 }
 

@@ -1642,6 +1642,7 @@ impl DAFSfs {
         Ok(())
     }
 
+    #[allow(clippy::borrowed_box)]
     fn map_error(&self, err: &Box<dyn std::error::Error + Send + Sync>) -> Errno {
         if let Some(status) = err.downcast_ref::<tonic::Status>() {
             match status.code() {
