@@ -23,12 +23,15 @@ impl tracing_subscriber::fmt::time::FormatTime for CompactTimestamp {
 }
 
 // Re-export the generated code
+// Generated code is not ours to lint
+#[allow(clippy::all)]
 pub mod dfs {
     // The build script generates a file named "dfs.rs" (based on package name in proto)
     // inside the OUT_DIR. We include it here.
     tonic::include_proto!("dfs");
 }
 
+#[allow(clippy::all)]
 pub mod raft {
     tonic::include_proto!("raft");
 }

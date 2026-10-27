@@ -42,7 +42,11 @@ deployment/ansible/cluster_config.json
 
 profiling/*
 tools/*
-Memoria/*.pdf
-rendered/
-tools/
 *.tmp
+
+# Python
+__pycache__/
+*.pyc
+
+# Generated benchmark reports
+reporte_rendimiento.html

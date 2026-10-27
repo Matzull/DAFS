@@ -5,6 +5,7 @@ fn test_datanode() -> Datanode {
         node_id: Arc::new(Mutex::new(0)),
         settings: Arc::new(InternalSettings {
             listen_address: "[::1]:18080".to_string(),
+            advertise_address: String::new(),
             data_folder: "./testing/datanode-tests".to_string(),
             log_level: "info".to_string(),
             mpsc_channel_size: 4,
