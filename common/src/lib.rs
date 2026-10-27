@@ -139,7 +139,10 @@ pub fn attach_bearer_token<T>(
     Ok(())
 }
 
-pub fn init_tracing(component: &str, default_level: &str) -> tracing_appender::non_blocking::WorkerGuard {
+pub fn init_tracing(
+    component: &str,
+    default_level: &str,
+) -> tracing_appender::non_blocking::WorkerGuard {
     let configured_level = std::env::var("RUST_LOG").unwrap_or_else(|_| default_level.to_string());
 
     let filter = tracing_subscriber::EnvFilter::new(configured_level.clone())

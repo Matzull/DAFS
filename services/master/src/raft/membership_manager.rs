@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use tokio::time::interval;
 use tokio::sync::RwLock;
+use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 use common::raft::raft_service_client::RaftServiceClient;
@@ -75,8 +75,11 @@ impl MembershipManager {
                 } else {
                     // Non-leaders do not mutate membership directly.
                     // The leader will add responsive known nodes as learners/voters.
-                    debug!(node_id = self.raft_ctx.node_id, "Follower waiting for leader membership updates");
-                    
+                    debug!(
+                        node_id = self.raft_ctx.node_id,
+                        "Follower waiting for leader membership updates"
+                    );
+
                     // Check if cluster has lost quorum
                     self.check_quorum_status().await;
                 }
@@ -174,7 +177,9 @@ impl MembershipManager {
         // Avoid shrinking a healthy 3+ voter cluster to 2 voters automatically.
         // A 2-voter config is fragile: if one voter dies, a restarted non-voter node
         // cannot help recover quorum until the missing voter returns.
-        if current_voters.len() >= MIN_AUTOMATIC_VOTERS && desired_voters.len() < MIN_AUTOMATIC_VOTERS {
+        if current_voters.len() >= MIN_AUTOMATIC_VOTERS
+            && desired_voters.len() < MIN_AUTOMATIC_VOTERS
+        {
             debug!(
                 current_voters = ?current_voters,
                 desired_voters = ?desired_voters,
@@ -292,32 +297,30 @@ impl MembershipManager {
     /// Check if the cluster has lost quorum and warn operator
     async fn check_quorum_status(&self) {
         let metrics = self.raft_ctx.raft.metrics().borrow().clone();
-        
+
         // If we have a leader, quorum is fine
         if metrics.current_leader.is_some() {
             // Reset warning timestamp
             *self.last_quorum_warning.write().await = None;
             return;
         }
-        
+
         // Count how many voters we have and how many are alive
         let voter_ids: BTreeSet<NodeId> = metrics.membership_config.voter_ids().collect();
         let voter_count = voter_ids.len();
-        
+
         if voter_count == 0 {
             return; // Not yet initialized
         }
-        
+
         let health = self.node_health.read().await;
         let responsive_voters: usize = voter_ids
             .iter()
-            .filter(|&&id| {
-                id == self.raft_ctx.node_id || health.get(&id).copied().unwrap_or(false)
-            })
+            .filter(|&&id| id == self.raft_ctx.node_id || health.get(&id).copied().unwrap_or(false))
             .count();
-        
+
         let quorum_size = (voter_count / 2) + 1;
-        
+
         // If we don't have enough responsive nodes for quorum, warn
         if responsive_voters < quorum_size {
             self.maybe_warn_quorum_lost(voter_count, responsive_voters)
@@ -388,4 +391,3 @@ impl MembershipManager {
         }
     }
 }
-

@@ -43,6 +43,10 @@ const DEFAULT_WRITE_SYNC_POLICY: &str = "all";
 #[derive(Parser, Debug, Serialize, Deserialize, Default)]
 pub struct InternalSettings {
     pub listen_address: String,
+    /// Address advertised to the master for other nodes to reach this datanode.
+    /// Must be routable from the master (e.g. the container/DNS name in Docker).
+    /// When empty, falls back to `listen_address` (fine for single-host setups).
+    pub advertise_address: String,
     pub data_folder: String,
     pub log_level: String,
     pub mpsc_channel_size: u8,
@@ -70,6 +74,7 @@ pub fn load_config() -> InternalSettings {
     let figment = Figment::new()
         .merge(Serialized::defaults(InternalSettings {
             listen_address: DEFAULT_LISTEN_ADDRESS.to_string(),
+            advertise_address: String::new(),
             data_folder: DEFAULT_DATA_FOLDER.to_string(),
             log_level: DEFAULT_LOG_LEVEL.to_string(),
             mpsc_channel_size: 4,
@@ -105,6 +110,12 @@ struct Cli {
     #[arg(short, long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     listen_address: Option<String>,
+
+    /// Address advertised to the master (must be routable from it, e.g. the
+    /// container/DNS name in Docker). Empty falls back to the listen address.
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    advertise_address: Option<String>,
 
     /// Data folder location
     #[arg(short, long)]
@@ -384,7 +395,7 @@ impl Datanode {
             request_data: Some(RequestData::Metadata(common::dfs::BlockMetadata {
                 block_id: block_id.clone(),
                 total_size: 0,
-                offset: 0,  // Replication always writes from block start
+                offset: 0, // Replication always writes from block start
             })),
         })
         .await
@@ -463,14 +474,14 @@ impl DataNodeService for Datanode {
                     if block_id_str.contains('/') || block_id_str.contains('.') {
                         return Err(Status::invalid_argument("Invalid block_id"));
                     }
-                    
+
                     let write_offset = metadata.offset as i64;
                     debug!(
                         block_id = %block_id_str,
                         offset = write_offset,
                         "Received metadata for block"
                     );
-                    
+
                     let mut file_path_pathbuf = PathBuf::from(&self.settings.data_folder);
                     file_path_pathbuf.push(&block_id_str[..2]);
                     file_path_pathbuf.push(&block_id_str[2..4]);
@@ -479,7 +490,7 @@ impl DataNodeService for Datanode {
                         Status::internal(err.to_string())
                     })?;
                     file_path_pathbuf.push(&block_id_str);
-                    
+
                     // Never truncate here: iozone and similar workloads can issue
                     // partial rewrites at offset 0, and truncation would drop the
                     // untouched tail of the block.
@@ -573,7 +584,12 @@ impl DataNodeService for Datanode {
             }
         }
         debug!(block_id = %block_id_str, bytes_written, "Successfully wrote block");
-        let synced = match self.settings.write_sync_policy.to_ascii_lowercase().as_str() {
+        let synced = match self
+            .settings
+            .write_sync_policy
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "none" => false,
             "data" => true, // With interval_ms=0, we always sync
             "all" => true,
@@ -757,6 +773,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     debug!("Creating directory to store files");
     create_dir_all(&settings.data_folder).await?;
     let address: std::net::SocketAddr = settings.listen_address.parse()?;
+    // Address the master (and peers) use to reach this datanode. The bind address
+    // ([::] / 0.0.0.0) is only valid for listening, never for connecting back, so
+    // advertise the configured routable address when one is provided.
+    let advertise_address = if settings.advertise_address.is_empty() {
+        address.to_string()
+    } else {
+        settings.advertise_address.clone()
+    };
+    info!(
+        "Advertising datanode address to master as {}",
+        advertise_address
+    );
     let datanode = Datanode {
         node_id: Arc::new(Mutex::new(0)),
         settings: Arc::clone(&settings),
@@ -778,7 +806,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut client = loop {
             let preferred = discover_leader_endpoint(&settings).await;
-            
+
             if preferred.is_none() {
                 warn!(
                     "No leader found in cluster. \
@@ -789,7 +817,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
                 continue;
             }
-            
+
             match connect_metadata_client(&settings, preferred.clone()).await {
                 Ok(c) => {
                     info!("Connected to master server at {:?}", preferred);
@@ -832,7 +860,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 node_id: current_node_id,
                 free_space: settings.heartbeat_free_space,
                 used_space: settings.heartbeat_used_space,
-                addr: address.to_string(),
+                addr: advertise_address.clone(),
             });
             if let Err(e) = common::attach_bearer_token(&mut heartbeat_request, &token) {
                 error!("Could not attach heartbeat token metadata: {}", e);
@@ -871,7 +899,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(e) => {
                     error!("Heartbeat failed: {}. Attempting to reconnect...", e);
-                    
+
                     // Try to reconnect
                     retry_delay = tokio::time::Duration::from_millis(
                         settings.heartbeat_retry_initial_ms.max(1),
@@ -883,15 +911,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             None
                         };
-                        
+
                         // If we couldn't get leader from error message, discover it
                         if preferred.is_none() {
-                            info!(
-                                "No leader hint in error, discovering leader from cluster..."
-                            );
+                            info!("No leader hint in error, discovering leader from cluster...");
                             preferred = discover_leader_endpoint(&settings).await;
                         }
-                        
+
                         // If still no leader found, wait before retrying discovery
                         if preferred.is_none() {
                             warn!(
@@ -903,14 +929,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
                             continue;
                         }
-                        
+
                         // Try to connect to the discovered leader
                         match connect_metadata_client(&settings, preferred.clone()).await {
                             Ok(c) => {
-                                info!(
-                                    "Reconnected to master server at {:?}",
-                                    preferred
-                                );
+                                info!("Reconnected to master server at {:?}", preferred);
                                 client = c;
                                 break;
                             }

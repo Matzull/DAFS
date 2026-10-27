@@ -108,7 +108,10 @@ impl AuditService for MyAuditService {
 
 fn env_bool(key: &str, default_value: bool) -> bool {
     match env::var(key) {
-        Ok(value) => matches!(value.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "y"),
+        Ok(value) => matches!(
+            value.trim().to_lowercase().as_str(),
+            "1" | "true" | "yes" | "y"
+        ),
         Err(_) => default_value,
     }
 }
@@ -123,14 +126,11 @@ fn build_http_client() -> Result<reqwest::Client, Box<dyn std::error::Error>> {
         if !user.is_empty() {
             builder = builder.default_headers({
                 let mut headers = reqwest::header::HeaderMap::new();
-                let value = format!(
-                    "Basic {}",
-                    {
-                        use base64::Engine;
-                        use base64::engine::general_purpose::STANDARD;
-                        STANDARD.encode(format!("{user}:{password}"))
-                    }
-                );
+                let value = format!("Basic {}", {
+                    use base64::engine::general_purpose::STANDARD;
+                    use base64::Engine;
+                    STANDARD.encode(format!("{user}:{password}"))
+                });
                 headers.insert(
                     reqwest::header::AUTHORIZATION,
                     reqwest::header::HeaderValue::from_str(&value)?,

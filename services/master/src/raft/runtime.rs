@@ -48,11 +48,14 @@ impl MasterRaftContext {
         settings: &InternalSettings,
         initial_state: Arc<MasterState>,
     ) -> Result<Self, Box<dyn Error>> {
-        let config =openraft::Config { cluster_name: settings.raft_cluster_name.clone(), ..Default::default() };
+        let config = openraft::Config {
+            cluster_name: settings.raft_cluster_name.clone(),
+            ..Default::default()
+        };
         let config = Arc::new(config.validate()?);
 
         let store = MasterStateMachine::new_with_state(initial_state);
-        
+
         // Auto-detect if cluster was already initialized in persistent storage
         // If there are prior logs or membership, don't bootstrap even if flag is set
         let was_previously_initialized = store.has_prior_initialization().await;
@@ -70,7 +73,14 @@ impl MasterRaftContext {
         .await?;
 
         let mut nodes = parse_member_nodes(&settings.raft_initial_members)?;
-        let self_addr = normalize_http_addr(&settings.listen_address);
+        // The bind address ([::] / 0.0.0.0) is only valid for listening; peers and
+        // datanodes must reach this node through a routable address, so advertise
+        // the configured one when provided and only fall back to listen_address.
+        let self_addr = if settings.advertise_address.is_empty() {
+            normalize_http_addr(&settings.listen_address)
+        } else {
+            normalize_http_addr(&settings.advertise_address)
+        };
         if let Some(existing) = nodes.get(&settings.raft_node_id) {
             if existing.addr != self_addr {
                 warn!(

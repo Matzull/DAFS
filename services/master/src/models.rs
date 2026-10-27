@@ -62,10 +62,10 @@ pub struct FileMetadata {
     pub last_modified_at: i64, //In millis since epoch
 
     pub file_status: FileStatus,
-    pub is_directory: bool,    // True if this is a directory
+    pub is_directory: bool, // True if this is a directory
 
     pub blocks: Vec<BlockMetadata>,
-    pub mode: u32,             // File permissions (e.g., 0o755 for directories, 0o644 for files)
+    pub mode: u32, // File permissions (e.g., 0o755 for directories, 0o644 for files)
 }
 
 #[derive(Debug)]

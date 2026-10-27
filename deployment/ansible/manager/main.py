@@ -7,6 +7,7 @@ import json
 import queue
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -234,6 +235,29 @@ def bg(fn, *a, log_key: str = "GLOBAL", **kw):
 
 # ── Operations ──────────────────────────────────────────────────────────
 
+def _host_ip() -> str:
+    """Best-effort routable IP of this machine (the default-route interface).
+    Used as the advertise host for local deployments so both the host-side client
+    and the Docker containers (via hairpin NAT) can reach the published ports."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.0.2.1", 80))  # TEST-NET-1: no packets sent, just picks the iface
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def _advertise_host(mac: dict) -> str:
+    """Address other nodes and clients use to reach this machine. An explicit
+    advertise_host always wins; otherwise local deployments use the routable host
+    IP (reachable from host and containers) and remote ones use the SSH host."""
+    if mac.get("advertise_host"):
+        return mac["advertise_host"]
+    return _host_ip() if mac["connection"] == "local" else mac["host"]
+
+
 def op_init(p, machines: list[dict]):
     hc, mcm, mid, did = [], [], 0, 0
     for mac in machines:
@@ -242,21 +266,26 @@ def op_init(p, machines: list[dict]):
             nid, cn, sp = mid, f"master{mid}", 9090 + mid
             cc = REPO_ROOT / "services" / "master" / f"config-node{nid}.toml"
             cp = f"../services/master/config-node{nid}.toml" if cc.exists() else "../services/master/config.toml"
-            # For local connections, use container_name (Docker DNS) instead of localhost
-            # For remote SSH connections, use the host IP / advertise_host
-            if mac["connection"] == "local":
-                eh = cn
-            else:
-                eh = mac.get("advertise_host") or mac["host"]
+            # Advertise a host-routable address (host IP + published port) so the
+            # host-side client reaches masters directly and containers reach them
+            # via hairpin NAT. Raft peers and datanodes use the same address.
+            eh = _advertise_host(mac)
             ms.append({"compose_project": f"dafs-master-{nid}", "container_name": cn, "node_id": nid,
                        "raft_bootstrap": nid == 0, "config_path": cp, "host_port": sp, "service_port": sp,
-                       "listen_address": f"[::]:{sp}", "wal_path": f"/app/data/master{nid}.wal",
+                       "listen_address": f"[::]:{sp}", "advertise_address": f"{eh}:{sp}",
+                       "wal_path": f"/app/data/master{nid}.wal",
                        "auth_db_path": f"/app/data/users{nid}.db", "metadata_host": eh, "raft_host": eh})
             mcm.append(ms[-1].copy())
             mid += 1
         for _ in range(mac["datanode_count"]):
-            ds.append({"compose_project": f"dafs-datanode-{did}", "config_path": "../services/datanode/config.toml",
-                       "host_port": str(8080 + _), "container_name": f"dafs-datanode-{did}",
+            cn, hp = f"dafs-datanode-{did}", str(8080 + _)
+            # Address the master, peer datanodes and the host-side client all use
+            # to reach this datanode: the machine's routable IP + the published
+            # host port. The internal listen port (8080) is the same for every
+            # datanode, so only the published host port distinguishes them.
+            adv = f"{_advertise_host(mac)}:{hp}"
+            ds.append({"compose_project": cn, "config_path": "../services/datanode/config.toml",
+                       "host_port": hp, "container_name": cn, "advertise_address": adv,
                        "rust_log": "info", "listen_address": "[::]:8080"})
             did += 1
         hc.append({"name": mac["name"], "host": mac["host"], "connection": mac["connection"],

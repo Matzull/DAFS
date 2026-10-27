@@ -14,7 +14,15 @@ use crate::auth::AuthManager;
 use crate::models::{BlockMetadata, DatanodeInfo, FileMetadata, FileStatus, MasterState};
 use common::dfs::metadata_service_server::{MetadataService, MetadataServiceServer};
 use common::dfs::{
-    AllocateBlocksRequest, AllocateBlocksResponse, BlockAssignment, BlockList, CreateDirectoryRequest, CreateDirectoryResponse, CreateFileRequest, CreateFileResponse, DeleteBlockRequest, DeleteDirectoryRequest, DeleteDirectoryResponse, DeleteFileRequest, DeleteFileResponse, FileInfo, GetFileRequest, GetFileResponse, GetSystemStatsRequest, GetSystemStatsResponse, HeartbeatRequest, HeartbeatResponse, ListDirectoryRequest, ListDirectoryResponse, LoginUserRequest, LoginUserResponse, RegisterUserRequest, RegisterUserResponse, RenameFileRequest, RenameFileResponse, ReplicateBlocksRequest, SetFilePermissionsRequest, SetFilePermissionsResponse, SetFileStatusRequest, SetFileStatusResponse, data_node_service_client
+    data_node_service_client, AllocateBlocksRequest, AllocateBlocksResponse, BlockAssignment,
+    BlockList, CreateDirectoryRequest, CreateDirectoryResponse, CreateFileRequest,
+    CreateFileResponse, DeleteBlockRequest, DeleteDirectoryRequest, DeleteDirectoryResponse,
+    DeleteFileRequest, DeleteFileResponse, FileInfo, GetFileRequest, GetFileResponse,
+    GetSystemStatsRequest, GetSystemStatsResponse, HeartbeatRequest, HeartbeatResponse,
+    ListDirectoryRequest, ListDirectoryResponse, LoginUserRequest, LoginUserResponse,
+    RegisterUserRequest, RegisterUserResponse, RenameFileRequest, RenameFileResponse,
+    ReplicateBlocksRequest, SetFilePermissionsRequest, SetFilePermissionsResponse,
+    SetFileStatusRequest, SetFileStatusResponse,
 };
 use common::raft::raft_service_server::{RaftService, RaftServiceServer};
 use common::raft::{
@@ -83,6 +91,10 @@ const DEFAULT_RAFT_BOOTSTRAP: bool = false;
 #[derive(Parser, Debug, Serialize, Deserialize)]
 pub struct InternalSettings {
     pub listen_address: String,
+    /// Address advertised to peers and datanodes for the Raft/metadata service.
+    /// Must be routable from them (e.g. the container/DNS name in Docker). When
+    /// empty, falls back to `listen_address` (fine for single-host setups).
+    pub advertise_address: String,
     pub block_size: i64,
     pub replication_factor: i32,
     pub log_level: String,
@@ -115,6 +127,7 @@ pub fn load_config() -> InternalSettings {
     let figment = Figment::new()
         .merge(Serialized::defaults(InternalSettings {
             listen_address: DEFAULT_LISTEN_ADDRESS.to_string(),
+            advertise_address: String::new(),
             block_size: DEFAULT_BLOCK_SIZE,
             replication_factor: DEFAULT_REPLICATION,
             log_level: DEFAULT_LOG_LEVEL.to_string(),
@@ -155,6 +168,12 @@ struct Cli {
     #[arg(short, long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     listen_address: Option<String>,
+
+    /// Address advertised to peers and datanodes (must be routable from them,
+    /// e.g. the container/DNS name in Docker). Empty falls back to listen address.
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    advertise_address: Option<String>,
 
     /// Block size (in bytes)
     #[arg(short, long)]
@@ -400,11 +419,13 @@ impl RaftService for RaftRpcNode {
         &self,
         _request: Request<GetLeaderRequest>,
     ) -> Result<Response<GetLeaderResponse>, Status> {
+        let responder_id = self.raft_ctx.node_id;
         if let Some((leader_id, leader_address)) = self.raft_ctx.leader_hint().await {
             return Ok(Response::new(GetLeaderResponse {
                 known: true,
                 leader_id,
                 leader_address,
+                responder_id,
             }));
         }
 
@@ -412,6 +433,7 @@ impl RaftService for RaftRpcNode {
             known: false,
             leader_id: 0,
             leader_address: String::new(),
+            responder_id,
         }))
     }
 
@@ -1216,7 +1238,9 @@ impl MetadataService for Metadatanode {
                     }),
                 )
                 .await;
-                return Err(Status::already_exists("Destination directory already exists"));
+                return Err(Status::already_exists(
+                    "Destination directory already exists",
+                ));
             }
 
             if !self.can_access_path(&existing_dst.owner, &claims) {
@@ -1249,7 +1273,10 @@ impl MetadataService for Metadatanode {
         if let Some(existing_dst) = dst_file {
             overwritten_blocks = existing_dst.blocks.len();
             if overwritten_blocks > 0 {
-                self.garbage_collector_tx.send(existing_dst.blocks).await.ok();
+                self.garbage_collector_tx
+                    .send(existing_dst.blocks)
+                    .await
+                    .ok();
             }
         }
 
@@ -1557,7 +1584,7 @@ impl MetadataService for Metadatanode {
         let claims = self.authorize_user_or_master(request.metadata())?;
         let dir_request = request.into_inner();
         let mut dir_path = dir_request.path.clone();
-        
+
         // Normalize path to end with /
         if !dir_path.ends_with('/') {
             dir_path.push('/');
@@ -1583,7 +1610,12 @@ impl MetadataService for Metadatanode {
         // Create directory entry (as empty file with directory flag)
         let file_metadata = FileMetadata {
             id: uuid::Uuid::new_v4().to_string(),
-            name: dir_request.path.split('/').next_back().unwrap_or("").to_string(),
+            name: dir_request
+                .path
+                .split('/')
+                .next_back()
+                .unwrap_or("")
+                .to_string(),
             path: dir_path.clone(),
             size: 0,
             owner: claims.sub.clone(),
@@ -1597,8 +1629,8 @@ impl MetadataService for Metadatanode {
                 .as_millis() as i64,
             file_status: FileStatus::Ready,
             blocks: Default::default(),
-            is_directory: true,  // Mark as directory
-            mode: 0o755, // Default directory permissions
+            is_directory: true, // Mark as directory
+            mode: 0o755,        // Default directory permissions
         };
 
         // Store in filesystem
@@ -1608,13 +1640,8 @@ impl MetadataService for Metadatanode {
         }
 
         info!(path = dir_path, "Directory created successfully");
-        self.audit_success(
-            "MKDIR",
-            Some(dir_path),
-            claims.sub,
-            json!({}),
-        )
-        .await;
+        self.audit_success("MKDIR", Some(dir_path), claims.sub, json!({}))
+            .await;
 
         Ok(Response::new(CreateDirectoryResponse {
             success: true,
@@ -1632,7 +1659,7 @@ impl MetadataService for Metadatanode {
         let claims = self.authorize_user_or_master(request.metadata())?;
         let del_request = request.into_inner();
         let mut dir_path = del_request.path.clone();
-        
+
         if !dir_path.ends_with('/') {
             dir_path.push('/');
         }
@@ -1667,7 +1694,7 @@ impl MetadataService for Metadatanode {
             let has_children = files_lock
                 .iter()
                 .any(|(path, _)| path != &dir_path && path.starts_with(&dir_path));
-            
+
             if has_children {
                 info!(path = dir_path, "Directory not empty");
                 self.audit_failure(
@@ -1689,13 +1716,8 @@ impl MetadataService for Metadatanode {
         }
 
         info!(path = dir_path, "Directory deleted successfully");
-        self.audit_success(
-            "RMDIR",
-            Some(dir_path),
-            claims.sub,
-            json!({}),
-        )
-        .await;
+        self.audit_success("RMDIR", Some(dir_path), claims.sub, json!({}))
+            .await;
 
         Ok(Response::new(DeleteDirectoryResponse {
             success: true,
@@ -1719,7 +1741,7 @@ impl MetadataService for Metadatanode {
                 .values()
                 .map(|f| {
                     // Each file uses ceil(size / block_size) blocks
-                    let block_size = 1024 * 1024;  // 1 MB
+                    let block_size = 1024 * 1024; // 1 MB
                     ((f.size + block_size - 1) / block_size).max(1)
                 })
                 .sum();
@@ -1738,13 +1760,13 @@ impl MetadataService for Metadatanode {
         };
 
         // Calculate filesystem metrics
-        let block_size: i64 = 1024 * 1024;  // 1 MB blocks
-        
+        let block_size: i64 = 1024 * 1024; // 1 MB blocks
+
         // Estimate total capacity: if datanodes didn't report, assume 100 * 1 MB blocks per node
         // (This should be updated when datanodes report their capacity via heartbeat)
         let datanode_count = self.state.available_datanodes.read().await.len().max(1) as i64;
-        let total_blocks = datanode_count * 50000;  // Conservative estimate
-        
+        let total_blocks = datanode_count * 50000; // Conservative estimate
+
         let free_blocks = (total_blocks - total_blocks_used).max(0);
         let free_inodes = (10000i64 - file_count).max(0);
 

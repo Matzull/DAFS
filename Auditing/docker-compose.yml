@@ -109,7 +109,14 @@ services:
     container_name: grafana
     ports:
       - "${GRAFANA_PORT}:3000"
-    entrypoint: 
+    # Run as root: the image ships /usr/share/grafana/data/plugins-bundled owned
+    # by 1000:1000, so the default grafana user (472) can't update the bundled
+    # elasticsearch datasource plugin there. That failed update leaves the
+    # datasource unregistered ("Could not find plugin definition"), so audit
+    # dashboards show no data. Running as root lets the bundled plugin update
+    # succeed. (Local single-host deployment; acceptable trade-off.)
+    user: "0:0"
+    entrypoint:
       - sh
       - -euc
       - |

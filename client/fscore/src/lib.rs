@@ -4,7 +4,11 @@ use common::dfs::metadata_service_client::MetadataServiceClient;
 use common::dfs::read_block_response::ResponseData;
 use common::dfs::write_block_request::RequestData;
 use common::dfs::{
-    AllocateBlocksRequest, AllocateBlocksResponse, CreateFileRequest, CreateFileResponse, CreateDirectoryRequest, DeleteFileRequest, DeleteDirectoryRequest, GetFileRequest, GetFileResponse, ListDirectoryRequest, ListDirectoryResponse, LoginUserRequest, ReadBlockRequest, RegisterUserRequest, RenameFileRequest, SetFilePermissionsRequest, SetFileStatusRequest, GetSystemStatsRequest, WriteBlockRequest, WriteBlockResponse
+    AllocateBlocksRequest, AllocateBlocksResponse, CreateDirectoryRequest, CreateFileRequest,
+    CreateFileResponse, DeleteDirectoryRequest, DeleteFileRequest, GetFileRequest, GetFileResponse,
+    GetSystemStatsRequest, ListDirectoryRequest, ListDirectoryResponse, LoginUserRequest,
+    ReadBlockRequest, RegisterUserRequest, RenameFileRequest, SetFilePermissionsRequest,
+    SetFileStatusRequest, WriteBlockRequest, WriteBlockResponse,
 };
 use common::raft::raft_service_client::RaftServiceClient;
 use common::raft::GetLeaderRequest;
@@ -16,8 +20,8 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{FileExt, MetadataExt};
-use std::sync::OnceLock;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
@@ -83,7 +87,8 @@ type MetadataClient = MetadataServiceClient<Channel>;
 static DATANODE_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, DatanodeClient>>> = OnceLock::new();
 static METADATA_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, MetadataClient>>> = OnceLock::new();
 static LEADER_CACHE: OnceLock<RwLock<Option<(Instant, String)>>> = OnceLock::new();
-static METADATA_CACHE: OnceLock<RwLock<HashMap<String, (Instant, GetFileResponse)>>> = OnceLock::new();
+static METADATA_CACHE: OnceLock<RwLock<HashMap<String, (Instant, GetFileResponse)>>> =
+    OnceLock::new();
 static BLOCK_READ_CACHE: OnceLock<RwLock<BlockReadCache>> = OnceLock::new();
 
 /// LRU cache of downloaded block payloads. Each entry tracks a logical access
@@ -184,7 +189,14 @@ async fn get_or_connect_datanode_client(
         return Ok(client);
     }
 
-    let connected = DataNodeServiceClient::connect(addr.to_string()).await?;
+    // Datanode addresses are advertised without a scheme (e.g. "192.168.0.11:8080");
+    // tonic needs an explicit scheme to build the endpoint, so default to http.
+    let uri = if addr.contains("://") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
+    };
+    let connected = DataNodeServiceClient::connect(uri).await?;
     let mut cache = datanode_client_cache().write().await;
     let client = cache
         .entry(addr.to_string())
@@ -231,6 +243,14 @@ fn prioritized_endpoints(settings: &DafsSettings, preferred: Option<String>) -> 
 /// Actually probe every master via the Raft service to find the current leader.
 /// This opens fresh connections, so callers should prefer the cached wrapper.
 async fn discover_leader_endpoint_uncached(settings: &DafsSettings) -> Option<String> {
+    // Probe our own configured endpoints and return the one whose node is the
+    // leader, so we always dial an address we can actually reach. The
+    // master-advertised `leader_address` is cluster-internal (e.g. a Docker
+    // hostname) and may be unresolvable from where the client runs, so we never
+    // dial it directly; we only use the leader's node id to pick our endpoint.
+    let mut leader_id: Option<u64> = None;
+    let mut endpoint_by_node: HashMap<u64, String> = HashMap::new();
+
     for endpoint in &settings.master_endpoints {
         let mut client = match RaftServiceClient::connect(endpoint.clone()).await {
             Ok(client) => client,
@@ -242,11 +262,20 @@ async fn discover_leader_endpoint_uncached(settings: &DafsSettings) -> Option<St
             Err(_) => continue,
         };
 
-        if response.known && !response.leader_address.is_empty() {
-            return Some(response.leader_address);
+        if response.responder_id != 0 {
+            endpoint_by_node.insert(response.responder_id, endpoint.clone());
+        }
+        if response.known {
+            // The endpoint we just queried is itself the leader: use it directly.
+            if response.leader_id == response.responder_id {
+                return Some(endpoint.clone());
+            }
+            leader_id.get_or_insert(response.leader_id);
         }
     }
-    None
+
+    // Leader is a different configured endpoint we already identified by node id.
+    leader_id.and_then(|id| endpoint_by_node.get(&id).cloned())
 }
 
 /// Cached leader lookup. Avoids re-probing all masters (fresh TCP + RPC) on
@@ -594,7 +623,10 @@ pub async fn create_directory(
             });
             common::attach_bearer_token(&mut retry_request, access_token)?;
             retry_client.create_directory(retry_request).await?;
-            info!(directory_path, "Directory created successfully (after retry)");
+            info!(
+                directory_path,
+                "Directory created successfully (after retry)"
+            );
             Ok(())
         }
         Err(status) => Err(Box::new(status)),
@@ -634,7 +666,10 @@ pub async fn delete_directory(
             });
             common::attach_bearer_token(&mut retry_request, access_token)?;
             retry_client.delete_directory(retry_request).await?;
-            info!(directory_path, "Directory deleted successfully (after retry)");
+            info!(
+                directory_path,
+                "Directory deleted successfully (after retry)"
+            );
             Ok(())
         }
         Err(status) => Err(Box::new(status)),
@@ -707,7 +742,7 @@ async fn upload_block(
         request_data: Some(RequestData::Metadata(common::dfs::BlockMetadata {
             block_id: block_id.clone(),
             total_size: block_size,
-            offset: 0,  // New blocks always write from start; offset used for append/overwrite
+            offset: 0, // New blocks always write from start; offset used for append/overwrite
         })),
     })
     .await
@@ -1068,8 +1103,8 @@ pub async fn upload_file(
     let clients = build_datanode_clients(nodes_to_connect).await?;
 
     for block_assignment in create_file_response.blocks.clone() {
-        let block_offset = (block_assignment.order.max(0) as u64)
-            .saturating_mul(logical_block_size);
+        let block_offset =
+            (block_assignment.order.max(0) as u64).saturating_mul(logical_block_size);
         let block_id = block_assignment.block_id.clone();
         let f_handle = Arc::clone(&shared_file_handle);
         let settings_clone = Arc::clone(&settings);
@@ -1143,8 +1178,8 @@ pub async fn download_file(
 
     for block_assignment in get_file_response.blocks.clone() {
         let permit = semaphore.clone().acquire_owned().await?;
-        let block_offset = (block_assignment.order.max(0) as u64)
-            .saturating_mul(logical_block_size);
+        let block_offset =
+            (block_assignment.order.max(0) as u64).saturating_mul(logical_block_size);
         let block_id = block_assignment.block_id.clone();
         let f_handle = Arc::clone(&shared_file_handle);
         let settings_clone = Arc::clone(&settings);
@@ -1183,7 +1218,11 @@ pub async fn set_file_permissions(
     mode: u32,
     access_token: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    info!(remote_path, mode = format!("{:o}", mode), "Setting file permissions");
+    info!(
+        remote_path,
+        mode = format!("{:o}", mode),
+        "Setting file permissions"
+    );
     let preferred = discover_leader_endpoint(settings.as_ref()).await;
     let mut client = connect_metadata_client(settings.as_ref(), preferred).await?;
     let mut request = Request::new(SetFilePermissionsRequest {
@@ -1194,7 +1233,11 @@ pub async fn set_file_permissions(
 
     match client.set_file_permissions(request).await {
         Ok(_) => {
-            info!(remote_path, mode = format!("{:o}", mode), "File permissions set successfully");
+            info!(
+                remote_path,
+                mode = format!("{:o}", mode),
+                "File permissions set successfully"
+            );
             Ok(())
         }
         Err(status) if status.code() == tonic::Code::FailedPrecondition => {
@@ -1209,7 +1252,11 @@ pub async fn set_file_permissions(
             });
             common::attach_bearer_token(&mut retry_request, access_token)?;
             retry_client.set_file_permissions(retry_request).await?;
-            info!(remote_path, mode = format!("{:o}", mode), "File permissions set successfully (after retry)");
+            info!(
+                remote_path,
+                mode = format!("{:o}", mode),
+                "File permissions set successfully (after retry)"
+            );
             Ok(())
         }
         Err(status) => Err(Box::new(status)),
@@ -1224,14 +1271,17 @@ pub async fn allocate_blocks(
     blocks_offset: u64,
     access_token: &str,
 ) -> Result<AllocateBlocksResponse, Box<dyn Error + Send + Sync>> {
-    info!(file_path, file_size, blocks_offset, "Starting block allocation");
+    info!(
+        file_path,
+        file_size, blocks_offset, "Starting block allocation"
+    );
     let access_token = Arc::new(access_token.to_owned());
     let preferred = discover_leader_endpoint(settings.as_ref()).await;
     let mut meta_client = connect_metadata_client(settings.as_ref(), preferred).await?;
     let mut allocate_blocks_request = Request::new(AllocateBlocksRequest {
         file_id: file_path.clone(),
         size: file_size,
-        offset: blocks_offset
+        offset: blocks_offset,
     });
     common::attach_bearer_token(&mut allocate_blocks_request, access_token.as_str())?;
     let allocate_block_response = match meta_client.allocate_blocks(allocate_blocks_request).await {
@@ -1244,10 +1294,13 @@ pub async fn allocate_blocks(
             let mut retry_request = Request::new(AllocateBlocksRequest {
                 file_id: file_path.clone(),
                 size: file_size,
-                offset: blocks_offset
+                offset: blocks_offset,
             });
             common::attach_bearer_token(&mut retry_request, access_token.as_str())?;
-            meta_client.allocate_blocks(retry_request).await?.into_inner()
+            meta_client
+                .allocate_blocks(retry_request)
+                .await?
+                .into_inner()
         }
         Err(status) => return Err(Box::new(status)),
     };
@@ -1381,9 +1434,12 @@ pub async fn read_file_range(
     {
         cached
     } else {
-        let fresh =
-            get_file_metadata(Arc::clone(&settings), remote_path.clone(), access_token.as_str())
-                .await?;
+        let fresh = get_file_metadata(
+            Arc::clone(&settings),
+            remote_path.clone(),
+            access_token.as_str(),
+        )
+        .await?;
         put_cached_metadata(remote_path.clone(), fresh.clone()).await;
         fresh
     };

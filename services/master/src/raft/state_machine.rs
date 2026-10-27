@@ -70,18 +70,24 @@ impl MasterStateMachine {
     /// This prevents accidental re-bootstrap when node restarts with bootstrap=true
     pub async fn has_prior_initialization(&self) -> bool {
         let inner = self.inner.read().await;
-        
+
         // Check if there are any log entries (indicates cluster was active before)
         if !inner.logs.is_empty() {
             return true;
         }
-        
+
         // Check if there is stored membership (indicates cluster membership was configured)
         // If there are any voters configured, cluster was previously initialized
-        if inner.last_membership.membership().voter_ids().next().is_some() {
+        if inner
+            .last_membership
+            .membership()
+            .voter_ids()
+            .next()
+            .is_some()
+        {
             return true;
         }
-        
+
         false
     }
 

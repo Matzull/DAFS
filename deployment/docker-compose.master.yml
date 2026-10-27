@@ -19,6 +19,8 @@ services:
       - /config/master.toml
       - --listen-address
       - ${MASTER_LISTEN_ADDRESS:-[::]:9090}
+      - --advertise-address
+      - ${MASTER_ADVERTISE_ADDRESS:-}
       - --raft-bootstrap
       - ${MASTER_RAFT_BOOTSTRAP:-false}
       - --raft-node-id

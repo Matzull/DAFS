@@ -227,15 +227,11 @@ struct DAFSfs {
     next_fh: AtomicU64,
     ttl: Duration,
     state: Arc<RwLock<DAFSState>>,
-    directories: RwLock<HashSet<String>>,  // Track directory paths locally
+    directories: RwLock<HashSet<String>>, // Track directory paths locally
 }
 
 impl Filesystem for DAFSfs {
-    fn init(
-        &mut self,
-        _req: &Request,
-        config: &mut fuser::KernelConfig,
-    ) -> std::io::Result<()> {
+    fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
         // Negotiate large I/O units so the kernel hands us 1 MiB chunks instead
         // of the default ~128 KiB. Fewer FUSE round-trips per MB → less overhead
         // on both the write (buffer fill) and read (readahead) paths.
@@ -273,17 +269,26 @@ impl Filesystem for DAFSfs {
                 return;
             }
         };
-        
+
         // Check if this is a directory
         if self.directories.blocking_read().contains(&path) {
             debug!(path = path, ino = ino.0, "Entry is a directory");
             reply.attr(
                 &self.ttl,
-                &self.file_attr(ino, 0, SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64, FileType::Directory, 0o755),
+                &self.file_attr(
+                    ino,
+                    0,
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64,
+                    FileType::Directory,
+                    0o755,
+                ),
             );
             return;
         }
-        
+
         let token = self.token.blocking_read().clone();
 
         match self.runtime.block_on(fscore::get_file_metadata(
@@ -330,19 +335,28 @@ impl Filesystem for DAFSfs {
             "Resolved parent path"
         );
         let full_path = self.join_path(&parent_path, name);
-        
+
         // Check if this is a directory first
         if self.directories.blocking_read().contains(&full_path) {
             debug!(full_path = full_path, "Entry is a directory");
             let ino = self.get_new_inode(full_path.clone());
             reply.entry(
                 &self.ttl,
-                &self.file_attr(ino, 0, SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64, FileType::Directory, 0o755),
+                &self.file_attr(
+                    ino,
+                    0,
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64,
+                    FileType::Directory,
+                    0o755,
+                ),
                 fuser::Generation(0),
             );
             return;
         }
-        
+
         let token = self.token.blocking_read().clone();
         let file_metadata = self.runtime.block_on(fscore::get_file_metadata(
             self.settings.clone(),
@@ -758,7 +772,11 @@ impl Filesystem for DAFSfs {
         if should_flush {
             match self.flush_pending_buffer(fh, flush_threshold) {
                 Ok(()) => {
-                    debug!(fh = fh.0, threshold = flush_threshold, "Buffered chunk upload completed after write");
+                    debug!(
+                        fh = fh.0,
+                        threshold = flush_threshold,
+                        "Buffered chunk upload completed after write"
+                    );
                 }
                 Err(err) => {
                     error!(fh = fh.0, error = %err, "Failed buffered chunk upload during write");
@@ -840,13 +858,13 @@ impl Filesystem for DAFSfs {
     }
 
     fn fsync(
-            &self,
-            _req: &Request,
-            ino: INodeNo,
-            fh: FileHandle,
-            datasync: bool,
-            reply: fuser::ReplyEmpty,
-        ) {
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        datasync: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
         debug!(ino = ino.0, fh = fh.0, datasync, "Fsync request");
         if let Err(err) = self.flush_pending_buffer(fh, 1) {
             error!(fh = fh.0, error = %err, "Failed to flush buffered data on fsync");
@@ -960,7 +978,13 @@ impl Filesystem for DAFSfs {
                     )) {
                         Ok(meta) => reply.attr(
                             &self.ttl,
-                            &self.file_attr(ino, meta.size, meta.created_at, FileType::RegularFile, meta.mode),
+                            &self.file_attr(
+                                ino,
+                                meta.size,
+                                meta.created_at,
+                                FileType::RegularFile,
+                                meta.mode,
+                            ),
                         ),
                         Err(_) => reply.attr(
                             &self.ttl,
@@ -1021,7 +1045,13 @@ impl Filesystem for DAFSfs {
             )) {
                 Ok(meta) => reply.attr(
                     &self.ttl,
-                    &self.file_attr(ino, meta.size, meta.created_at, FileType::RegularFile, meta.mode),
+                    &self.file_attr(
+                        ino,
+                        meta.size,
+                        meta.created_at,
+                        FileType::RegularFile,
+                        meta.mode,
+                    ),
                 ),
                 Err(err) => {
                     error!(ino = ino.0, error = %err, "Setattr metadata refresh failed");
@@ -1086,11 +1116,7 @@ impl Filesystem for DAFSfs {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
-        debug!(
-            parent = parent.0,
-            name = name.to_str(),
-            "Deleting file"
-        );
+        debug!(parent = parent.0, name = name.to_str(), "Deleting file");
 
         let parent_path = match self.get_path_by_inode(parent) {
             Some(p) => p,
@@ -1124,16 +1150,16 @@ impl Filesystem for DAFSfs {
     }
 
     fn mkdir(
-            &self,
-            _req: &Request,
-            parent: INodeNo,
-            name: &OsStr,
-            mode: u32,
-            umask: u32,
-            reply: ReplyEntry,
-        ) {
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        reply: ReplyEntry,
+    ) {
         debug!(parent = parent.0, name = name.to_str(), "mkdir request");
-        
+
         let parent_path = match self.get_path_by_inode(parent) {
             Some(p) => p,
             None => {
@@ -1154,7 +1180,7 @@ impl Filesystem for DAFSfs {
             Ok(()) => {
                 // Add to local cache
                 self.directories.blocking_write().insert(dir_path.clone());
-                
+
                 // Create and return inode
                 let ino = self.get_new_inode(dir_path.clone());
                 let now = SystemTime::now();
@@ -1176,7 +1202,11 @@ impl Filesystem for DAFSfs {
                     flags: 0,
                     blksize: 512,
                 };
-                debug!(path = dir_path, ino = ino.0, "Directory created successfully");
+                debug!(
+                    path = dir_path,
+                    ino = ino.0,
+                    "Directory created successfully"
+                );
                 reply.entry(&self.ttl, &attr, fuser::Generation(0));
             }
             Err(err) => {
@@ -1188,7 +1218,7 @@ impl Filesystem for DAFSfs {
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
         debug!(parent = parent.0, name = name.to_str(), "rmdir request");
-        
+
         let parent_path = match self.get_path_by_inode(parent) {
             Some(p) => p,
             None => {
@@ -1209,13 +1239,13 @@ impl Filesystem for DAFSfs {
             Ok(()) => {
                 // Remove from local cache
                 self.directories.blocking_write().remove(&dir_path);
-                
+
                 // Remove inode mapping
                 let mut inode_map = self.inode_map.blocking_write();
                 if let Some(ino) = inode_map.get_by_right(&dir_path).copied() {
                     inode_map.remove_by_left(&ino);
                 }
-                
+
                 debug!(path = dir_path, "Directory removed successfully");
                 reply.ok();
             }
@@ -1228,14 +1258,14 @@ impl Filesystem for DAFSfs {
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
         debug!("statfs request");
-        
+
         let token = self.token.blocking_read().clone();
-        
+
         // Query backend for real filesystem statistics
-        match self.runtime.block_on(fscore::get_system_stats(
-            self.settings.clone(),
-            &token,
-        )) {
+        match self
+            .runtime
+            .block_on(fscore::get_system_stats(self.settings.clone(), &token))
+        {
             Ok(stats) => {
                 debug!(
                     blocks_total = stats.total_blocks,
@@ -1244,30 +1274,30 @@ impl Filesystem for DAFSfs {
                     inodes_free = stats.free_inodes,
                     "Returning filesystem statistics from backend"
                 );
-                
+
                 reply.statfs(
-                    stats.total_blocks as u64,       // blocks
-                    stats.free_blocks as u64,        // bfree (free blocks)
-                    stats.free_blocks as u64,        // bavail (available blocks to non-root)
-                    stats.total_inodes as u64,       // files (total inodes)
-                    stats.free_inodes as u64,        // ffree (free inodes)
-                    stats.block_size as u32,         // bsize (block size)
-                    512,                             // namelen (max filename length)
-                    stats.block_size as u32,         // frsize (fragment size)
+                    stats.total_blocks as u64, // blocks
+                    stats.free_blocks as u64,  // bfree (free blocks)
+                    stats.free_blocks as u64,  // bavail (available blocks to non-root)
+                    stats.total_inodes as u64, // files (total inodes)
+                    stats.free_inodes as u64,  // ffree (free inodes)
+                    stats.block_size as u32,   // bsize (block size)
+                    512,                       // namelen (max filename length)
+                    stats.block_size as u32,   // frsize (fragment size)
                 );
             }
             Err(err) => {
                 error!(error = %err, "Failed to get system stats, using fallback");
                 // Fallback to conservative defaults
                 reply.statfs(
-                    1048576,  // 4 GB (1M blocks × 4KB)
-                    1000000,  // 4 GB free
-                    1000000,  // 4 GB available
-                    10000,    // 10K inodes
-                    10000,    // 10K free inodes
-                    4096,     // 4KB block size
-                    512,      // max filename
-                    4096,     // fragment size
+                    1048576, // 4 GB (1M blocks × 4KB)
+                    1000000, // 4 GB free
+                    1000000, // 4 GB available
+                    10000,   // 10K inodes
+                    10000,   // 10K free inodes
+                    4096,    // 4KB block size
+                    512,     // max filename
+                    4096,    // fragment size
                 );
             }
         }
@@ -1307,7 +1337,11 @@ impl Filesystem for DAFSfs {
             reply.error(Errno::from_i32(ENOENT));
             return;
         }
-        debug!(ino = ino.0, name = name.to_string_lossy().to_string(), "setxattr unsupported");
+        debug!(
+            ino = ino.0,
+            name = name.to_string_lossy().to_string(),
+            "setxattr unsupported"
+        );
         reply.error(Errno::from_i32(libc::ENOTSUP));
     }
 
@@ -1318,7 +1352,11 @@ impl Filesystem for DAFSfs {
             reply.error(Errno::from_i32(ENOENT));
             return;
         }
-        debug!(ino = ino.0, name = name.to_string_lossy().to_string(), "xattr not present");
+        debug!(
+            ino = ino.0,
+            name = name.to_string_lossy().to_string(),
+            "xattr not present"
+        );
         reply.error(Errno::from_i32(libc::ENODATA));
     }
 
@@ -1343,7 +1381,11 @@ impl Filesystem for DAFSfs {
             reply.error(Errno::from_i32(ENOENT));
             return;
         }
-        debug!(ino = ino.0, name = name.to_string_lossy().to_string(), "removexattr unsupported");
+        debug!(
+            ino = ino.0,
+            name = name.to_string_lossy().to_string(),
+            "removexattr unsupported"
+        );
         reply.error(Errno::from_i32(libc::ENOTSUP));
     }
 
@@ -1662,19 +1704,20 @@ impl DAFSfs {
         // Register user, ignoring error if already exists
         let register_result = self.runtime.block_on(fscore::register_user(
             self.settings.clone(),
-            "pep".to_string(),
-            "pepe".to_string(),
+            "user".to_string(),
+            "password".to_string(),
         ));
         match register_result {
             Ok(_) => {}
             Err(e) if e.to_string().contains("already exists") => {
-                debug!("User pep already registered, logging in");
-                self.runtime.block_on(fscore::login_user(
-                    self.settings.clone(),
-                    "pep".to_string(),
-                    "pepe".to_string(),
-                ))
-                .expect("Login failed for existing user");
+                debug!("User user already registered, logging in");
+                self.runtime
+                    .block_on(fscore::login_user(
+                        self.settings.clone(),
+                        "user".to_string(),
+                        "password".to_string(),
+                    ))
+                    .expect("Login failed for existing user");
             }
             Err(e) => panic!("Failed to register user: {}", e),
         }
@@ -1712,7 +1755,14 @@ impl DAFSfs {
         }
     }
 
-    fn file_attr(&self, ino: INodeNo, size: i64, created_at_ms: i64, kind: FileType, mode: u32) -> FileAttr {
+    fn file_attr(
+        &self,
+        ino: INodeNo,
+        size: i64,
+        created_at_ms: i64,
+        kind: FileType,
+        mode: u32,
+    ) -> FileAttr {
         let timestamp = UNIX_EPOCH + Duration::from_millis(created_at_ms.max(0) as u64);
         FileAttr {
             ino,
@@ -1801,11 +1851,11 @@ fn main() {
     config.mount_options = vec![MountOption::RW, MountOption::AutoUnmount];
     config.acl = fuser::SessionACL::All;
     let mut initial_dirs = HashSet::new();
-    initial_dirs.insert("/".to_string());  // Root is always a directory
-    
+    initial_dirs.insert("/".to_string()); // Root is always a directory
+
     let inode_map = RwLock::new(BiMap::new());
-    inode_map.blocking_write().insert(1u64, "/".to_string());  // Register root inode
-    
+    inode_map.blocking_write().insert(1u64, "/".to_string()); // Register root inode
+
     let fs = DAFSfs {
         inode_map,
         runtime: Arc::new(Runtime::new().unwrap()),

@@ -1,7 +1,13 @@
 # DAFS DataNode Configuration File
 
-# Server listen address
+# Server listen address (used to bind the server socket)
 listen_address = "[::1]:8080"
+
+# Address advertised to the master so it (and other nodes) can reach this
+# datanode. Must be routable from the master; in Docker use the container/DNS
+# name (e.g. "dafs-datanode-0:8080"). Leave empty to fall back to
+# listen_address, which is only correct on a single-host local setup.
+advertise_address = ""
 
 # Data folder location for storing blocks
 data_folder = "./testing/datanode"

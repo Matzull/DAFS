@@ -18,6 +18,8 @@ services:
       - /config/datanode.toml
       - --listen-address
       - ${DATANODE_LISTEN_ADDRESS:-[::]:8080}
+      - --advertise-address
+      - ${DATANODE_ADVERTISE_ADDRESS:-}
       - --data-folder
       - /app/data/datanode
       - --metadata-node-address

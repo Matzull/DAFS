@@ -11,8 +11,6 @@
     enable_datanodes: true
     enable_logrotate: true
     logrotate_config_path: /etc/logrotate.d/dafs-docker-json
-    logrotate_temp_path: /tmp/dafs-docker-json.logrotate
-    logrotate_sudo_password: ""
     logrotate_rotate_count: 14
     logrotate_max_size: 100M
 
@@ -35,55 +33,29 @@
     auditing_network_name: elastic
 
   tasks:
-    - name: Validate logrotate sudo password is provided
+    - name: Validate become password is provided for logrotate
       ansible.builtin.fail:
         msg: >-
-          enable_logrotate=true requires logrotate_sudo_password.
+          enable_logrotate=true requires a privilege-escalation password.
           Provide it with cluster_manager (--become-pass) or via
-          -e '{"logrotate_sudo_password":"..."}'.
+          -e '{"ansible_become_password":"..."}'.
       when:
         - enable_logrotate | bool
-        - (logrotate_sudo_password | default('') | length) == 0
+        - (ansible_become_password | default('') | length) == 0
 
     - name: Ensure logrotate package is installed
-      ansible.builtin.shell: |
-        set -euo pipefail
-        if command -v logrotate >/dev/null 2>&1; then
-          echo "already-installed"
-          exit 0
-        fi
-
-        install_cmd=""
-        if command -v apt-get >/dev/null 2>&1; then
-          install_cmd="apt-get update && apt-get install -y logrotate"
-        elif command -v dnf >/dev/null 2>&1; then
-          install_cmd="dnf install -y logrotate"
-        elif command -v yum >/dev/null 2>&1; then
-          install_cmd="yum install -y logrotate"
-        elif command -v pacman >/dev/null 2>&1; then
-          install_cmd="pacman -Sy --noconfirm logrotate"
-        elif command -v zypper >/dev/null 2>&1; then
-          install_cmd="zypper --non-interactive install logrotate"
-        elif command -v apk >/dev/null 2>&1; then
-          install_cmd="apk add --no-cache logrotate"
-        else
-          echo "unsupported-package-manager"
-          exit 1
-        fi
-
-        printf '%s\n' "$LOGROTATE_SUDO_PASSWORD" | sudo -S -p '' sh -c "$install_cmd"
-        echo "installed"
-      args:
-        executable: /bin/bash
-      environment:
-        LOGROTATE_SUDO_PASSWORD: "{{ logrotate_sudo_password }}"
-      register: logrotate_install
-      changed_when: "'installed' in logrotate_install.stdout"
+      become: true
+      ansible.builtin.package:
+        name: logrotate
+        state: present
       when: enable_logrotate | bool
 
-    - name: Render logrotate policy in temp path
+    - name: Install logrotate policy for Docker json logs
+      become: true
       ansible.builtin.copy:
-        dest: "{{ logrotate_temp_path }}"
+        dest: "{{ logrotate_config_path }}"
+        owner: root
+        group: root
         mode: "0644"
         content: |
           /var/lib/docker/containers/*/*-json.log {
@@ -101,37 +73,13 @@
               copytruncate
               maxsize {{ logrotate_max_size }}
           }
-      when:
-        - enable_logrotate | bool
-
-    - name: Install logrotate policy with sudo when changed
-      ansible.builtin.shell: |
-        set -euo pipefail
-        if printf '%s\n' "$LOGROTATE_SUDO_PASSWORD" | sudo -S -p '' test -f "{{ logrotate_config_path }}" && \
-           printf '%s\n' "$LOGROTATE_SUDO_PASSWORD" | sudo -S -p '' cmp -s "{{ logrotate_temp_path }}" "{{ logrotate_config_path }}"; then
-          echo "unchanged"
-          exit 0
-        fi
-
-        printf '%s\n' "$LOGROTATE_SUDO_PASSWORD" | sudo -S -p '' install -m 0644 "{{ logrotate_temp_path }}" "{{ logrotate_config_path }}"
-        echo "updated"
-      args:
-        executable: /bin/bash
-      environment:
-        LOGROTATE_SUDO_PASSWORD: "{{ logrotate_sudo_password }}"
       register: logrotate_policy
-      changed_when: "'updated' in logrotate_policy.stdout"
       when:
         - enable_logrotate | bool
 
     - name: Force-run logrotate policy once
-      ansible.builtin.shell: |
-        set -euo pipefail
-        printf '%s\n' "$LOGROTATE_SUDO_PASSWORD" | sudo -S -p '' logrotate -f "{{ logrotate_config_path }}"
-      args:
-        executable: /bin/bash
-      environment:
-        LOGROTATE_SUDO_PASSWORD: "{{ logrotate_sudo_password }}"
+      become: true
+      ansible.builtin.command: logrotate -f "{{ logrotate_config_path }}"
       changed_when: false
       when:
         - enable_logrotate | bool
@@ -202,6 +150,7 @@
         MASTER_HOST_PORT: "{{ item.host_port | string }}"
         MASTER_SERVICE_PORT: "{{ item.service_port | string }}"
         MASTER_LISTEN_ADDRESS: "{{ item.listen_address }}"
+        MASTER_ADVERTISE_ADDRESS: "{{ item.advertise_address | default((item.raft_host | default(item.container_name)) ~ ':' ~ item.service_port) }}"
         MASTER_RAFT_BOOTSTRAP: "{{ item.raft_bootstrap | lower }}"
         MASTER_RAFT_NODE_ID: "{{ item.node_id | string }}"
         MASTER_RAFT_INITIAL_MEMBERS: >-
@@ -236,6 +185,7 @@
         DATANODE_CONTAINER_NAME: "{{ item.container_name }}"
         DATANODE_RUST_LOG: "{{ item.rust_log | default('info') }}"
         DATANODE_LISTEN_ADDRESS: "{{ item.listen_address | default('[::]:8080') }}"
+        DATANODE_ADVERTISE_ADDRESS: "{{ item.advertise_address | default(item.container_name ~ ':8080') }}"
         DATANODE_METADATA_ADDRESS: "{{ item.metadata_address | default(preferred_metadata_leader_endpoint | default('')) }}"
         DATANODE_METADATA_ENDPOINTS: "{{ item.metadata_endpoints | default(masters_metadata_endpoints | default('')) }}"
       loop: "{{ datanodes }}"

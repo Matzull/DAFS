@@ -1,7 +1,13 @@
 # DAFS Master (MetadataNode) Configuration File
 
-# Server listen address
+# Server listen address (used to bind the server socket)
 listen_address = "[::1]:9090"
+
+# Address advertised to peers and datanodes for the Raft/metadata service. Must
+# be routable from them; in Docker use the container/DNS name (e.g.
+# "master0:9090"). Leave empty to fall back to listen_address, which is only
+# correct on a single-host local setup.
+advertise_address = ""
 
 # Block size (in bytes) - should match datanode settings
 block_size = 1048576

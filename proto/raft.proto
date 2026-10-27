@@ -45,6 +45,10 @@ message GetLeaderResponse {
 	bool known = 1;
 	uint64 leader_id = 2;
 	string leader_address = 3;
+	// node_id of the master answering this request. Lets clients map the leader
+	// to one of their own configured endpoints instead of dialing the
+	// cluster-internal leader_address, which may be unreachable from outside.
+	uint64 responder_id = 4;
 }
 
 message ChangeMembershipRequest {
