@@ -489,6 +489,42 @@ impl Clone for Metadatanode {
     }
 }
 
+/// Splits a file into blocks and assigns each block `replication_factor` distinct
+/// datanodes (capped by the number available), rotating the starting node per block.
+fn plan_blocks(
+    file_size: i64,
+    block_size: i64,
+    replication_factor: i32,
+    datanodes: &[u16],
+) -> Vec<BlockMetadata> {
+    let num_blocks: usize = ((file_size + block_size - 1) / block_size)
+        .try_into()
+        .unwrap_or(0);
+
+    let mut blocks = Vec::<BlockMetadata>::new();
+    for block_idx in 0..num_blocks {
+        let block_id = Uuid::new_v4().to_string();
+        let mut block_datanodes = vec![];
+        for datanode_id in 0..min(replication_factor, datanodes.len() as i32) {
+            block_datanodes.push(datanodes[(block_idx + datanode_id as usize) % datanodes.len()]);
+        }
+        let current_block_size = if (block_idx as i64 + 1) * block_size < file_size {
+            block_size
+        } else {
+            file_size - (block_idx as i64) * block_size
+        };
+        blocks.push(BlockMetadata {
+            id: block_id,
+            index: block_idx as i32,
+            size: current_block_size,
+            locations: block_datanodes,
+            checksum: "TO_IMPLEMENT".to_string(),
+        });
+    }
+
+    blocks
+}
+
 impl Metadatanode {
     #[instrument(skip(state, settings, self))]
     async fn allocate_blocks(
@@ -498,9 +534,6 @@ impl Metadatanode {
         file_size: u64,
     ) -> Result<Vec<BlockMetadata>, (i8, String)> {
         let file_size = file_size as i64; // CAUTION
-        let num_blocks: usize = ((file_size + settings.block_size - 1) / settings.block_size)
-            .try_into()
-            .unwrap_or(0);
 
         let datanodes_lock = state.available_datanodes.read().await;
         let datanodes: Vec<u16> = datanodes_lock.keys().cloned().collect();
@@ -511,29 +544,12 @@ impl Metadatanode {
             return Err((2, "No datanodes found".to_string()));
         }
 
-        let mut blocks = Vec::<BlockMetadata>::new();
-        for block_idx in 0..num_blocks {
-            let block_id = Uuid::new_v4().to_string();
-            let mut block_datanodes = vec![];
-            for datanode_id in 0..min(settings.replication_factor, datanodes.len() as i32) {
-                block_datanodes
-                    .push(datanodes[(block_idx + datanode_id as usize) % datanodes.len()]);
-            }
-            let current_block_size = if (block_idx as i64 + 1) * settings.block_size < file_size {
-                settings.block_size
-            } else {
-                file_size - (block_idx as i64) * settings.block_size
-            };
-            blocks.push(BlockMetadata {
-                id: block_id,
-                index: block_idx as i32,
-                size: current_block_size,
-                locations: block_datanodes,
-                checksum: "TO_IMPLEMENT".to_string(),
-            });
-        }
-
-        Ok(blocks)
+        Ok(plan_blocks(
+            file_size,
+            settings.block_size,
+            settings.replication_factor,
+            &datanodes,
+        ))
     }
 
     // Allocate write segments for an existing file range [offset, offset + write_size).

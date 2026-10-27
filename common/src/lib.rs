@@ -183,5 +183,5 @@ impl std::fmt::Display for dfs::AuditRequest {
     }
 }
 
-// #[cfg(test)]
-// mod tests;
+#[cfg(test)]
+mod tests;
