@@ -8,6 +8,7 @@
 ![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)
 ![gRPC](https://img.shields.io/badge/gRPC-tonic-blue)
 ![Raft](https://img.shields.io/badge/consensus-Raft-6f42c1)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 </div>
 
@@ -158,3 +159,5 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs these three che
 ## About
 
 DAFS was built as my Master's thesis (Máster en Ingeniería Informática, Universidad Carlos III de Madrid).
+
+Released under the [MIT License](LICENSE).
