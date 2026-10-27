@@ -224,6 +224,25 @@ pub struct Datanode {
     pub block_last_sync: Arc<Mutex<std::collections::HashMap<String, Instant>>>,
 }
 
+/// Builds `<data_folder>/<id[0..2]>/<id[2..4]>/<id>` for a block, rejecting ids that
+/// are too short to shard or could escape the data folder.
+#[allow(clippy::result_large_err)]
+fn block_path(data_folder: &str, block_id: &str) -> Result<PathBuf, Status> {
+    let valid = block_id.len() >= 4
+        && block_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !valid {
+        return Err(Status::invalid_argument("Invalid block_id"));
+    }
+
+    let mut path = PathBuf::from(data_folder);
+    path.push(&block_id[..2]);
+    path.push(&block_id[2..4]);
+    path.push(block_id);
+    Ok(path)
+}
+
 fn parse_leader_addr_from_message(message: &str) -> Option<String> {
     let marker = "leader_addr=";
     let start = message.find(marker)? + marker.len();
@@ -356,14 +375,7 @@ impl Datanode {
         dst_addr: String,
         block_id: String,
     ) -> Result<(), Status> {
-        if block_id.contains('/') || block_id.contains('.') {
-            return Err(Status::invalid_argument("Invalid block_id"));
-        }
-
-        let mut file_path = PathBuf::from(&settings.data_folder);
-        file_path.push(&block_id[..2]);
-        file_path.push(&block_id[2..4]);
-        file_path.push(&block_id);
+        let file_path = block_path(&settings.data_folder, &block_id)?;
 
         let mut source_file = File::open(file_path).await.map_err(|err| {
             error!(%err, block_id = %block_id, "Failed to open source block for replication");
@@ -471,9 +483,7 @@ impl DataNodeService for Datanode {
             match msg.request_data {
                 Some(RequestData::Metadata(metadata)) => {
                     block_id_str = metadata.block_id.clone();
-                    if block_id_str.contains('/') || block_id_str.contains('.') {
-                        return Err(Status::invalid_argument("Invalid block_id"));
-                    }
+                    let block_file = block_path(&self.settings.data_folder, &block_id_str)?;
 
                     let write_offset = metadata.offset as i64;
                     debug!(
@@ -482,14 +492,13 @@ impl DataNodeService for Datanode {
                         "Received metadata for block"
                     );
 
-                    let mut file_path_pathbuf = PathBuf::from(&self.settings.data_folder);
-                    file_path_pathbuf.push(&block_id_str[..2]);
-                    file_path_pathbuf.push(&block_id_str[2..4]);
-                    create_dir_all(&file_path_pathbuf).await.map_err(|err| {
-                        error!(%err, "Failed to create folder");
-                        Status::internal(err.to_string())
-                    })?;
-                    file_path_pathbuf.push(&block_id_str);
+                    let file_path_pathbuf = block_file;
+                    if let Some(block_dir) = file_path_pathbuf.parent() {
+                        create_dir_all(block_dir).await.map_err(|err| {
+                            error!(%err, "Failed to create folder");
+                            Status::internal(err.to_string())
+                        })?;
+                    }
 
                     // Never truncate here: iozone and similar workloads can issue
                     // partial rewrites at offset 0, and truncation would drop the
@@ -612,13 +621,7 @@ impl DataNodeService for Datanode {
         let block_id = request.into_inner().block_id;
         let mut hasher = Hasher::new();
         debug!(block_id = %block_id, "Received read_block request");
-        if block_id.contains('/') || block_id.contains('.') {
-            return Err(Status::invalid_argument("Invalid block_id"));
-        }
-        let mut file_path_pathbuf = PathBuf::from(&self.settings.data_folder);
-        file_path_pathbuf.push(&block_id[..2]);
-        file_path_pathbuf.push(&block_id[2..4]);
-        file_path_pathbuf.push(&block_id);
+        let file_path_pathbuf = block_path(&self.settings.data_folder, &block_id)?;
         let (tx, rx) = mpsc::channel(self.settings.mpsc_channel_size as usize);
         let read_buffer_size = self.settings.read_buffer_size;
 
@@ -681,10 +684,7 @@ impl DataNodeService for Datanode {
         let block_id = request.into_inner().block_id;
         debug!(block_id = %block_id, "Received delete_block request");
 
-        let mut file_path_pathbuf = PathBuf::from(&self.settings.data_folder);
-        file_path_pathbuf.push(&block_id[..2]);
-        file_path_pathbuf.push(&block_id[2..4]);
-        file_path_pathbuf.push(&block_id);
+        let file_path_pathbuf = block_path(&self.settings.data_folder, &block_id)?;
         let _ = fs::remove_file(&file_path_pathbuf)
         .await
         .map_err(|err| {
